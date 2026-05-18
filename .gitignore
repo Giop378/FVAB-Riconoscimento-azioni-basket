@@ -1,0 +1,101 @@
+# =========================
+# Dataset e file pesanti
+# =========================
+
+# Ignora i dataset veri
+data/datasets/*
+!data/datasets/.gitkeep
+
+# File compressi/dataset/video
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+
+# =========================
+# Output grezzi degli esperimenti
+# =========================
+
+outputs/*
+!outputs/.gitkeep
+
+runs/
+wandb/
+logs/
+
+
+# =========================
+# Checkpoint dei modelli
+# =========================
+
+checkpoints/*
+!checkpoints/.gitkeep
+
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+
+# =========================
+# File sensibili locali
+# =========================
+
+.env
+.env.*
+*.key
+*.pem
+credentials.*
+secrets.*
+
+
+# =========================
+# Python cache e build
+# =========================
+
+__pycache__/
+*.py[cod]
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+build/
+dist/
+*.egg-info/
+
+
+# =========================
+# Ambienti locali
+# =========================
+
+.venv/
+venv/
+env/
+.conda/
+conda-meta/
+
+
+# =========================
+# Jupyter
+# =========================
+
+.ipynb_checkpoints/
+
+
+# =========================
+# OS/editor
+# =========================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/

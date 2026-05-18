@@ -1,0 +1,41 @@
+name: fvab-basket
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip
+
+  # Core scientific stack
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+
+  # Visualization
+  - matplotlib
+  - seaborn
+
+  # Computer vision and media
+  - opencv
+  - pillow
+
+  # CLI and configuration
+  - pyyaml
+  - tqdm
+
+  - pip:
+      # Deep learning
+      - torch
+      - torchvision
+      - torchmetrics
+      - timm
+
+      # Model utilities
+      - huggingface-hub
+      - safetensors
+
+      # CLI utilities
+      - rich
+      - typer
