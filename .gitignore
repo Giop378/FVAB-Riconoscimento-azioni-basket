@@ -1,101 +1,70 @@
 # =========================
-# Dataset e file pesanti
+# Python
 # =========================
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Ignora i dataset veri
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# =========================
+# Dataset: ignorare tutti i dataset
+# =========================
 data/datasets/*
 !data/datasets/.gitkeep
+!data/datasets/README.md
 
-# File compressi/dataset/video
-*.zip
-*.tar
-*.tar.gz
-*.rar
-*.7z
-
+# =========================
+# File pesanti generati
+# =========================
 *.mp4
 *.avi
 *.mov
 *.mkv
 *.webm
 
-
-# =========================
-# Output grezzi degli esperimenti
-# =========================
-
-outputs/*
-!outputs/.gitkeep
-
-runs/
-wandb/
-logs/
-
-
-# =========================
-# Checkpoint dei modelli
-# =========================
-
-checkpoints/*
-!checkpoints/.gitkeep
-
 *.pt
 *.pth
 *.ckpt
 *.onnx
+*.safetensors
 
-
-# =========================
-# File sensibili locali
-# =========================
-
-.env
-.env.*
-*.key
-*.pem
-credentials.*
-secrets.*
-
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.joblib
 
 # =========================
-# Python cache e build
+# Cache / temporanei
 # =========================
-
-__pycache__/
-*.py[cod]
-
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-build/
-dist/
-*.egg-info/
-
+.cache/
+cache/
+tmp/
+temp/
 
 # =========================
-# Ambienti locali
+# Log pesanti o strumenti esterni
 # =========================
-
-.venv/
-venv/
-env/
-.conda/
-conda-meta/
-
-
-# =========================
-# Jupyter
-# =========================
-
-.ipynb_checkpoints/
-
-
-# =========================
-# OS/editor
-# =========================
-
-.DS_Store
-Thumbs.db
-desktop.ini
-.vscode/
+wandb/
+runs/
+checkpoints/
