@@ -20,10 +20,14 @@ dependencies:
   # Computer vision and media
   - opencv
   - pillow
+  - ffmpeg
 
   # CLI and configuration
   - pyyaml
   - tqdm
+
+  # Notebook / VS Code support
+  - ipykernel
 
   - pip:
       # Deep learning
