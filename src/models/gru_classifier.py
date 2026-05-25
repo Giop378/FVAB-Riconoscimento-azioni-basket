@@ -13,14 +13,14 @@ class AttentionPooling(nn.Module):
             nn.Linear(input_dim // 2, 1),
         )
 
-    def forward(self, outputs, lengths):
+    def forward(self, outputs, lengths, return_weights: bool = False):
         """
         outputs: [B, Tmax, D]
         lengths: [B]
         """
         lengths = lengths.to(outputs.device)
 
-        batch_size, max_len, _ = outputs.shape
+        _, max_len, _ = outputs.shape
 
         time_idx = torch.arange(max_len, device=outputs.device).unsqueeze(0)
         mask = time_idx < lengths.unsqueeze(1)   # True sui frame reali, False sul padding
@@ -30,6 +30,9 @@ class AttentionPooling(nn.Module):
 
         weights = torch.softmax(scores, dim=1)        # [B, Tmax]
         pooled = torch.sum(outputs * weights.unsqueeze(-1), dim=1)
+
+        if return_weights:
+            return pooled, weights
 
         return pooled
 
@@ -65,7 +68,7 @@ class GRUActionClassifier(nn.Module):
             nn.Linear(gru_out_dim, num_classes),
         )
 
-    def forward(self, features, lengths):
+    def forward(self, features, lengths, return_attention: bool = False):
         """
         features: [B, Tmax, input_dim]
         lengths:  [B]
@@ -84,7 +87,18 @@ class GRUActionClassifier(nn.Module):
             batch_first=True,
         )
 
-        pooled = self.pooling(outputs, lengths)
+        if return_attention:
+            pooled, attention_weights = self.pooling(
+                outputs,
+                lengths,
+                return_weights=True,
+            )
 
+            logits = self.classifier(pooled)
+
+            return logits, attention_weights
+
+        pooled = self.pooling(outputs, lengths)
         logits = self.classifier(pooled)
+
         return logits
