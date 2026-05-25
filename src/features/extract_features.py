@@ -10,7 +10,7 @@ from torchvision import models, transforms
 from src.data.video_io import read_video_frames
 
 #Per eseguire questo codice per la baseline fare: 
-#python -m src.features.extract_resnet_features --dataset-root data/datasets/dataset_basket_v1 --manifest data/datasets/dataset_basket_v1/manifest.csv --output-dir data/features/resnet18
+#python -m src.features.extract_features --dataset-root data/datasets/dataset_basket_v1 --manifest data/datasets/dataset_basket_v1/manifest.csv --output-dir data/features/resnet18
 LABELS = [
     "passaggio",
     "tiroDaDue0",
