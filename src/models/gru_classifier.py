@@ -1,12 +1,43 @@
 import torch
 import torch.nn as nn
-from torch.nn.utils.rnn import pack_padded_sequence
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+
+class AttentionPooling(nn.Module):
+    def __init__(self, input_dim: int):
+        super().__init__()
+
+        self.attention = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.Tanh(),
+            nn.Linear(input_dim // 2, 1),
+        )
+
+    def forward(self, outputs, lengths):
+        """
+        outputs: [B, Tmax, D]
+        lengths: [B]
+        """
+        lengths = lengths.to(outputs.device)
+
+        batch_size, max_len, _ = outputs.shape
+
+        time_idx = torch.arange(max_len, device=outputs.device).unsqueeze(0)
+        mask = time_idx < lengths.unsqueeze(1)   # True sui frame reali, False sul padding
+
+        scores = self.attention(outputs).squeeze(-1)  # [B, Tmax]
+        scores = scores.masked_fill(~mask, -1e9)
+
+        weights = torch.softmax(scores, dim=1)        # [B, Tmax]
+        pooled = torch.sum(outputs * weights.unsqueeze(-1), dim=1)
+
+        return pooled
 
 
 class GRUActionClassifier(nn.Module):
     def __init__(
         self,
-        input_dim: int = 512,
+        input_dim: int = 768,
         hidden_dim: int = 256,
         num_layers: int = 1,
         num_classes: int = 9,
@@ -26,6 +57,8 @@ class GRUActionClassifier(nn.Module):
 
         gru_out_dim = hidden_dim * 2 if bidirectional else hidden_dim
 
+        self.pooling = AttentionPooling(gru_out_dim)
+
         self.classifier = nn.Sequential(
             nn.LayerNorm(gru_out_dim),
             nn.Dropout(dropout),
@@ -34,7 +67,7 @@ class GRUActionClassifier(nn.Module):
 
     def forward(self, features, lengths):
         """
-        features: [B, Tmax, 512]
+        features: [B, Tmax, input_dim]
         lengths:  [B]
         """
         packed = pack_padded_sequence(
@@ -44,14 +77,14 @@ class GRUActionClassifier(nn.Module):
             enforce_sorted=False,
         )
 
-        _, hidden = self.gru(packed)
+        packed_outputs, _ = self.gru(packed)
 
-        if self.gru.bidirectional:
-            # hidden[-2] = ultimo stato direzione forward
-            # hidden[-1] = ultimo stato direzione backward
-            final_hidden = torch.cat([hidden[-2], hidden[-1]], dim=1)
-        else:
-            final_hidden = hidden[-1]
+        outputs, _ = pad_packed_sequence(
+            packed_outputs,
+            batch_first=True,
+        )
 
-        logits = self.classifier(final_hidden)
+        pooled = self.pooling(outputs, lengths)
+
+        logits = self.classifier(pooled)
         return logits
