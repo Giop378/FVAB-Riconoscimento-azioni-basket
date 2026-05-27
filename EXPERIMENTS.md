@@ -12,6 +12,7 @@ Questo file tiene traccia sintetica delle principali versioni sperimentali del m
 | exp_02 | BiGRU + attention pooling | ConvNeXt-Tiny ImageNet frozen | 50 | 16 | 1e-4 | 256 | 0.3 | 1e-4 | 0.9888 | 0.75 | 0.43 | 0.72 | `outputs/convnext_bigru_attention_weighted` |
 | exp_03 | BiGRU + attention pooling | ConvNeXt-Tiny ImageNet frozen | 35 | 16 | 1e-4 | 192 | 0.5 | 1e-3 | 0.8866 | 0.73 | 0.43 | 0.70 | `outputs/convnext_bigru_attention_regularized` |
 | exp_04 | BiGRU + attention pooling | ConvNeXt-Tiny ImageNet frozen | 35 | 16 | 1e-4 | 256 | 0.4 | 5e-4 | 1.0516 | 0.73 | 0.44 | 0.71 | `outputs/convnext_bigru_attention_mid_regularized` |
+| exp_05 | BiGRU + attention pooling + temporal pyramid pooling | ConvNeXt-Tiny ImageNet frozen | 35 | 16 | 1e-4 | 256 | 0.4 | 5e-4 | 0.7579 | 0.73 | 0.43 | 0.72 | `outputs/convnext_bigru_attention_temporal_pyramid` |
 
 ---
 
@@ -23,7 +24,7 @@ Questo file tiene traccia sintetica delle principali versioni sperimentali del m
 | exp_02 | 0.75 | 0.45 | 0.44 | 0.43 | 0.72 | 0.75 | 0.72 |
 | exp_03 | 0.73 | 0.51 | 0.44 | 0.43 | 0.71 | 0.73 | 0.70 |
 | exp_04 | 0.73 | 0.51 | 0.43 | 0.44 | 0.70 | 0.73 | 0.71 |
-
+| exp_05 | 0.73 | 0.46 | 0.43 | 0.43 | 0.71 | 0.73 | 0.72 |
 ---
 
 ## Risultati aggregati sulle sole 7 azioni reali
@@ -33,7 +34,7 @@ Questo file tiene traccia sintetica delle principali versioni sperimentali del m
 | exp_02 | 0.73 | 0.82 | 0.77 | 0.38 | 0.40 | 0.38 | 0.70 | 0.82 | 0.75 |
 | exp_03 | 0.73 | 0.78 | 0.75 | 0.47 | 0.40 | 0.38 | 0.72 | 0.78 | 0.72 |
 | exp_04 | 0.75 | 0.73 | 0.74 | 0.48 | 0.37 | 0.38 | 0.72 | 0.73 | 0.71 |
-
+| exp_05 | 0.73 | 0.76 | 0.75 | 0.40 | 0.37 | 0.37 | 0.71 | 0.76 | 0.72 |
 ---
 
 # Risultati per classe su validation
@@ -101,7 +102,22 @@ Questo file tiene traccia sintetica delle principali versioni sperimentali del m
 | `non-gioco` | 0.82 | 0.94 | 0.87 | 170 |
 
 ---
+---
 
+## exp_05 - ConvNeXt-Tiny + BiGRU + attention pooling + temporal pyramid pooling
+
+| Classe | Precision | Recall | F1-score | Support |
+|---|---:|---:|---:|---:|
+| `passaggio` | 0.79 | 0.89 | 0.84 | 212 |
+| `tiroDaDue0` | 0.69 | 0.43 | 0.53 | 21 |
+| `tiroDaDue1` | 0.33 | 0.09 | 0.14 | 11 |
+| `tiroDaTre0` | 0.53 | 0.67 | 0.59 | 12 |
+| `tiroDaTre1` | 0.00 | 0.00 | 0.00 | 3 |
+| `tiroLibero0` | 0.30 | 0.43 | 0.35 | 7 |
+| `tiroLibero1` | 0.17 | 0.09 | 0.12 | 11 |
+| `idle` | 0.46 | 0.41 | 0.43 | 93 |
+| `non-gioco` | 0.86 | 0.86 | 0.86 | 170 |
+---
 # Comandi utilizzati
 
 ## exp_01
@@ -140,13 +156,28 @@ python -m src.training.train \
   --dropout 0.4 \
   --weight-decay 5e-4 \
   --output-dir outputs/convnext_bigru_attention_mid_regularized
+exp_05
+python -m src.training.train \
+  --features-root data/features/convnext_tiny \
+  --epochs 35 \
+  --batch-size 16 \
+  --lr 1e-4 \
+  --hidden-dim 256 \
+  --dropout 0.4 \
+  --weight-decay 5e-4 \
+  --output-dir outputs/convnext_bigru_attention_temporal_pyramid
 ```
   
 Nota finale
 
-Il miglior modello in termini di Val Macro F1 è exp_04, con Val Macro F1 = 0.44.
+Il miglior modello in termini di Val Macro F1 rimane exp_04, con Val Macro F1 = 0.44.
 
-Il miglior modello in termini di Val Accuracy e Val Weighted F1 è exp_02, con:
+Il miglior modello in termini di Val Accuracy è exp_02, con:
 
 Val Accuracy = 0.75
+
+Il miglior Val Weighted F1, arrotondato a due decimali, è ottenuto da exp_02 ed exp_05, con:
+
 Val Weighted F1 = 0.72
+
+exp_05 introduce il temporal pyramid pooling per fornire al classificatore anche informazioni esplicite su inizio, centro e fine della clip. Tuttavia, rispetto a exp_04 non migliora la Val Macro F1 complessiva.
