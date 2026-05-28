@@ -4,9 +4,20 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 class AttentionPooling(nn.Module):
+    """
+    Modulo di attention pooling temporale.
+
+    Riceve in input tutti gli output temporali della GRU/BiGRU e impara
+    un peso per ogni frame/timestep. In questo modo il modello può dare
+    più importanza ai frame più informativi della clip.
+    """
+
     def __init__(self, input_dim: int):
         super().__init__()
 
+        # Piccola rete feed-forward che assegna uno score scalare a ogni timestep.
+        # Input:  vettore GRU del singolo timestep, dimensione input_dim
+        # Output: score di attenzione, dimensione 1
         self.attention = nn.Sequential(
             nn.Linear(input_dim, input_dim // 2),
             nn.Tanh(),
@@ -16,20 +27,41 @@ class AttentionPooling(nn.Module):
     def forward(self, outputs, lengths, return_weights: bool = False):
         """
         outputs: [B, Tmax, D]
+            Output della GRU/BiGRU per ogni elemento del batch.
+            B    = batch size
+            Tmax = lunghezza massima della sequenza nel batch
+            D    = dimensione dell'output GRU/BiGRU
+
         lengths: [B]
+            Lunghezze reali delle clip, senza considerare il padding.
+
+        return_weights:
+            Se True restituisce anche i pesi di attenzione, utili per capire
+            quali frame sono stati considerati più importanti dal modello.
         """
+        # Portiamo lengths sullo stesso device di outputs, necessario quando si usa CUDA.
         lengths = lengths.to(outputs.device)
 
         _, max_len, _ = outputs.shape
 
+        # Costruzione della maschera per ignorare i timestep di padding.
+        # mask[b, t] è True solo se t appartiene alla parte reale della clip b.
         time_idx = torch.arange(max_len, device=outputs.device).unsqueeze(0)
         mask = time_idx < lengths.unsqueeze(1)
 
+        # Calcola uno score di attenzione per ogni timestep.
         scores = self.attention(outputs).squeeze(-1)  # [B, Tmax]
+
+        # I timestep di padding vengono forzati a uno score molto basso,
+        # così dopo la softmax avranno peso praticamente nullo.
         scores = scores.masked_fill(~mask, -1e9)
 
-        weights = torch.softmax(scores, dim=1)        # [B, Tmax]
-        pooled = torch.sum(outputs * weights.unsqueeze(-1), dim=1)
+        # Converte gli score in pesi normalizzati lungo la dimensione temporale.
+        weights = torch.softmax(scores, dim=1)  # [B, Tmax]
+
+        # Media pesata degli output temporali della GRU/BiGRU.
+        # Risultato: un unico vettore per ogni clip.
+        pooled = torch.sum(outputs * weights.unsqueeze(-1), dim=1)  # [B, D]
 
         if return_weights:
             return pooled, weights
@@ -37,77 +69,24 @@ class AttentionPooling(nn.Module):
         return pooled
 
 
-class TemporalPyramidPooling(nn.Module):
-    """
-    Divide ogni clip in tre parti temporali:
-    - inizio
-    - centro
-    - fine
-
-    Per ogni parte calcola la media degli output della BiGRU.
-    In questo modo il classificatore riceve sempre anche informazione
-    dalla parte finale della clip, utile per distinguere tiri segnati/sbagliati.
-    """
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, outputs, lengths):
-        """
-        outputs: [B, Tmax, D]
-        lengths: [B]
-
-        return: [B, D * 3]
-        """
-        lengths = lengths.to(outputs.device)
-
-        pooled_segments = []
-
-        for i in range(outputs.size(0)):
-            T = int(lengths[i].item())
-
-            valid_outputs = outputs[i, :T]  # [T, D]
-
-            # Se la clip è molto corta, evitiamo segmenti vuoti.
-            if T < 3:
-                segment_pooled = valid_outputs.mean(dim=0)
-                pooled = torch.cat(
-                    [segment_pooled, segment_pooled, segment_pooled],
-                    dim=0,
-                )
-                pooled_segments.append(pooled)
-                continue
-
-            first_end = max(1, T // 3)
-            second_end = max(first_end + 1, (2 * T) // 3)
-
-            early = valid_outputs[:first_end]
-            middle = valid_outputs[first_end:second_end]
-            late = valid_outputs[second_end:T]
-
-            # Sicurezza nel caso qualche segmento risultasse vuoto.
-            if early.size(0) == 0:
-                early = valid_outputs
-            if middle.size(0) == 0:
-                middle = valid_outputs
-            if late.size(0) == 0:
-                late = valid_outputs
-
-            early_pooled = early.mean(dim=0)
-            middle_pooled = middle.mean(dim=0)
-            late_pooled = late.mean(dim=0)
-
-            pooled = torch.cat(
-                [early_pooled, middle_pooled, late_pooled],
-                dim=0,
-            )  # [D * 3]
-
-            pooled_segments.append(pooled)
-
-        return torch.stack(pooled_segments, dim=0)
-
-
 class GRUActionClassifier(nn.Module):
+    """
+    Classificatore per action recognition basato su GRU/BiGRU + attention pooling.
+
+    Input atteso:
+        features: [B, Tmax, input_dim]
+            Sequenza di feature già estratte dai frame della clip.
+            Ad esempio, se si usa ConvNeXt-Tiny, input_dim è tipicamente 768.
+
+        lengths: [B]
+            Numero reale di frame/timestep per ogni clip, prima del padding.
+
+    Output:
+        logits: [B, num_classes]
+            Punteggi grezzi per ciascuna classe. La softmax non viene applicata qui,
+            perché CrossEntropyLoss la applica internamente.
+    """
+
     def __init__(
         self,
         input_dim: int = 768,
@@ -119,6 +98,9 @@ class GRUActionClassifier(nn.Module):
     ):
         super().__init__()
 
+        # GRU temporale.
+        # batch_first=True indica che gli input hanno forma [B, T, D].
+        # Se bidirectional=True, la GRU legge la sequenza sia in avanti sia all'indietro.
         self.gru = nn.GRU(
             input_size=input_dim,
             hidden_size=hidden_dim,
@@ -128,17 +110,20 @@ class GRUActionClassifier(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
 
+        # Dimensione dell'output della GRU.
+        # Con BiGRU si concatena direzione forward e backward, quindi hidden_dim * 2.
         gru_out_dim = hidden_dim * 2 if bidirectional else hidden_dim
 
         self.attention_pooling = AttentionPooling(gru_out_dim)
-        self.temporal_pyramid_pooling = TemporalPyramidPooling()
 
-        # Rappresentazione finale:
-        # attention pooling:            gru_out_dim
-        # temporal pyramid: 3 segmenti * gru_out_dim
-        # totale: 4 * gru_out_dim
-        final_dim = gru_out_dim * 4
+        # La rappresentazione finale coincide con il vettore prodotto dall'attention pooling.
+        # Prima, con il pooling a piramide temporale, era gru_out_dim * 4.
+        # Ora è solo gru_out_dim, quindi il classificatore ha meno parametri.
+        final_dim = gru_out_dim
 
+        # Classificatore finale.
+        # LayerNorm stabilizza le feature, Dropout riduce overfitting,
+        # Linear produce i logits per le classi.
         self.classifier = nn.Sequential(
             nn.LayerNorm(final_dim),
             nn.Dropout(dropout),
@@ -148,8 +133,16 @@ class GRUActionClassifier(nn.Module):
     def forward(self, features, lengths, return_attention: bool = False):
         """
         features: [B, Tmax, input_dim]
-        lengths:  [B]
+            Feature dei frame/segmenti, già paddate alla stessa lunghezza nel batch.
+
+        lengths: [B]
+            Lunghezze reali delle clip, usate per non far processare il padding alla GRU.
+
+        return_attention:
+            Se True restituisce anche i pesi di attention.
         """
+        # pack_padded_sequence permette alla GRU di ignorare i timestep di padding.
+        # enforce_sorted=False evita di dover ordinare manualmente il batch per lunghezza.
         packed = pack_padded_sequence(
             features,
             lengths.cpu(),
@@ -157,34 +150,31 @@ class GRUActionClassifier(nn.Module):
             enforce_sorted=False,
         )
 
+        # Esecuzione della GRU sulla sequenza compressa.
         packed_outputs, _ = self.gru(packed)
 
+        # Riconverte l'output packed in tensore paddato [B, Tmax, D].
         outputs, _ = pad_packed_sequence(
             packed_outputs,
             batch_first=True,
         )
 
+        # Attention pooling sugli output temporali della GRU/BiGRU.
         if return_attention:
-            attention_pooled, attention_weights = self.attention_pooling(
+            final_representation, attention_weights = self.attention_pooling(
                 outputs,
                 lengths,
                 return_weights=True,
             )
         else:
-            attention_pooled = self.attention_pooling(
+            final_representation = self.attention_pooling(
                 outputs,
                 lengths,
                 return_weights=False,
             )
             attention_weights = None
 
-        pyramid_pooled = self.temporal_pyramid_pooling(outputs, lengths)
-
-        final_representation = torch.cat(
-            [attention_pooled, pyramid_pooled],
-            dim=1,
-        )
-
+        # Produzione dei logits finali per le classi.
         logits = self.classifier(final_representation)
 
         if return_attention:
