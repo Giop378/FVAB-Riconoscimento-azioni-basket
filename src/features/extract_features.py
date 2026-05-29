@@ -1,32 +1,16 @@
 from pathlib import Path
 import argparse
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from PIL import Image
 from tqdm import tqdm
-from torchvision import models, transforms
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 from src.data.video_io import read_video_frames
-
-
-# Esempio minimale di esecuzione:
-#
-# python -m src.features.extract_features
-#
-# Di default:
-# - legge il dataset da data/datasets/dataset_basket_v1
-# - legge il manifest da data/datasets/dataset_basket_v1/manifest.csv
-# - salva le feature in data/features/convnext_tiny_stretched_320
-# - usa resize stretched 320x320 senza center crop
-#
-# Esempio con parametri espliciti:
-#
-# python -m src.features.extract_features \
-#   --dataset-root data/datasets/dataset_basket_v1 \
-#   --manifest data/datasets/dataset_basket_v1/manifest.csv \
-#   --output-dir data/features/convnext_tiny_stretched_320 \
-#   --chunk-size 150
 
 
 LABELS = [
@@ -41,227 +25,338 @@ LABELS = [
     "non-gioco",
 ]
 
+LABEL_TO_IDX = {label: idx for idx, label in enumerate(LABELS)}
 
-def build_convnext_tiny_feature_extractor(device: torch.device) -> nn.Module:
+
+DINO_FEATURE_DIMS = {
+    "dinov2_vits14": 384,
+    "dinov2_vitb14": 768,
+    "dinov2_vitl14": 1024,
+    "dinov2_vitg14": 1536,
+}
+
+
+class DINOv2FeatureExtractor(nn.Module):
     """
-    Costruisce un modello ConvNeXt-Tiny preaddestrato su ImageNet
-    da usare come estrattore di feature.
+    Wrapper per DINOv2.
 
-    Il classificatore finale viene rimosso, quindi il modello non restituisce
-    più una classe ImageNet, ma un vettore di feature da 768 valori per frame.
+    Usiamo il CLS token normalizzato come feature del frame.
+    Output:
+        [B, D]
+    dove D dipende dal modello:
+        dinov2_vits14 -> 384
+        dinov2_vitb14 -> 768
+        dinov2_vitl14 -> 1024
     """
 
-    weights = models.ConvNeXt_Tiny_Weights.DEFAULT
-    model = models.convnext_tiny(weights=weights)
+    def __init__(self, model_name: str):
+        super().__init__()
 
-    # ConvNeXt originale fa:
-    # features -> avgpool -> classifier
-    #
-    # Noi rimuoviamo il Linear finale del classifier ImageNet
-    # e manteniamo il vettore di feature da 768 dimensioni.
-    final_norm = model.classifier[0]
+        self.model_name = model_name
 
-    model.classifier = nn.Sequential(
-        final_norm,
-        nn.Flatten(1),
+        self.backbone = torch.hub.load(
+            "facebookresearch/dinov2",
+            model_name,
+            pretrained=True,
+            trust_repo=True,
+        )
+
+        self.backbone.eval()
+
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+    @torch.no_grad()
+    def forward(self, x):
+        """
+        x: [B, 3, H, W]
+        """
+
+        # Nei modelli DINOv2 da torch.hub è disponibile forward_features.
+        # Prendiamo x_norm_clstoken, cioè la rappresentazione globale del frame.
+        if hasattr(self.backbone, "forward_features"):
+            out = self.backbone.forward_features(x)
+
+            if isinstance(out, dict):
+                if "x_norm_clstoken" in out:
+                    return out["x_norm_clstoken"]
+
+                if "x_prenorm" in out:
+                    return out["x_prenorm"][:, 0]
+
+        # Fallback: di solito model(x) restituisce già una feature [B, D].
+        return self.backbone(x)
+
+
+def build_transform(image_size: int):
+    """
+    Preprocessing per DINOv2.
+
+    Usiamo resize stretched senza center crop, come negli ultimi esperimenti.
+    Per DINOv2 conviene usare dimensioni multiple di 14.
+    336 = 14 * 24.
+    """
+
+    return transforms.Compose(
+        [
+            transforms.Resize(
+                (image_size, image_size),
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True,
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225),
+            ),
+        ]
     )
 
-    model.eval()
-    model.to(device)
 
-    # ConvNeXt viene usata come feature extractor frozen.
-    for param in model.parameters():
-        param.requires_grad = False
-
-    return model
-
-
-def build_stretched_320_transform():
+def frame_to_pil(frame):
     """
-    Costruisce il preprocessing scelto dopo l'analisi visiva dei frame.
+    Converte un frame in PIL RGB.
 
-    Invece del preprocessing standard ConvNeXt:
-        resize + center crop
-
-    usiamo:
-        resize diretto a 320x320 + normalizzazione ImageNet
-
-    Questo significa che:
-    - tutto il frame viene mantenuto;
-    - non viene fatto center crop;
-    - l'immagine 16:9 viene deformata/stretched in un quadrato 320x320.
+    Gestisce:
+    - PIL.Image
+    - numpy array [H, W, C]
+    - torch tensor [H, W, C]
+    - torch tensor [C, H, W]
     """
 
-    return transforms.Compose([
-        transforms.Resize((320, 320)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
-    ])
+    if isinstance(frame, Image.Image):
+        return frame.convert("RGB")
+
+    if isinstance(frame, np.ndarray):
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+        return Image.fromarray(frame).convert("RGB")
+
+    if torch.is_tensor(frame):
+        frame = frame.detach().cpu()
+
+        if frame.ndim != 3:
+            raise ValueError(f"Frame tensor con shape non valida: {frame.shape}")
+
+        # Se è [H, W, C], lo porto a [C, H, W]
+        if frame.shape[-1] in (1, 3):
+            frame = frame.permute(2, 0, 1)
+
+        if frame.dtype != torch.uint8:
+            if frame.max() <= 1.0:
+                frame = frame * 255.0
+
+            frame = frame.clamp(0, 255).to(torch.uint8)
+
+        return transforms.functional.to_pil_image(frame).convert("RGB")
+
+    raise TypeError(f"Tipo frame non supportato: {type(frame)}")
 
 
-def extract_features_for_video(
-    video_path: Path,
-    model: nn.Module,
+@torch.no_grad()
+def extract_clip_features(
+    frames,
+    model,
     transform,
-    device: torch.device,
-    chunk_size: int = 150,
-) -> torch.Tensor:
+    device,
+    chunk_size: int,
+):
     """
-    Estrae le feature da una singola clip video.
+    Estrae feature DINOv2 da tutti i frame di una clip.
 
-    Restituisce un tensore [T, 768], dove T è il numero reale di frame
-    della clip.
+    Input:
+        frames: lista di frame
+    Output:
+        Tensor [T, D]
     """
-
-    frames = read_video_frames(video_path)
 
     if len(frames) == 0:
-        raise ValueError(f"Nessun frame letto dal video: {video_path}")
+        raise ValueError("Clip senza frame.")
 
     all_features = []
 
-    with torch.no_grad():
-        for start in range(0, len(frames), chunk_size):
-            chunk = frames[start:start + chunk_size]
+    for start_idx in range(0, len(frames), chunk_size):
+        chunk = frames[start_idx : start_idx + chunk_size]
 
-            # Ogni frame viene trasformato in 320x320 stretched,
-            # senza center crop.
-            #
-            # batch shape:
-            # [numero_frame_chunk, 3, 320, 320]
-            batch = torch.stack([transform(frame) for frame in chunk])
-            batch = batch.to(device)
+        batch = torch.stack(
+            [transform(frame_to_pil(frame)) for frame in chunk],
+            dim=0,
+        ).to(device)
 
-            # Output:
-            # [numero_frame_chunk, 768]
-            features = model(batch)
+        features = model(batch)
 
-            # Spostiamo le feature su CPU per liberare memoria GPU.
-            all_features.append(features.cpu())
+        all_features.append(features.cpu())
 
-    features = torch.cat(all_features, dim=0)
-
-    return features
+    return torch.cat(all_features, dim=0)
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--dataset-root",
         type=str,
-        default="data/datasets/dataset_basket_v1",
-        help="Cartella principale del dataset.",
+        required=True,
+        help="Root del dataset video, es. data/datasets/dataset_basket_v1",
     )
 
     parser.add_argument(
         "--manifest",
         type=str,
-        default="data/datasets/dataset_basket_v1/manifest.csv",
-        help="Percorso del manifest.csv.",
+        required=True,
+        help="Path del manifest.csv",
     )
 
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="data/features/convnext_tiny_stretched_320",
-        help="Cartella in cui salvare le feature estratte.",
+        required=True,
+        help="Cartella di output delle feature estratte.",
+    )
+
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="dinov2_vits14",
+        choices=[
+            "dinov2_vits14",
+            "dinov2_vitb14",
+            "dinov2_vitl14",
+            "dinov2_vitg14",
+        ],
+        help="Modello DINOv2 da usare.",
+    )
+
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=336,
+        help="Dimensione del resize quadrato. Consigliato 336 per DINOv2.",
     )
 
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=150,
-        help="Numero di frame processati contemporaneamente.",
+        default=128,
+        help="Numero di frame processati insieme dalla GPU.",
     )
 
     parser.add_argument(
-        "--no-overwrite",
-        action="store_true",
-        help="Se attivo, NON ricalcola le feature già esistenti.",
+        "--device",
+        type=str,
+        default="cuda",
+        help="cuda oppure cpu.",
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Se attivo, sovrascrive feature già esistenti.",
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
 
     dataset_root = Path(args.dataset_root)
     manifest_path = Path(args.manifest)
     output_dir = Path(args.output_dir)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.model_name not in DINO_FEATURE_DIMS:
+        raise ValueError(f"Modello DINOv2 non supportato: {args.model_name}")
 
-    # Di default sovrascriviamo le feature.
-    # Se usi --no-overwrite, salta quelle già esistenti.
-    overwrite = not args.no_overwrite
+    feature_dim = DINO_FEATURE_DIMS[args.model_name]
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu"
+    )
 
     print(f"Device: {device}")
-    print(f"Dataset root: {dataset_root}")
-    print(f"Manifest: {manifest_path}")
+    print(f"Modello DINOv2: {args.model_name}")
+    print(f"Feature dim: {feature_dim}")
+    print(f"Image size: {args.image_size}x{args.image_size}")
     print(f"Output dir: {output_dir}")
-    print(f"Chunk size: {args.chunk_size}")
-    print("Transform: stretched resize 320x320, no center crop")
-    print(f"Overwrite: {overwrite}")
 
-    df = pd.read_csv(manifest_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Nuovo transform: 320x320 stretched senza center crop.
-    transform = build_stretched_320_transform()
+    manifest = pd.read_csv(manifest_path)
 
-    model = build_convnext_tiny_feature_extractor(device)
+    model = DINOv2FeatureExtractor(args.model_name).to(device)
+    model.eval()
 
-    for _, row in tqdm(df.iterrows(), total=len(df)):
-        clip_id = row["clip_id"]
-        rel_path = row["path"]
-        split = row["split"]
-        label = row["label"]
+    transform = build_transform(args.image_size)
 
-        if label not in LABELS:
-            print(f"Label non riconosciuta per {clip_id}: {label}")
-            continue
+    num_ok = 0
+    num_skipped = 0
+    num_errors = 0
+
+    for row in tqdm(manifest.itertuples(index=False), total=len(manifest)):
+        clip_id = str(row.clip_id)
+        rel_path = Path(row.path)
+        label = str(row.label)
+        split = str(row.split)
+
+        if label not in LABEL_TO_IDX:
+            raise ValueError(f"Label non riconosciuta: {label}")
 
         video_path = dataset_root / rel_path
 
-        save_dir = output_dir / split / label
-        save_dir.mkdir(parents=True, exist_ok=True)
+        out_path = output_dir / split / label / f"{clip_id}.pt"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        save_path = save_dir / f"{clip_id}.pt"
-
-        if save_path.exists() and not overwrite:
+        if out_path.exists() and not args.overwrite:
+            num_skipped += 1
             continue
 
         try:
-            features = extract_features_for_video(
-                video_path=video_path,
+            frames = read_video_frames(video_path)
+
+            features = extract_clip_features(
+                frames=frames,
                 model=model,
                 transform=transform,
                 device=device,
                 chunk_size=args.chunk_size,
             )
 
-            item = {
-                "clip_id": clip_id,
-                "features": features,       # [T, 768]
-                "label": label,
-                "path": rel_path,
-                "num_frames": features.shape[0],
-                "feature_extractor": "convnext_tiny",
-                "feature_dim": features.shape[1],
+            if features.ndim != 2:
+                raise ValueError(f"Feature con shape non valida: {features.shape}")
 
-                # Metadati sul preprocessing usato.
-                "resize_mode": "stretched",
-                "input_size": 320,
-                "center_crop": False,
-                "normalization": "imagenet",
-            }
+            if features.shape[1] != feature_dim:
+                raise ValueError(
+                    f"Feature dim inattesa: ottenuto {features.shape[1]}, "
+                    f"atteso {feature_dim}"
+                )
 
-            torch.save(item, save_path)
+            torch.save(
+                {
+                    "features": features,
+                    "label": LABEL_TO_IDX[label],
+                    "label_name": label,
+                    "clip_id": clip_id,
+                    "path": str(rel_path),
+                    "split": split,
+                    "model_name": args.model_name,
+                    "feature_dim": feature_dim,
+                    "image_size": args.image_size,
+                },
+                out_path,
+            )
 
-        except Exception as e:
-            print(f"Errore su {video_path}: {e}")
+            num_ok += 1
+
+        except Exception as exc:
+            num_errors += 1
+            print(f"\nErrore su {video_path}: {exc}")
+
+    print("\nEstrazione completata.")
+    print(f"Clip processate: {num_ok}")
+    print(f"Clip saltate perché già esistenti: {num_skipped}")
+    print(f"Clip con errore: {num_errors}")
+    print(f"Feature salvate in: {output_dir}")
 
 
 if __name__ == "__main__":
