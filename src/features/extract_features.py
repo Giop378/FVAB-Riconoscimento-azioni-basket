@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 from tqdm import tqdm
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
@@ -28,6 +28,18 @@ LABELS = [
 LABEL_TO_IDX = {label: idx for idx, label in enumerate(LABELS)}
 
 
+# Applichiamo augmentation solo alle classi di tiro e solo nello split train.
+# Le classi passaggio, idle e non-gioco restano non augmentate perché già numerose.
+AUGMENT_LABELS = {
+    "tiroDaDue0",
+    "tiroDaDue1",
+    "tiroDaTre0",
+    "tiroDaTre1",
+    "tiroLibero0",
+    "tiroLibero1",
+}
+
+
 # Per ora teniamo solo i modelli DINOv3 più utili per il progetto.
 # DINOv3 ViT-B/16 -> feature da 768
 # DINOv3 ViT-L/16 -> feature da 1024
@@ -41,7 +53,8 @@ class DINOv3FeatureExtractor(nn.Module):
     """
     Wrapper per DINOv3.
 
-    Usiamo il token globale CLS come feature del singolo frame.
+    Usiamo una feature globale per ogni frame, preferendo il CLS token
+    normalizzato quando disponibile.
 
     Input:
         x: [B, 3, H, W]
@@ -93,9 +106,7 @@ class DINOv3FeatureExtractor(nn.Module):
 
         DINOv3, a seconda del modello/versione, può esporre:
         - forward_features con output dizionario
-        - forward diretto che restituisce già il CLS token
-
-        Qui gestiamo entrambi i casi.
+        - forward diretto che restituisce già una feature globale
         """
 
         if hasattr(self.backbone, "forward_features"):
@@ -110,8 +121,8 @@ class DINOv3FeatureExtractor(nn.Module):
                 if "x_prenorm" in out:
                     return out["x_prenorm"][:, 0]
 
+                # Ultimo fallback: media dei patch tokens.
                 if "x_norm_patchtokens" in out:
-                    # Ultimo fallback ragionevole: media dei patch tokens.
                     return out["x_norm_patchtokens"].mean(dim=1)
 
             if torch.is_tensor(out):
@@ -130,16 +141,14 @@ class DINOv3FeatureExtractor(nn.Module):
             if out.ndim == 3:
                 return out[:, 0]
 
-        raise RuntimeError(
-            f"Output DINOv3 non gestito. Tipo: {type(out)}"
-        )
+        raise RuntimeError(f"Output DINOv3 non gestito. Tipo: {type(out)}")
 
 
 def build_transform(image_size: int):
     """
     Preprocessing per DINOv3.
 
-    Manteniamo la stessa scelta usata negli esperimenti DINOv2:
+    Manteniamo la stessa scelta usata negli esperimenti DINOv2/DINOv3:
     - resize stretched quadrato
     - no center crop
     - normalizzazione ImageNet
@@ -205,6 +214,35 @@ def frame_to_pil(frame):
     raise TypeError(f"Tipo frame non supportato: {type(frame)}")
 
 
+def apply_frame_augmentation(image: Image.Image, augmentation: str) -> Image.Image:
+    """
+    Applica una augmentation leggera e deterministica a un frame.
+
+    La trasformazione è uguale per tutti i frame della clip, così evitiamo
+    flickering temporale artificiale.
+
+    Augmentation supportate:
+        - orig: nessuna modifica
+        - hflip: flip orizzontale
+        - color: brightness/contrast/color jitter leggero
+        - hflip_color: flip + color jitter leggero
+    """
+
+    if augmentation == "orig":
+        return image
+
+    if augmentation in ("hflip", "hflip_color"):
+        image = ImageOps.mirror(image)
+
+    if augmentation in ("color", "hflip_color"):
+        # Valori volutamente leggeri per non alterare troppo palla/canestro.
+        image = ImageEnhance.Brightness(image).enhance(1.08)
+        image = ImageEnhance.Contrast(image).enhance(1.08)
+        image = ImageEnhance.Color(image).enhance(1.05)
+
+    return image
+
+
 @torch.no_grad()
 def extract_clip_features(
     frames,
@@ -212,12 +250,14 @@ def extract_clip_features(
     transform,
     device,
     chunk_size: int,
+    augmentation: str = "orig",
 ):
     """
     Estrae feature DINOv3 da tutti i frame di una clip.
 
     Input:
         frames: lista di frame della clip
+        augmentation: augmentation da applicare ai frame prima del preprocessing
 
     Output:
         Tensor [T, D]
@@ -235,7 +275,15 @@ def extract_clip_features(
         chunk = frames[start_idx : start_idx + chunk_size]
 
         batch = torch.stack(
-            [transform(frame_to_pil(frame)) for frame in chunk],
+            [
+                transform(
+                    apply_frame_augmentation(
+                        frame_to_pil(frame),
+                        augmentation,
+                    )
+                )
+                for frame in chunk
+            ],
             dim=0,
         ).to(device)
 
@@ -287,7 +335,7 @@ def parse_args():
         required=True,
         help=(
             "Path locale o URL dei pesi DINOv3. "
-            "Esempio: checkpoints/dinov3_vitl16_pretrain_lvd1689m.pth"
+            "Esempio: checkpoints/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
         ),
     )
 
@@ -340,6 +388,20 @@ def parse_args():
         help="Se attivo, sovrascrive feature già esistenti.",
     )
 
+    parser.add_argument(
+        "--augment-train-shots",
+        action="store_true",
+        help="Se attivo, applica augmentation leggera solo alle classi di tiro nello split train.",
+    )
+
+    parser.add_argument(
+        "--augmentations",
+        nargs="+",
+        default=["hflip", "color"],
+        choices=["hflip", "color", "hflip_color"],
+        help="Lista di augmentation da applicare alle clip di tiro nel train.",
+    )
+
     return parser.parse_args()
 
 
@@ -374,6 +436,10 @@ def main():
     print(f"Repo/dir DINOv3: {args.repo_or_dir}")
     print(f"Source: {args.source}")
     print(f"Weights: {args.weights}")
+    print(f"Augment train shots: {args.augment_train_shots}")
+    if args.augment_train_shots:
+        print(f"Augmentations: {args.augmentations}")
+        print(f"Classi augmentate: {sorted(AUGMENT_LABELS)}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -385,7 +451,6 @@ def main():
         repo_or_dir=args.repo_or_dir,
         source=args.source,
     ).to(device)
-
     model.eval()
 
     transform = build_transform(args.image_size)
@@ -405,57 +470,80 @@ def main():
 
         video_path = dataset_root / rel_path
 
-        out_path = output_dir / split / label / f"{clip_id}.pt"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        variants = ["orig"]
+        if args.augment_train_shots and split == "train" and label in AUGMENT_LABELS:
+            variants.extend(args.augmentations)
 
-        if out_path.exists() and not args.overwrite:
-            num_skipped += 1
-            continue
+        # Se tutte le varianti esistono già e non stiamo sovrascrivendo,
+        # evitiamo anche di leggere il video.
+        if not args.overwrite:
+            existing_variants = 0
+            for augmentation in variants:
+                out_clip_id = clip_id if augmentation == "orig" else f"{clip_id}_{augmentation}"
+                out_path = output_dir / split / label / f"{out_clip_id}.pt"
+                if out_path.exists():
+                    existing_variants += 1
+
+            if existing_variants == len(variants):
+                num_skipped += len(variants)
+                continue
 
         try:
             frames = read_video_frames(video_path)
 
-            features = extract_clip_features(
-                frames=frames,
-                model=model,
-                transform=transform,
-                device=device,
-                chunk_size=args.chunk_size,
-            )
+            for augmentation in variants:
+                out_clip_id = clip_id if augmentation == "orig" else f"{clip_id}_{augmentation}"
+                out_path = output_dir / split / label / f"{out_clip_id}.pt"
+                out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            if features.ndim != 2:
-                raise ValueError(f"Feature con shape non valida: {features.shape}")
+                if out_path.exists() and not args.overwrite:
+                    num_skipped += 1
+                    continue
 
-            if features.shape[1] != feature_dim:
-                raise ValueError(
-                    f"Feature dim inattesa per {args.model_name}: "
-                    f"ottenuto {features.shape[1]}, atteso {feature_dim}"
+                features = extract_clip_features(
+                    frames=frames,
+                    model=model,
+                    transform=transform,
+                    device=device,
+                    chunk_size=args.chunk_size,
+                    augmentation=augmentation,
                 )
 
-            torch.save(
-                {
-                    "features": features,
-                    "label": LABEL_TO_IDX[label],
-                    "label_name": label,
-                    "clip_id": clip_id,
-                    "path": str(rel_path),
-                    "split": split,
-                    "model_name": args.model_name,
-                    "feature_dim": feature_dim,
-                    "image_size": args.image_size,
-                },
-                out_path,
-            )
+                if features.ndim != 2:
+                    raise ValueError(f"Feature con shape non valida: {features.shape}")
 
-            num_ok += 1
+                if features.shape[1] != feature_dim:
+                    raise ValueError(
+                        f"Feature dim inattesa per {args.model_name}: "
+                        f"ottenuto {features.shape[1]}, atteso {feature_dim}"
+                    )
+
+                torch.save(
+                    {
+                        "features": features,
+                        "label": LABEL_TO_IDX[label],
+                        "label_name": label,
+                        "clip_id": out_clip_id,
+                        "source_clip_id": clip_id,
+                        "path": str(rel_path),
+                        "split": split,
+                        "model_name": args.model_name,
+                        "feature_dim": feature_dim,
+                        "image_size": args.image_size,
+                        "augmentation": augmentation,
+                    },
+                    out_path,
+                )
+
+                num_ok += 1
 
         except Exception as exc:
             num_errors += 1
             print(f"\nErrore su {video_path}: {exc}")
 
     print("\nEstrazione completata.")
-    print(f"Clip processate: {num_ok}")
-    print(f"Clip saltate perché già esistenti: {num_skipped}")
+    print(f"Feature salvate: {num_ok}")
+    print(f"Feature saltate perché già esistenti: {num_skipped}")
     print(f"Clip con errore: {num_errors}")
     print(f"Feature salvate in: {output_dir}")
 

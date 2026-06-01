@@ -2,7 +2,7 @@
 
 Questo file tiene traccia sintetica degli esperimenti effettuati sostituendo il classificatore GRU/BiGRU con un classificatore basato su **Temporal Transformer Encoder**.
 
-Gli esperimenti usano feature già estratte con **ConvNeXt-Tiny frozen**, **DINOv2-B/14 frozen** e **DINOv2-L/14 frozen**, confrontando diverse configurazioni del classificatore temporale, del pooling e delle strategie per gestire lo sbilanciamento tra classi.
+Gli esperimenti usano feature già estratte con **ConvNeXt-Tiny frozen**, **DINOv2-B/14 frozen**, **DINOv2-L/14 frozen** e **DINOv3-L/16 frozen**, confrontando diverse configurazioni del classificatore temporale, del pooling e delle strategie per gestire lo sbilanciamento tra classi.
 
 ## Tabella riassuntiva
 
@@ -19,6 +19,8 @@ Gli esperimenti usano feature già estratte con **ConvNeXt-Tiny frozen**, **DINO
 | exp_18 | Temporal Transformer regularized | DINOv2-L/14 frozen | 40 | 64 | 5e-5 | 256 | 2 | 4 | 768 | 0.45 | 5e-3 | Mean | 0.5 | WeightedRandomSampler power 0.4 | 0.6160 | 0.7944 | 0.5762 | 0.7840 | outputs/exp_18_dinov2_vitl14_transformer_mean |
 | exp_19 | Temporal Transformer d384 | DINOv2-L/14 frozen | 40 | 64 | 5e-5 | 384 | 2 | 6 | 1024 | 0.45 | 5e-3 | CLS | 0.5 | WeightedRandomSampler power 0.4 | 0.5823 | 0.8167 | 0.5672 | 0.8079 | outputs/exp_19_dinov2_vitl14_transformer_cls_d384 |
 | exp_20 | Temporal Transformer d384 balanced | DINOv2-L/14 frozen | 40 | 64 | 5e-5 | 384 | 2 | 6 | 1024 | 0.50 | 7e-3 | CLS | 0.6 | WeightedRandomSampler power 0.5 | 0.6246 | 0.7889 | 0.5455 | 0.7894 | outputs/exp_20_dinov2_vitl14_transformer_cls_d384_balanced |
+| exp_21 | Temporal Transformer d384 | DINOv3-L/16 frozen | 40 | 64 | 5e-5 | 384 | 2 | 6 | 1024 | 0.45 | 5e-3 | CLS | 0.5 | WeightedRandomSampler power 0.4 | 0.5752 | 0.8148 | 0.6256 | 0.8095 | outputs/exp_21_dinov3_vitl16_transformer_cls_d384 |
+| exp_22 | Temporal Transformer d384 | DINOv3-L/16 frozen | 40 | 64 | 5e-5 | 384 | 2 | 6 | 1024 | 0.45 | 5e-3 | Mean | 0.5 | WeightedRandomSampler power 0.4 | 0.5707 | 0.8296 | 0.6146 | 0.8232 | outputs/exp_22_dinov3_vitl16_transformer_mean_d384 |
 
 ## Risultati aggregati su validation - 9 classi
 
@@ -35,6 +37,8 @@ Gli esperimenti usano feature già estratte con **ConvNeXt-Tiny frozen**, **DINO
 |exp_18|0.7944|0.64|0.58|0.58|0.81|0.79|0.78|
 |exp_19|0.8167|0.59|0.57|0.57|0.81|0.82|0.81|
 |exp_20|0.7889|0.54|0.56|0.55|0.79|0.79|0.79|
+|exp_21|0.8148|0.66|0.62|0.63|0.81|0.81|0.81|
+|exp_22|0.8296|0.65|0.61|0.61|0.83|0.83|0.82|
 
 ## Risultati aggregati sulle sole 7 azioni reali
 
@@ -51,6 +55,8 @@ Gli esperimenti usano feature già estratte con **ConvNeXt-Tiny frozen**, **DINO
 |exp_18|0.73|0.86|0.79|0.58|0.55|0.54|0.74|0.86|0.79|
 |exp_19|0.80|0.83|0.81|0.53|0.52|0.51|0.79|0.83|0.80|
 |exp_20|0.78|0.80|0.79|0.48|0.51|0.49|0.78|0.80|0.79|
+|exp_21|0.81|0.81|0.81|0.63|0.58|0.58|0.82|0.81|0.81|
+|exp_22|0.80|0.86|0.83|0.59|0.56|0.57|0.80|0.86|0.82|
 
 ## Risultati per classe su validation
 
@@ -207,6 +213,34 @@ Gli esperimenti usano feature già estratte con **ConvNeXt-Tiny frozen**, **DINO
 |tiroLibero1|0.42|0.45|0.43|11|
 |idle|0.60|0.59|0.59|93|
 |non-gioco|0.92|0.88|0.90|170|
+
+### exp_21 - DINOv3-L/16 frozen, Temporal Transformer d384, CLS pooling, sampler power 0.4
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|passaggio|0.88|0.90|0.89|212|
+|tiroDaDue0|0.62|0.38|0.47|21|
+|tiroDaDue1|0.37|0.64|0.47|11|
+|tiroDaTre0|0.60|0.75|0.67|12|
+|tiroDaTre1|0.33|0.33|0.33|3|
+|tiroLibero0|0.83|0.71|0.77|7|
+|tiroLibero1|0.80|0.36|0.50|11|
+|idle|0.66|0.57|0.61|93|
+|non-gioco|0.89|0.96|0.92|170|
+
+### exp_22 - DINOv3-L/16 frozen, Temporal Transformer d384, mean pooling, sampler power 0.4
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|passaggio|0.87|0.95|0.91|212|
+|tiroDaDue0|0.62|0.62|0.62|21|
+|tiroDaDue1|0.38|0.27|0.32|11|
+|tiroDaTre0|0.64|0.75|0.69|12|
+|tiroDaTre1|0.25|0.33|0.29|3|
+|tiroLibero0|1.00|0.57|0.73|7|
+|tiroLibero1|0.38|0.45|0.42|11|
+|idle|0.76|0.56|0.65|93|
+|non-gioco|0.90|0.94|0.92|170|
 
 ## Comandi utilizzati
 
@@ -447,25 +481,37 @@ python -m src.training.train \
   --output-dir outputs/exp_20_dinov2_vitl14_transformer_cls_d384_balanced
 ```
 
-## Nota finale
+### exp_21
 
-Il miglior modello in termini di **Val Macro F1 sulle 9 classi** resta **exp_16**, con:
-
-```text
-Val Macro F1 = 0.5865
-Val Accuracy = 0.7852
-Val Weighted F1 = 0.7817
-Macro F1 sulle sole 7 azioni reali = 0.54
+```bash
+python -m src.training.train   --features-root data/features/dinov3_vitl16_336   --epochs 40   --batch-size 64   --lr 5e-5   --input-dim 1024   --d-model 384   --num-layers 2   --num-heads 6   --ff-dim 1024   --dropout 0.45   --weight-decay 5e-3   --pooling cls   --class-weight-power 0.5   --sampler-power 0.4   --scheduler-patience 5   --output-dir outputs/exp_21_dinov3_vitl16_transformer_cls_d384
 ```
 
-Tuttavia, il miglior compromesso operativo complessivo è **exp_19**, con:
+### exp_22
+
+```bash
+python -m src.training.train   --features-root data/features/dinov3_vitl16_336   --epochs 40   --batch-size 64   --lr 5e-5   --input-dim 1024   --d-model 384   --num-layers 2   --num-heads 6   --ff-dim 1024   --dropout 0.45   --weight-decay 5e-3   --pooling mean   --class-weight-power 0.5   --sampler-power 0.4   --scheduler-patience 5   --output-dir outputs/exp_22_dinov3_vitl16_transformer_mean_d384
+```
+
+## Nota finale
+
+Il miglior modello in termini di **Val Macro F1 sulle 9 classi** è **exp_21**, con:
 
 ```text
-Val Macro F1 = 0.5672
-Val Accuracy = 0.8167
-Val Weighted F1 = 0.8079
-Micro F1 sulle sole 7 azioni reali = 0.81
-Weighted F1 sulle sole 7 azioni reali = 0.80
+Val Macro F1 = 0.6256
+Val Accuracy = 0.8148
+Val Weighted F1 = 0.8095
+Macro F1 sulle sole 7 azioni reali = 0.58
+```
+
+Il miglior compromesso operativo complessivo è invece **exp_22**, con:
+
+```text
+Val Macro F1 = 0.6146
+Val Accuracy = 0.8296
+Val Weighted F1 = 0.8232
+Micro F1 sulle sole 7 azioni reali = 0.83
+Weighted F1 sulle sole 7 azioni reali = 0.82
 ```
 
 Il confronto tra gli esperimenti suggerisce che:
@@ -476,16 +522,18 @@ Il confronto tra gli esperimenti suggerisce che:
 - **exp_13** sostituisce il CLS pooling con mean pooling e ottiene il miglior compromesso complessivo tra gli esperimenti basati su ConvNeXt-Tiny.
 - **exp_14** aumenta il `sampler-power` da 0.4 a 0.5, ma non migliora rispetto a exp_13.
 - **exp_15** sostituisce ConvNeXt-Tiny con **DINOv2-B/14 frozen** e usa mean pooling. Il miglioramento è netto rispetto agli esperimenti precedenti: la Val Macro F1 passa da 0.4557 di exp_13 a 0.5833.
-- **exp_16** usa le stesse feature DINOv2-B/14 di exp_15, ma cambia il pooling da mean a CLS. Ottiene il miglior risultato sulle 9 classi, con Val Macro F1 = 0.5865.
+- **exp_16** usa le stesse feature DINOv2-B/14 di exp_15, ma cambia il pooling da mean a CLS. Ottiene il miglior risultato tra gli esperimenti DINOv2-B/14, con Val Macro F1 = 0.5865.
 - **exp_17** sostituisce DINOv2-B/14 con **DINOv2-L/14 frozen**, mantenendo CLS pooling e `d_model = 256`. Migliora accuracy e weighted F1 rispetto a exp_16, ma non migliora la Macro F1 complessiva.
 - **exp_18** usa DINOv2-L/14 con mean pooling. Ottiene una Macro F1 molto vicina a exp_17 e una buona recall sulle azioni reali, ma tende a generare più falsi positivi sulle azioni, in particolare confondendo diverse clip `idle` con `passaggio`.
-- **exp_19** aumenta la capacità del classificatore temporale usando `d_model = 384`, `num_heads = 6` e `ff_dim = 1024`. Ottiene la migliore accuracy, il miglior weighted F1 sulle 9 classi e la migliore micro F1 sulle 7 azioni reali. Per questo motivo è il miglior candidato come modello principale.
+- **exp_19** aumenta la capacità del classificatore temporale usando `d_model = 384`, `num_heads = 6` e `ff_dim = 1024`. Ottiene la migliore accuracy e il miglior weighted F1 tra gli esperimenti DINOv2, oltre alla migliore micro F1 sulle 7 azioni reali fino a quel punto.
 - **exp_20** parte da exp_19 e aumenta regolarizzazione e bilanciamento (`dropout = 0.50`, `weight_decay = 7e-3`, `class_weight_power = 0.6`, `sampler_power = 0.5`). L'esperimento non migliora exp_19 e peggiora sia accuracy sia Macro F1, suggerendo che un bilanciamento più aggressivo non è vantaggioso in questa configurazione.
+- **exp_21** sostituisce DINOv2-L/14 con **DINOv3-L/16 frozen**, mantenendo la configurazione di exp_19 e CLS pooling. Ottiene la migliore Val Macro F1 complessiva, migliorando soprattutto il bilanciamento tra le classi e recuperando parzialmente classi rare come `tiroDaTre1`, `tiroLibero0` e `tiroLibero1`.
+- **exp_22** usa DINOv3-L/16 con mean pooling. Ottiene la migliore accuracy, il miglior weighted F1 sulle 9 classi e la migliore micro F1 sulle 7 azioni reali. La Macro F1 è leggermente inferiore rispetto a exp_21, ma il comportamento globale risulta più solido.
 
 Il miglior compromesso attuale è quindi:
 
 ```text
-DINOv2-L/14 frozen + Temporal Transformer
+DINOv3-L/16 frozen + Temporal Transformer
 input_dim = 1024
 d_model = 384
 num_layers = 2
@@ -493,22 +541,21 @@ num_heads = 6
 ff_dim = 1024
 dropout = 0.45
 weight_decay = 5e-3
-pooling = CLS
+pooling = Mean
 class_weight_power = 0.5
 sampler_power = 0.4
 ```
 
-Rispetto agli esperimenti basati su ConvNeXt-Tiny, il passaggio a DINOv2-B/14 produce un miglioramento netto e stabile. Il passaggio successivo a DINOv2-L/14 non migliora la Macro F1 massima, ma migliora le metriche globali, soprattutto quando il classificatore temporale viene reso leggermente più capiente in exp_19.
+Rispetto agli esperimenti basati su ConvNeXt-Tiny, il passaggio a DINOv2-B/14 produce un miglioramento netto e stabile. Il passaggio successivo a DINOv2-L/14 migliora soprattutto le metriche globali quando il classificatore temporale viene reso più capiente in exp_19. Il passaggio a DINOv3-L/16 produce invece il miglioramento più importante sulle metriche complessive e sulle classi rare, portando la Macro F1 massima da 0.5865 di exp_16 a 0.6256 di exp_21.
 
 Le classi più problematiche restano:
 
 ```text
+tiroDaDue1
 tiroDaTre1
 tiroLibero1
-tiroDaDue0
-tiroDaDue1
 ```
 
-`tiroDaTre1` ha solo 3 esempi in validation, quindi la sua metrica è molto instabile: exp_16 ed exp_18 riescono a classificarne correttamente almeno uno, mentre exp_19 ed exp_20 non ne riconoscono nessuno. Per questo motivo exp_16 resta importante come miglior modello in termini di Macro F1, ma exp_19 è più solido come modello operativo complessivo.
+`tiroDaTre1` ha solo 3 esempi in validation, quindi la sua metrica è molto instabile: exp_21 ed exp_22 riescono a classificarne correttamente almeno uno, mentre exp_19 ed exp_20 non ne riconoscono nessuno. Per questo motivo exp_21 resta importante come miglior modello in termini di Macro F1, mentre exp_22 è più adatto come modello operativo complessivo.
 
-Il prossimo passo consigliato non è aumentare ulteriormente la dimensione del modello, ma fare un'analisi degli errori sulle clip delle classi di tiro, soprattutto per verificare se l'esito del tiro sia effettivamente visibile nella finestra temporale della clip. In parallelo si può valutare data augmentation mirata sulle classi rare, evitando però di aumentare eccessivamente `class_weight_power` e `sampler_power`, dato che exp_20 non ha prodotto miglioramenti.
+Il prossimo passo consigliato non è aumentare ulteriormente la dimensione del modello, ma introdurre **data augmentation mirata sulle classi di tiro** durante la fase di feature extraction. L'augmentation dovrebbe essere applicata solo al training set e principalmente alle classi rare, evitando di aumentare ulteriormente `passaggio`, `idle` e `non-gioco`, già molto rappresentate nel dataset.
