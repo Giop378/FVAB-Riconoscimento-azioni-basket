@@ -28,38 +28,58 @@ LABELS = [
 LABEL_TO_IDX = {label: idx for idx, label in enumerate(LABELS)}
 
 
+# Per ora teniamo solo i modelli DINOv3 più utili per il progetto.
+# DINOv3 ViT-B/16 -> feature da 768
+# DINOv3 ViT-L/16 -> feature da 1024
 DINO_FEATURE_DIMS = {
-    "dinov2_vits14": 384,
-    "dinov2_vitb14": 768,
-    "dinov2_vitl14": 1024,
-    "dinov2_vitg14": 1536,
+    "dinov3_vitb16": 768,
+    "dinov3_vitl16": 1024,
 }
 
 
-class DINOv2FeatureExtractor(nn.Module):
+class DINOv3FeatureExtractor(nn.Module):
     """
-    Wrapper per DINOv2.
+    Wrapper per DINOv3.
 
-    Usiamo il CLS token normalizzato come feature del frame.
+    Usiamo il token globale CLS come feature del singolo frame.
+
+    Input:
+        x: [B, 3, H, W]
+
     Output:
-        [B, D]
-    dove D dipende dal modello:
-        dinov2_vits14 -> 384
-        dinov2_vitb14 -> 768
-        dinov2_vitl14 -> 1024
+        features: [B, D]
+
+    dove D dipende dal backbone:
+        dinov3_vitb16 -> 768
+        dinov3_vitl16 -> 1024
     """
 
-    def __init__(self, model_name: str):
+    def __init__(
+        self,
+        model_name: str,
+        weights: str,
+        repo_or_dir: str,
+        source: str,
+    ):
         super().__init__()
 
         self.model_name = model_name
 
-        self.backbone = torch.hub.load(
-            "facebookresearch/dinov2",
-            model_name,
-            pretrained=True,
-            trust_repo=True,
-        )
+        if source == "local":
+            self.backbone = torch.hub.load(
+                repo_or_dir,
+                model_name,
+                source="local",
+                weights=weights,
+            )
+        else:
+            self.backbone = torch.hub.load(
+                repo_or_dir,
+                model_name,
+                source="github",
+                weights=weights,
+                trust_repo=True,
+            )
 
         self.backbone.eval()
 
@@ -69,32 +89,63 @@ class DINOv2FeatureExtractor(nn.Module):
     @torch.no_grad()
     def forward(self, x):
         """
-        x: [B, 3, H, W]
+        Estrae una feature globale per ogni frame.
+
+        DINOv3, a seconda del modello/versione, può esporre:
+        - forward_features con output dizionario
+        - forward diretto che restituisce già il CLS token
+
+        Qui gestiamo entrambi i casi.
         """
 
-        # Nei modelli DINOv2 da torch.hub è disponibile forward_features.
-        # Prendiamo x_norm_clstoken, cioè la rappresentazione globale del frame.
         if hasattr(self.backbone, "forward_features"):
             out = self.backbone.forward_features(x)
 
             if isinstance(out, dict):
+                # Caso più comune per modelli ViT stile DINO.
                 if "x_norm_clstoken" in out:
                     return out["x_norm_clstoken"]
 
+                # Fallback: primo token della sequenza.
                 if "x_prenorm" in out:
                     return out["x_prenorm"][:, 0]
 
-        # Fallback: di solito model(x) restituisce già una feature [B, D].
-        return self.backbone(x)
+                if "x_norm_patchtokens" in out:
+                    # Ultimo fallback ragionevole: media dei patch tokens.
+                    return out["x_norm_patchtokens"].mean(dim=1)
+
+            if torch.is_tensor(out):
+                if out.ndim == 2:
+                    return out
+
+                if out.ndim == 3:
+                    return out[:, 0]
+
+        out = self.backbone(x)
+
+        if torch.is_tensor(out):
+            if out.ndim == 2:
+                return out
+
+            if out.ndim == 3:
+                return out[:, 0]
+
+        raise RuntimeError(
+            f"Output DINOv3 non gestito. Tipo: {type(out)}"
+        )
 
 
 def build_transform(image_size: int):
     """
-    Preprocessing per DINOv2.
+    Preprocessing per DINOv3.
 
-    Usiamo resize stretched senza center crop, come negli ultimi esperimenti.
-    Per DINOv2 conviene usare dimensioni multiple di 14.
-    336 = 14 * 24.
+    Manteniamo la stessa scelta usata negli esperimenti DINOv2:
+    - resize stretched quadrato
+    - no center crop
+    - normalizzazione ImageNet
+
+    Per DINOv3 ViT-* /16 è consigliato usare dimensioni multiple di 16.
+    336 = 16 * 21, quindi va bene.
     """
 
     return transforms.Compose(
@@ -139,7 +190,7 @@ def frame_to_pil(frame):
         if frame.ndim != 3:
             raise ValueError(f"Frame tensor con shape non valida: {frame.shape}")
 
-        # Se è [H, W, C], lo porto a [C, H, W]
+        # Se è [H, W, C], lo porto a [C, H, W].
         if frame.shape[-1] in (1, 3):
             frame = frame.permute(2, 0, 1)
 
@@ -163,12 +214,16 @@ def extract_clip_features(
     chunk_size: int,
 ):
     """
-    Estrae feature DINOv2 da tutti i frame di una clip.
+    Estrae feature DINOv3 da tutti i frame di una clip.
 
     Input:
-        frames: lista di frame
+        frames: lista di frame della clip
+
     Output:
         Tensor [T, D]
+        dove:
+            T = numero di frame della clip
+            D = dimensione della feature DINOv3
     """
 
     if len(frames) == 0:
@@ -185,6 +240,9 @@ def extract_clip_features(
         ).to(device)
 
         features = model(batch)
+
+        if features.ndim != 2:
+            raise ValueError(f"Feature con shape non valida: {features.shape}")
 
         all_features.append(features.cpu())
 
@@ -218,21 +276,48 @@ def parse_args():
     parser.add_argument(
         "--model-name",
         type=str,
-        default="dinov2_vits14",
-        choices=[
-            "dinov2_vits14",
-            "dinov2_vitb14",
-            "dinov2_vitl14",
-            "dinov2_vitg14",
-        ],
-        help="Modello DINOv2 da usare.",
+        default="dinov3_vitl16",
+        choices=list(DINO_FEATURE_DIMS.keys()),
+        help="Modello DINOv3 da usare.",
+    )
+
+    parser.add_argument(
+        "--weights",
+        type=str,
+        required=True,
+        help=(
+            "Path locale o URL dei pesi DINOv3. "
+            "Esempio: checkpoints/dinov3_vitl16_pretrain_lvd1689m.pth"
+        ),
+    )
+
+    parser.add_argument(
+        "--repo-or-dir",
+        type=str,
+        default="facebookresearch/dinov3",
+        help=(
+            "Repository GitHub o path locale del repository DINOv3. "
+            "Esempio GitHub: facebookresearch/dinov3. "
+            "Esempio locale: third_party/dinov3"
+        ),
+    )
+
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="github",
+        choices=["github", "local"],
+        help=(
+            "Usa 'github' se vuoi caricare da facebookresearch/dinov3; "
+            "usa 'local' se hai clonato il repository DINOv3 in locale."
+        ),
     )
 
     parser.add_argument(
         "--image-size",
         type=int,
         default=336,
-        help="Dimensione del resize quadrato. Consigliato 336 per DINOv2.",
+        help="Dimensione del resize quadrato. Per DINOv3 ViT-* /16 usare multipli di 16.",
     )
 
     parser.add_argument(
@@ -266,25 +351,41 @@ def main():
     output_dir = Path(args.output_dir)
 
     if args.model_name not in DINO_FEATURE_DIMS:
-        raise ValueError(f"Modello DINOv2 non supportato: {args.model_name}")
+        raise ValueError(f"Modello DINOv3 non supportato: {args.model_name}")
 
     feature_dim = DINO_FEATURE_DIMS[args.model_name]
+
+    if args.image_size % 16 != 0:
+        raise ValueError(
+            f"image_size={args.image_size} non è multiplo di 16. "
+            "Per DINOv3 ViT-* /16 usa una dimensione multipla di 16, ad esempio 224, 320 o 336."
+        )
 
     device = torch.device(
         args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu"
     )
 
     print(f"Device: {device}")
-    print(f"Modello DINOv2: {args.model_name}")
-    print(f"Feature dim: {feature_dim}")
+    print(f"Modello DINOv3: {args.model_name}")
+    print(f"Feature dim attesa: {feature_dim}")
     print(f"Image size: {args.image_size}x{args.image_size}")
+    print(f"Chunk size: {args.chunk_size}")
     print(f"Output dir: {output_dir}")
+    print(f"Repo/dir DINOv3: {args.repo_or_dir}")
+    print(f"Source: {args.source}")
+    print(f"Weights: {args.weights}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = pd.read_csv(manifest_path)
 
-    model = DINOv2FeatureExtractor(args.model_name).to(device)
+    model = DINOv3FeatureExtractor(
+        model_name=args.model_name,
+        weights=args.weights,
+        repo_or_dir=args.repo_or_dir,
+        source=args.source,
+    ).to(device)
+
     model.eval()
 
     transform = build_transform(args.image_size)
@@ -327,8 +428,8 @@ def main():
 
             if features.shape[1] != feature_dim:
                 raise ValueError(
-                    f"Feature dim inattesa: ottenuto {features.shape[1]}, "
-                    f"atteso {feature_dim}"
+                    f"Feature dim inattesa per {args.model_name}: "
+                    f"ottenuto {features.shape[1]}, atteso {feature_dim}"
                 )
 
             torch.save(
