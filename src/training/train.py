@@ -286,15 +286,14 @@ class LabelMappedDataset(Dataset):
         base_idx = self.indices[idx]
         sample = self.base_dataset[base_idx]
 
-        # Copia shallow per evitare di modificare accidentalmente il sample originale.
+        # Copia il dizionario per evitare modifiche indesiderate al sample originale.
         sample = dict(sample)
-        mapped_label = int(self.mapped_labels[idx])
 
-        sample["label"] = mapped_label
+        mapped_label = self.mapped_labels[idx]
 
-        # Nel caso in cui qualche versione del dataset usi anche questa chiave.
-        if "labels" in sample:
-            sample["labels"] = mapped_label
+        # collate_features si aspetta che item["label"] sia un Tensor,
+        # perché poi fa torch.stack([item["label"] for item in batch]).
+        sample["label"] = torch.tensor(mapped_label, dtype=torch.long)
 
         return sample
 
