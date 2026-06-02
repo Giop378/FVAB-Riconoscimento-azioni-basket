@@ -8,7 +8,7 @@ import traceback
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
 
 from src.data.feature_dataset import FeatureDataset, collate_features, IDX_TO_LABEL, LABEL_TO_IDX
@@ -51,69 +51,51 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-LABEL_MODE_CHOICES = [
-    "full",
-    "shot_outcome",
-    "shot_type",
-    "action_group",
-    "action_noaction",
-]
-
-
-def get_label_mode_config(label_mode: str):
+def get_original_idx_to_label():
     """
-    Restituisce la configurazione delle label usata dal training.
-
-    Le feature restano sempre salvate con le 9 classi originali.
-    Questa funzione permette di rimappare le label al momento del training,
-    senza dover riestrarre le feature.
-
-    Modalita disponibili:
-        full:
-            9 classi originali.
-
-        shot_outcome:
-            5 classi. I tiri vengono collassati in tiro0 / tiro1.
-            Serve a capire se il modello distingue l'esito del tiro.
-
-        shot_type:
-            6 classi. I tiri vengono collassati in tiroDaDue / tiroDaTre / tiroLibero.
-            Serve a capire se il modello distingue il tipo di tiro.
-
-        action_group:
-            4 classi. Tutti i tiri vengono collassati in tiro.
-            Utile come primo stadio di un classificatore gerarchico.
-
-        action_noaction:
-            3 classi. I tiri vengono collassati in tiro e idle/non-gioco
-            vengono collassati in no-action.
-            Utile come primo stadio più semplice per separare azioni rilevanti
-            da finestre da scartare nel report finale.
+    Restituisce il mapping originale idx -> label in forma di dict.
+    IDX_TO_LABEL nel progetto è già usato come mapping indicizzabile.
     """
+    return {idx: IDX_TO_LABEL[idx] for idx in range(len(IDX_TO_LABEL))}
 
-    if label_mode == "full":
-        idx_to_label = dict(IDX_TO_LABEL)
-        original_to_new = {idx: idx for idx in IDX_TO_LABEL.keys()}
 
-    elif label_mode == "shot_outcome":
+def build_label_mapping(label_mode: str):
+    """
+    Costruisce:
+    - label_mapping: label originale -> label usata dal modello
+    - idx_to_label: indice di output del modello -> label usata dal modello
+
+    Modalità previste:
+    - original: 9 classi originali.
+    - action_noaction: passaggio / tiro / no-action.
+    - shot_type: passaggio / tipo tiro / idle / non-gioco.
+    - shot_outcome: passaggio / esito tiro / idle / non-gioco.
+    - action_group: passaggio / tiro / idle / non-gioco.
+    - shot_type_only: solo clip di tiro, classificate per tipo.
+    - shot_outcome_only: solo clip di tiro, classificate per esito.
+    """
+    original_idx_to_label = get_original_idx_to_label()
+
+    if label_mode == "original":
+        idx_to_label = original_idx_to_label
+        label_mapping = {label: label for label in original_idx_to_label.values()}
+
+    elif label_mode == "action_noaction":
         idx_to_label = {
             0: "passaggio",
-            1: "tiro0",
-            2: "tiro1",
-            3: "idle",
-            4: "non-gioco",
+            1: "tiro",
+            2: "no-action",
         }
-
-        original_to_new = {
-            LABEL_TO_IDX["passaggio"]: 0,
-            LABEL_TO_IDX["tiroDaDue0"]: 1,
-            LABEL_TO_IDX["tiroDaTre0"]: 1,
-            LABEL_TO_IDX["tiroLibero0"]: 1,
-            LABEL_TO_IDX["tiroDaDue1"]: 2,
-            LABEL_TO_IDX["tiroDaTre1"]: 2,
-            LABEL_TO_IDX["tiroLibero1"]: 2,
-            LABEL_TO_IDX["idle"]: 3,
-            LABEL_TO_IDX["non-gioco"]: 4,
+        label_mapping = {
+            "passaggio": "passaggio",
+            "tiroDaDue0": "tiro",
+            "tiroDaDue1": "tiro",
+            "tiroDaTre0": "tiro",
+            "tiroDaTre1": "tiro",
+            "tiroLibero0": "tiro",
+            "tiroLibero1": "tiro",
+            "idle": "no-action",
+            "non-gioco": "no-action",
         }
 
     elif label_mode == "shot_type":
@@ -125,17 +107,36 @@ def get_label_mode_config(label_mode: str):
             4: "idle",
             5: "non-gioco",
         }
+        label_mapping = {
+            "passaggio": "passaggio",
+            "tiroDaDue0": "tiroDaDue",
+            "tiroDaDue1": "tiroDaDue",
+            "tiroDaTre0": "tiroDaTre",
+            "tiroDaTre1": "tiroDaTre",
+            "tiroLibero0": "tiroLibero",
+            "tiroLibero1": "tiroLibero",
+            "idle": "idle",
+            "non-gioco": "non-gioco",
+        }
 
-        original_to_new = {
-            LABEL_TO_IDX["passaggio"]: 0,
-            LABEL_TO_IDX["tiroDaDue0"]: 1,
-            LABEL_TO_IDX["tiroDaDue1"]: 1,
-            LABEL_TO_IDX["tiroDaTre0"]: 2,
-            LABEL_TO_IDX["tiroDaTre1"]: 2,
-            LABEL_TO_IDX["tiroLibero0"]: 3,
-            LABEL_TO_IDX["tiroLibero1"]: 3,
-            LABEL_TO_IDX["idle"]: 4,
-            LABEL_TO_IDX["non-gioco"]: 5,
+    elif label_mode == "shot_outcome":
+        idx_to_label = {
+            0: "passaggio",
+            1: "tiro0",
+            2: "tiro1",
+            3: "idle",
+            4: "non-gioco",
+        }
+        label_mapping = {
+            "passaggio": "passaggio",
+            "tiroDaDue0": "tiro0",
+            "tiroDaTre0": "tiro0",
+            "tiroLibero0": "tiro0",
+            "tiroDaDue1": "tiro1",
+            "tiroDaTre1": "tiro1",
+            "tiroLibero1": "tiro1",
+            "idle": "idle",
+            "non-gioco": "non-gioco",
         }
 
     elif label_mode == "action_group":
@@ -145,101 +146,180 @@ def get_label_mode_config(label_mode: str):
             2: "idle",
             3: "non-gioco",
         }
-
-        original_to_new = {
-            LABEL_TO_IDX["passaggio"]: 0,
-            LABEL_TO_IDX["tiroDaDue0"]: 1,
-            LABEL_TO_IDX["tiroDaDue1"]: 1,
-            LABEL_TO_IDX["tiroDaTre0"]: 1,
-            LABEL_TO_IDX["tiroDaTre1"]: 1,
-            LABEL_TO_IDX["tiroLibero0"]: 1,
-            LABEL_TO_IDX["tiroLibero1"]: 1,
-            LABEL_TO_IDX["idle"]: 2,
-            LABEL_TO_IDX["non-gioco"]: 3,
+        label_mapping = {
+            "passaggio": "passaggio",
+            "tiroDaDue0": "tiro",
+            "tiroDaDue1": "tiro",
+            "tiroDaTre0": "tiro",
+            "tiroDaTre1": "tiro",
+            "tiroLibero0": "tiro",
+            "tiroLibero1": "tiro",
+            "idle": "idle",
+            "non-gioco": "non-gioco",
         }
 
-    elif label_mode == "action_noaction":
+    elif label_mode == "shot_type_only":
         idx_to_label = {
-            0: "passaggio",
-            1: "tiro",
-            2: "no-action",
+            0: "tiroDaDue",
+            1: "tiroDaTre",
+            2: "tiroLibero",
+        }
+        label_mapping = {
+            "tiroDaDue0": "tiroDaDue",
+            "tiroDaDue1": "tiroDaDue",
+            "tiroDaTre0": "tiroDaTre",
+            "tiroDaTre1": "tiroDaTre",
+            "tiroLibero0": "tiroLibero",
+            "tiroLibero1": "tiroLibero",
         }
 
-        original_to_new = {
-            LABEL_TO_IDX["passaggio"]: 0,
-            LABEL_TO_IDX["tiroDaDue0"]: 1,
-            LABEL_TO_IDX["tiroDaDue1"]: 1,
-            LABEL_TO_IDX["tiroDaTre0"]: 1,
-            LABEL_TO_IDX["tiroDaTre1"]: 1,
-            LABEL_TO_IDX["tiroLibero0"]: 1,
-            LABEL_TO_IDX["tiroLibero1"]: 1,
-            LABEL_TO_IDX["idle"]: 2,
-            LABEL_TO_IDX["non-gioco"]: 2,
+    elif label_mode == "shot_outcome_only":
+        idx_to_label = {
+            0: "tiro0",
+            1: "tiro1",
+        }
+        label_mapping = {
+            "tiroDaDue0": "tiro0",
+            "tiroDaTre0": "tiro0",
+            "tiroLibero0": "tiro0",
+            "tiroDaDue1": "tiro1",
+            "tiroDaTre1": "tiro1",
+            "tiroLibero1": "tiro1",
         }
 
     else:
-        raise ValueError(f"label_mode non supportato: {label_mode}")
+        raise ValueError(f"Label mode non supportata: {label_mode}")
 
-    return {
-        "label_mode": label_mode,
-        "idx_to_label": idx_to_label,
-        "original_to_new": original_to_new,
-        "num_classes": len(idx_to_label),
-    }
+    return label_mapping, idx_to_label
 
 
-def build_label_map_tensor(original_to_new: dict[int, int], device: torch.device):
+def get_label_to_idx(idx_to_label):
+    return {label: idx for idx, label in idx_to_label.items()}
+
+
+def normalize_sample_label(label_value) -> int:
+    if isinstance(label_value, torch.Tensor):
+        return int(label_value.item())
+    return int(label_value)
+
+
+def infer_original_label_from_item(item):
     """
-    Crea un tensore di mapping da label originale a label rimappata.
+    Cerca di ricavare la label originale senza caricare il tensore delle feature.
+    Nel FeatureDataset corrente gli item sono path e la label è il nome della cartella padre.
+    """
+    original_idx_to_label = get_original_idx_to_label()
+
+    if isinstance(item, dict):
+        if "label" in item:
+            label = item["label"]
+            if isinstance(label, str):
+                return label
+            return original_idx_to_label[normalize_sample_label(label)]
+
+        if "path" in item:
+            return Path(item["path"]).parent.name
+
+    return Path(item).parent.name
+
+
+class LabelMappedDataset(Dataset):
+    """
+    Wrapper per FeatureDataset che permette di:
+    - rimappare le label originali in label aggregate;
+    - filtrare alcune classi quando serve addestrare un sotto-modello.
 
     Esempio:
-        labels originali: [1, 3, 5]
-        shot_outcome:    [1, 1, 1]
+    - shot_type_only tiene solo le clip di tiro e le rimappa in:
+      tiroDaDue / tiroDaTre / tiroLibero.
+    - shot_outcome_only tiene solo le clip di tiro e le rimappa in:
+      tiro0 / tiro1.
     """
 
-    label_map = torch.empty(len(IDX_TO_LABEL), dtype=torch.long)
+    def __init__(self, base_dataset: Dataset, label_mode: str):
+        self.base_dataset = base_dataset
+        self.label_mode = label_mode
 
-    for original_idx in range(len(IDX_TO_LABEL)):
-        if original_idx not in original_to_new:
-            raise ValueError(f"Mapping mancante per label originale {original_idx}")
-        label_map[original_idx] = int(original_to_new[original_idx])
+        self.label_mapping, self.idx_to_label = build_label_mapping(label_mode)
+        self.label_to_idx = get_label_to_idx(self.idx_to_label)
+        self.original_idx_to_label = get_original_idx_to_label()
 
-    return label_map.to(device)
+        self.indices = []
+        self.mapped_labels = []
+        self.original_labels = []
+
+        if hasattr(base_dataset, "items"):
+            for idx, item in enumerate(base_dataset.items):
+                original_label = infer_original_label_from_item(item)
+                self._try_add_item(idx, original_label)
+        else:
+            for idx in range(len(base_dataset)):
+                sample = base_dataset[idx]
+                if "label" not in sample:
+                    raise KeyError("Il sample del dataset non contiene la chiave 'label'.")
+
+                original_label_idx = normalize_sample_label(sample["label"])
+                original_label = self.original_idx_to_label[original_label_idx]
+                self._try_add_item(idx, original_label)
+
+        if len(self.indices) == 0:
+            raise ValueError(
+                f"Nessun campione disponibile per label_mode='{label_mode}'. "
+                "Controlla mapping, nomi delle cartelle e split del dataset."
+            )
+
+    def _try_add_item(self, idx: int, original_label: str):
+        if original_label not in self.label_mapping:
+            return
+
+        mapped_label = self.label_mapping[original_label]
+        mapped_idx = self.label_to_idx[mapped_label]
+
+        self.indices.append(idx)
+        self.mapped_labels.append(mapped_idx)
+        self.original_labels.append(original_label)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        base_idx = self.indices[idx]
+        sample = self.base_dataset[base_idx]
+
+        # Copia shallow per evitare di modificare accidentalmente il sample originale.
+        sample = dict(sample)
+        mapped_label = int(self.mapped_labels[idx])
+
+        sample["label"] = mapped_label
+
+        # Nel caso in cui qualche versione del dataset usi anche questa chiave.
+        if "labels" in sample:
+            sample["labels"] = mapped_label
+
+        return sample
 
 
-def remap_labels(labels: torch.Tensor, label_map_tensor: torch.Tensor):
-    """
-    Rimappa le label originali del dataset nella label-mode selezionata.
-    """
-
-    return label_map_tensor[labels.long()]
-
-
-def get_dataset_labels_and_counts(dataset, num_classes: int, original_to_new: dict[int, int]):
+def get_dataset_labels_and_counts(dataset, num_classes: int):
     labels = []
     counts = torch.zeros(num_classes, dtype=torch.float)
 
-    if hasattr(dataset, "items"):
-        for item in dataset.items:
-            item_path = Path(item)
-            label_name = item_path.parent.name
-
-            if label_name not in LABEL_TO_IDX:
-                raise ValueError(f"Label non riconosciuta: {label_name}")
-
-            original_label_idx = LABEL_TO_IDX[label_name]
-            label_idx = original_to_new[original_label_idx]
-
-            labels.append(label_idx)
-            counts[label_idx] += 1
+    if hasattr(dataset, "mapped_labels"):
+        iterable_labels = dataset.mapped_labels
     else:
+        iterable_labels = []
         for idx in range(len(dataset)):
             sample = dataset[idx]
-            original_label_idx = int(sample["label"])
-            label_idx = original_to_new[original_label_idx]
+            iterable_labels.append(normalize_sample_label(sample["label"]))
 
-            labels.append(label_idx)
-            counts[label_idx] += 1
+    for label_idx in iterable_labels:
+        label_idx = int(label_idx)
+        if label_idx < 0 or label_idx >= num_classes:
+            raise ValueError(
+                f"Label index fuori range: {label_idx}. "
+                f"Numero classi corrente: {num_classes}."
+            )
+        labels.append(label_idx)
+        counts[label_idx] += 1
 
     labels = torch.tensor(labels, dtype=torch.long)
     return labels, counts
@@ -266,6 +346,23 @@ def build_weighted_sampler(labels: torch.Tensor, counts: torch.Tensor, power: fl
     )
 
 
+def print_label_mode_info(label_mode: str, label_mapping, idx_to_label):
+    print("\n# Label mode")
+    print(f"Label mode: {label_mode}")
+
+    print("Classi usate nel training:")
+    for idx in range(len(idx_to_label)):
+        print(f"  {idx}: {idx_to_label[idx]}")
+
+    print("\nMapping label originali -> label usate nel training:")
+    for idx in range(len(IDX_TO_LABEL)):
+        original_label = IDX_TO_LABEL[idx]
+        if original_label in label_mapping:
+            print(f"  {original_label} -> {label_mapping[original_label]}")
+        else:
+            print(f"  {original_label} -> esclusa")
+
+
 def print_class_stats(counts, idx_to_label, class_weights=None):
     print("Class counts:")
     for idx in range(len(counts)):
@@ -277,31 +374,11 @@ def print_class_stats(counts, idx_to_label, class_weights=None):
             print(f"  {idx_to_label[idx]}: {class_weights[idx].item():.4f}")
 
 
-def print_label_mapping(label_config):
-    print(f"Label mode: {label_config['label_mode']}")
-    print("Mapping label originali -> label usate nel training:")
-
-    original_to_new = label_config["original_to_new"]
-    idx_to_label = label_config["idx_to_label"]
-
-    for original_idx in range(len(IDX_TO_LABEL)):
-        new_idx = original_to_new[original_idx]
-        print(f"  {IDX_TO_LABEL[original_idx]} -> {idx_to_label[new_idx]}")
-
-
 def get_current_lr(optimizer):
     return optimizer.param_groups[0]["lr"]
 
 
-def train_one_epoch(
-    model,
-    loader,
-    criterion,
-    optimizer,
-    device,
-    label_map_tensor,
-    grad_clip: float = 1.0,
-):
+def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip: float = 1.0):
     model.train()
 
     total_loss = 0.0
@@ -312,7 +389,6 @@ def train_one_epoch(
         features = batch["features"].to(device)
         lengths = batch["lengths"].to(device)
         labels = batch["labels"].to(device)
-        labels = remap_labels(labels, label_map_tensor)
 
         optimizer.zero_grad()
 
@@ -341,7 +417,7 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, label_map_tensor):
+def evaluate(model, loader, criterion, device):
     model.eval()
 
     total_loss = 0.0
@@ -352,7 +428,6 @@ def evaluate(model, loader, criterion, device, label_map_tensor):
         features = batch["features"].to(device)
         lengths = batch["lengths"].to(device)
         labels = batch["labels"].to(device)
-        labels = remap_labels(labels, label_map_tensor)
 
         logits = model(features, lengths)
         loss = criterion(logits, labels)
@@ -394,15 +469,19 @@ def parse_args():
     parser.add_argument(
         "--label-mode",
         type=str,
-        default="full",
-        choices=LABEL_MODE_CHOICES,
+        default="original",
+        choices=[
+            "original",
+            "action_noaction",
+            "shot_type",
+            "shot_outcome",
+            "action_group",
+            "shot_type_only",
+            "shot_outcome_only",
+        ],
         help=(
-            "Modalita di rimappatura delle classi: "
-            "full=9 classi originali; "
-            "shot_outcome=passaggio/tiro0/tiro1/idle/non-gioco; "
-            "shot_type=passaggio/tiroDaDue/tiroDaTre/tiroLibero/idle/non-gioco; "
-            "action_group=passaggio/tiro/idle/non-gioco; "
-            "action_noaction=passaggio/tiro/no-action."
+            "Modalità di etichettatura. "
+            "Per la gerarchia usare: action_noaction, shot_type_only, shot_outcome_only."
         ),
     )
 
@@ -476,22 +555,27 @@ def run_training(args):
     print(f"Device: {device}")
     print(f"Seed: {args.seed}")
 
-    label_config = get_label_mode_config(args.label_mode)
-    idx_to_label = label_config["idx_to_label"]
-    original_to_new = label_config["original_to_new"]
-    num_classes = label_config["num_classes"]
-    label_map_tensor = build_label_map_tensor(original_to_new, device)
+    label_mapping, idx_to_label = build_label_mapping(args.label_mode)
+    label_to_idx = get_label_to_idx(idx_to_label)
+    num_classes = len(idx_to_label)
 
-    print("\n# Label mode")
-    print_label_mapping(label_config)
+    print_label_mode_info(args.label_mode, label_mapping, idx_to_label)
 
-    train_dataset = FeatureDataset(args.features_root, split="train")
-    val_dataset = FeatureDataset(args.features_root, split="val")
+    base_train_dataset = FeatureDataset(args.features_root, split="train")
+    base_val_dataset = FeatureDataset(args.features_root, split="val")
+
+    train_dataset = LabelMappedDataset(base_train_dataset, args.label_mode)
+    val_dataset = LabelMappedDataset(base_val_dataset, args.label_mode)
+
+    print("\n# Dataset")
+    print(f"Train samples originali: {len(base_train_dataset)}")
+    print(f"Train samples usati: {len(train_dataset)}")
+    print(f"Val samples originali: {len(base_val_dataset)}")
+    print(f"Val samples usati: {len(val_dataset)}")
 
     train_labels, train_counts = get_dataset_labels_and_counts(
         train_dataset,
         num_classes=num_classes,
-        original_to_new=original_to_new,
     )
 
     print("\n# Distribuzione classi")
@@ -599,7 +683,6 @@ def run_training(args):
             criterion=criterion,
             optimizer=optimizer,
             device=device,
-            label_map_tensor=label_map_tensor,
             grad_clip=args.grad_clip,
         )
 
@@ -608,7 +691,6 @@ def run_training(args):
             loader=val_loader,
             criterion=criterion,
             device=device,
-            label_map_tensor=label_map_tensor,
         )
 
         print(
@@ -646,9 +728,10 @@ def run_training(args):
                     "best_val_acc": best_val_acc,
                     "epoch": best_epoch,
                     "idx_to_label": idx_to_label,
-                    "original_idx_to_label": IDX_TO_LABEL,
+                    "label_to_idx": label_to_idx,
                     "label_mode": args.label_mode,
-                    "label_mapping_original_to_new": original_to_new,
+                    "label_mapping": label_mapping,
+                    "original_idx_to_label": get_original_idx_to_label(),
                     "model_config": model_config,
                     "training_config": vars(args),
                     "class_weights": class_weights.detach().cpu()
@@ -679,13 +762,16 @@ def run_training(args):
     print(f"Best val macro-F1: {best_macro_f1:.4f}")
     print(f"Best val weighted-F1: {best_weighted_f1:.4f}")
 
+    labels = list(range(num_classes))
+    target_names = [idx_to_label[i] for i in labels]
+
     print(f"\nClassification report - {num_classes} classi ({args.label_mode}):")
     print(
         classification_report(
             best_val_labels,
             best_val_preds,
-            labels=list(range(num_classes)),
-            target_names=[idx_to_label[i] for i in range(num_classes)],
+            labels=labels,
+            target_names=target_names,
             zero_division=0,
         )
     )
@@ -695,18 +781,18 @@ def run_training(args):
         confusion_matrix(
             best_val_labels,
             best_val_preds,
-            labels=list(range(num_classes)),
+            labels=labels,
         )
     )
 
-    if args.label_mode == "full":
+    if args.label_mode == "original":
         print("\nClassification report - solo 7 azioni reali:")
         print(
             classification_report(
                 best_val_labels,
                 best_val_preds,
                 labels=list(range(7)),
-                target_names=[idx_to_label[i] for i in range(7)],
+                target_names=[IDX_TO_LABEL[i] for i in range(7)],
                 zero_division=0,
             )
         )
