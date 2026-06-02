@@ -56,6 +56,7 @@ LABEL_MODE_CHOICES = [
     "shot_outcome",
     "shot_type",
     "action_group",
+    "action_noaction",
 ]
 
 
@@ -82,6 +83,12 @@ def get_label_mode_config(label_mode: str):
         action_group:
             4 classi. Tutti i tiri vengono collassati in tiro.
             Utile come primo stadio di un classificatore gerarchico.
+
+        action_noaction:
+            3 classi. I tiri vengono collassati in tiro e idle/non-gioco
+            vengono collassati in no-action.
+            Utile come primo stadio più semplice per separare azioni rilevanti
+            da finestre da scartare nel report finale.
     """
 
     if label_mode == "full":
@@ -149,6 +156,25 @@ def get_label_mode_config(label_mode: str):
             LABEL_TO_IDX["tiroLibero1"]: 1,
             LABEL_TO_IDX["idle"]: 2,
             LABEL_TO_IDX["non-gioco"]: 3,
+        }
+
+    elif label_mode == "action_noaction":
+        idx_to_label = {
+            0: "passaggio",
+            1: "tiro",
+            2: "no-action",
+        }
+
+        original_to_new = {
+            LABEL_TO_IDX["passaggio"]: 0,
+            LABEL_TO_IDX["tiroDaDue0"]: 1,
+            LABEL_TO_IDX["tiroDaDue1"]: 1,
+            LABEL_TO_IDX["tiroDaTre0"]: 1,
+            LABEL_TO_IDX["tiroDaTre1"]: 1,
+            LABEL_TO_IDX["tiroLibero0"]: 1,
+            LABEL_TO_IDX["tiroLibero1"]: 1,
+            LABEL_TO_IDX["idle"]: 2,
+            LABEL_TO_IDX["non-gioco"]: 2,
         }
 
     else:
@@ -375,7 +401,8 @@ def parse_args():
             "full=9 classi originali; "
             "shot_outcome=passaggio/tiro0/tiro1/idle/non-gioco; "
             "shot_type=passaggio/tiroDaDue/tiroDaTre/tiroLibero/idle/non-gioco; "
-            "action_group=passaggio/tiro/idle/non-gioco."
+            "action_group=passaggio/tiro/idle/non-gioco; "
+            "action_noaction=passaggio/tiro/no-action."
         ),
     )
 
