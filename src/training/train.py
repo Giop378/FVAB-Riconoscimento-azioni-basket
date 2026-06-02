@@ -51,7 +51,145 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-def get_dataset_labels_and_counts(dataset, num_classes: int = 9):
+LABEL_MODE_CHOICES = [
+    "full",
+    "shot_outcome",
+    "shot_type",
+    "action_group",
+]
+
+
+def get_label_mode_config(label_mode: str):
+    """
+    Restituisce la configurazione delle label usata dal training.
+
+    Le feature restano sempre salvate con le 9 classi originali.
+    Questa funzione permette di rimappare le label al momento del training,
+    senza dover riestrarre le feature.
+
+    Modalita disponibili:
+        full:
+            9 classi originali.
+
+        shot_outcome:
+            5 classi. I tiri vengono collassati in tiro0 / tiro1.
+            Serve a capire se il modello distingue l'esito del tiro.
+
+        shot_type:
+            6 classi. I tiri vengono collassati in tiroDaDue / tiroDaTre / tiroLibero.
+            Serve a capire se il modello distingue il tipo di tiro.
+
+        action_group:
+            4 classi. Tutti i tiri vengono collassati in tiro.
+            Utile come primo stadio di un classificatore gerarchico.
+    """
+
+    if label_mode == "full":
+        idx_to_label = dict(IDX_TO_LABEL)
+        original_to_new = {idx: idx for idx in IDX_TO_LABEL.keys()}
+
+    elif label_mode == "shot_outcome":
+        idx_to_label = {
+            0: "passaggio",
+            1: "tiro0",
+            2: "tiro1",
+            3: "idle",
+            4: "non-gioco",
+        }
+
+        original_to_new = {
+            LABEL_TO_IDX["passaggio"]: 0,
+            LABEL_TO_IDX["tiroDaDue0"]: 1,
+            LABEL_TO_IDX["tiroDaTre0"]: 1,
+            LABEL_TO_IDX["tiroLibero0"]: 1,
+            LABEL_TO_IDX["tiroDaDue1"]: 2,
+            LABEL_TO_IDX["tiroDaTre1"]: 2,
+            LABEL_TO_IDX["tiroLibero1"]: 2,
+            LABEL_TO_IDX["idle"]: 3,
+            LABEL_TO_IDX["non-gioco"]: 4,
+        }
+
+    elif label_mode == "shot_type":
+        idx_to_label = {
+            0: "passaggio",
+            1: "tiroDaDue",
+            2: "tiroDaTre",
+            3: "tiroLibero",
+            4: "idle",
+            5: "non-gioco",
+        }
+
+        original_to_new = {
+            LABEL_TO_IDX["passaggio"]: 0,
+            LABEL_TO_IDX["tiroDaDue0"]: 1,
+            LABEL_TO_IDX["tiroDaDue1"]: 1,
+            LABEL_TO_IDX["tiroDaTre0"]: 2,
+            LABEL_TO_IDX["tiroDaTre1"]: 2,
+            LABEL_TO_IDX["tiroLibero0"]: 3,
+            LABEL_TO_IDX["tiroLibero1"]: 3,
+            LABEL_TO_IDX["idle"]: 4,
+            LABEL_TO_IDX["non-gioco"]: 5,
+        }
+
+    elif label_mode == "action_group":
+        idx_to_label = {
+            0: "passaggio",
+            1: "tiro",
+            2: "idle",
+            3: "non-gioco",
+        }
+
+        original_to_new = {
+            LABEL_TO_IDX["passaggio"]: 0,
+            LABEL_TO_IDX["tiroDaDue0"]: 1,
+            LABEL_TO_IDX["tiroDaDue1"]: 1,
+            LABEL_TO_IDX["tiroDaTre0"]: 1,
+            LABEL_TO_IDX["tiroDaTre1"]: 1,
+            LABEL_TO_IDX["tiroLibero0"]: 1,
+            LABEL_TO_IDX["tiroLibero1"]: 1,
+            LABEL_TO_IDX["idle"]: 2,
+            LABEL_TO_IDX["non-gioco"]: 3,
+        }
+
+    else:
+        raise ValueError(f"label_mode non supportato: {label_mode}")
+
+    return {
+        "label_mode": label_mode,
+        "idx_to_label": idx_to_label,
+        "original_to_new": original_to_new,
+        "num_classes": len(idx_to_label),
+    }
+
+
+def build_label_map_tensor(original_to_new: dict[int, int], device: torch.device):
+    """
+    Crea un tensore di mapping da label originale a label rimappata.
+
+    Esempio:
+        labels originali: [1, 3, 5]
+        shot_outcome:    [1, 1, 1]
+    """
+
+    label_map = torch.empty(len(IDX_TO_LABEL), dtype=torch.long)
+
+    for original_idx in range(len(IDX_TO_LABEL)):
+        if original_idx not in original_to_new:
+            raise ValueError(f"Mapping mancante per label originale {original_idx}")
+        label_map[original_idx] = int(original_to_new[original_idx])
+
+    return label_map.to(device)
+
+
+def remap_labels(labels: torch.Tensor, label_map_tensor: torch.Tensor):
+    """
+    Rimappa le label originali del dataset nella label-mode selezionata.
+    """
+
+    return label_map_tensor[labels.long()]
+
+
+def get_dataset_labels_and_counts(dataset, num_classes: int, original_to_new: dict[int, int]):
     labels = []
     counts = torch.zeros(num_classes, dtype=torch.float)
 
@@ -63,13 +201,17 @@ def get_dataset_labels_and_counts(dataset, num_classes: int = 9):
             if label_name not in LABEL_TO_IDX:
                 raise ValueError(f"Label non riconosciuta: {label_name}")
 
-            label_idx = LABEL_TO_IDX[label_name]
+            original_label_idx = LABEL_TO_IDX[label_name]
+            label_idx = original_to_new[original_label_idx]
+
             labels.append(label_idx)
             counts[label_idx] += 1
     else:
         for idx in range(len(dataset)):
             sample = dataset[idx]
-            label_idx = int(sample["label"])
+            original_label_idx = int(sample["label"])
+            label_idx = original_to_new[original_label_idx]
+
             labels.append(label_idx)
             counts[label_idx] += 1
 
@@ -98,22 +240,42 @@ def build_weighted_sampler(labels: torch.Tensor, counts: torch.Tensor, power: fl
     )
 
 
-def print_class_stats(counts, class_weights=None):
+def print_class_stats(counts, idx_to_label, class_weights=None):
     print("Class counts:")
     for idx in range(len(counts)):
-        print(f"  {IDX_TO_LABEL[idx]}: {int(counts[idx].item())}")
+        print(f"  {idx_to_label[idx]}: {int(counts[idx].item())}")
 
     if class_weights is not None:
         print("\nClass weights:")
         for idx in range(len(class_weights)):
-            print(f"  {IDX_TO_LABEL[idx]}: {class_weights[idx].item():.4f}")
+            print(f"  {idx_to_label[idx]}: {class_weights[idx].item():.4f}")
+
+
+def print_label_mapping(label_config):
+    print(f"Label mode: {label_config['label_mode']}")
+    print("Mapping label originali -> label usate nel training:")
+
+    original_to_new = label_config["original_to_new"]
+    idx_to_label = label_config["idx_to_label"]
+
+    for original_idx in range(len(IDX_TO_LABEL)):
+        new_idx = original_to_new[original_idx]
+        print(f"  {IDX_TO_LABEL[original_idx]} -> {idx_to_label[new_idx]}")
 
 
 def get_current_lr(optimizer):
     return optimizer.param_groups[0]["lr"]
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip: float = 1.0):
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device,
+    label_map_tensor,
+    grad_clip: float = 1.0,
+):
     model.train()
 
     total_loss = 0.0
@@ -124,6 +286,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip: floa
         features = batch["features"].to(device)
         lengths = batch["lengths"].to(device)
         labels = batch["labels"].to(device)
+        labels = remap_labels(labels, label_map_tensor)
 
         optimizer.zero_grad()
 
@@ -152,7 +315,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip: floa
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, label_map_tensor):
     model.eval()
 
     total_loss = 0.0
@@ -163,6 +326,7 @@ def evaluate(model, loader, criterion, device):
         features = batch["features"].to(device)
         lengths = batch["lengths"].to(device)
         labels = batch["labels"].to(device)
+        labels = remap_labels(labels, label_map_tensor)
 
         logits = model(features, lengths)
         loss = criterion(logits, labels)
@@ -201,6 +365,20 @@ def parse_args():
     parser.add_argument("--pooling", type=str, default="cls", choices=["cls", "mean"])
     parser.add_argument("--max-len", type=int, default=1024)
 
+    parser.add_argument(
+        "--label-mode",
+        type=str,
+        default="full",
+        choices=LABEL_MODE_CHOICES,
+        help=(
+            "Modalita di rimappatura delle classi: "
+            "full=9 classi originali; "
+            "shot_outcome=passaggio/tiro0/tiro1/idle/non-gioco; "
+            "shot_type=passaggio/tiroDaDue/tiroDaTre/tiroLibero/idle/non-gioco; "
+            "action_group=passaggio/tiro/idle/non-gioco."
+        ),
+    )
+
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -226,14 +404,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_model(args, device):
+def build_model(args, device, num_classes: int):
     model = TemporalTransformerActionClassifier(
         input_dim=args.input_dim,
         d_model=args.d_model,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         dim_feedforward=args.ff_dim,
-        num_classes=9,
+        num_classes=num_classes,
         dropout=args.dropout,
         pooling=args.pooling,
         max_len=args.max_len,
@@ -246,7 +424,7 @@ def build_model(args, device):
         "num_layers": args.num_layers,
         "num_heads": args.num_heads,
         "dim_feedforward": args.ff_dim,
-        "num_classes": 9,
+        "num_classes": num_classes,
         "dropout": args.dropout,
         "pooling": args.pooling,
         "max_len": args.max_len,
@@ -271,12 +449,22 @@ def run_training(args):
     print(f"Device: {device}")
     print(f"Seed: {args.seed}")
 
+    label_config = get_label_mode_config(args.label_mode)
+    idx_to_label = label_config["idx_to_label"]
+    original_to_new = label_config["original_to_new"]
+    num_classes = label_config["num_classes"]
+    label_map_tensor = build_label_map_tensor(original_to_new, device)
+
+    print("\n# Label mode")
+    print_label_mapping(label_config)
+
     train_dataset = FeatureDataset(args.features_root, split="train")
     val_dataset = FeatureDataset(args.features_root, split="val")
 
     train_labels, train_counts = get_dataset_labels_and_counts(
         train_dataset,
-        num_classes=9,
+        num_classes=num_classes,
+        original_to_new=original_to_new,
     )
 
     print("\n# Distribuzione classi")
@@ -284,7 +472,7 @@ def run_training(args):
     if args.no_class_weights:
         class_weights = None
         criterion = nn.CrossEntropyLoss()
-        print_class_stats(train_counts)
+        print_class_stats(train_counts, idx_to_label)
         print("\nWeighted CrossEntropyLoss disattivata.")
     else:
         class_weights_cpu = compute_class_weights_from_counts(
@@ -293,7 +481,7 @@ def run_training(args):
         )
         class_weights = class_weights_cpu.to(device)
         criterion = nn.CrossEntropyLoss(weight=class_weights)
-        print_class_stats(train_counts, class_weights_cpu)
+        print_class_stats(train_counts, idx_to_label, class_weights_cpu)
         print("\nWeighted CrossEntropyLoss attiva.")
 
     if args.no_weighted_sampler:
@@ -338,7 +526,7 @@ def run_training(args):
         generator=data_loader_generator,
     )
 
-    model, model_config = build_model(args, device)
+    model, model_config = build_model(args, device, num_classes=num_classes)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -384,6 +572,7 @@ def run_training(args):
             criterion=criterion,
             optimizer=optimizer,
             device=device,
+            label_map_tensor=label_map_tensor,
             grad_clip=args.grad_clip,
         )
 
@@ -392,6 +581,7 @@ def run_training(args):
             loader=val_loader,
             criterion=criterion,
             device=device,
+            label_map_tensor=label_map_tensor,
         )
 
         print(
@@ -428,7 +618,10 @@ def run_training(args):
                     "best_val_loss": best_val_loss,
                     "best_val_acc": best_val_acc,
                     "epoch": best_epoch,
-                    "idx_to_label": IDX_TO_LABEL,
+                    "idx_to_label": idx_to_label,
+                    "original_idx_to_label": IDX_TO_LABEL,
+                    "label_mode": args.label_mode,
+                    "label_mapping_original_to_new": original_to_new,
                     "model_config": model_config,
                     "training_config": vars(args),
                     "class_weights": class_weights.detach().cpu()
@@ -459,36 +652,37 @@ def run_training(args):
     print(f"Best val macro-F1: {best_macro_f1:.4f}")
     print(f"Best val weighted-F1: {best_weighted_f1:.4f}")
 
-    print("\nClassification report - 9 classi:")
+    print(f"\nClassification report - {num_classes} classi ({args.label_mode}):")
     print(
         classification_report(
             best_val_labels,
             best_val_preds,
-            labels=list(range(9)),
-            target_names=[IDX_TO_LABEL[i] for i in range(9)],
+            labels=list(range(num_classes)),
+            target_names=[idx_to_label[i] for i in range(num_classes)],
             zero_division=0,
         )
     )
 
-    print("Confusion matrix - 9 classi:")
+    print(f"Confusion matrix - {num_classes} classi ({args.label_mode}):")
     print(
         confusion_matrix(
             best_val_labels,
             best_val_preds,
-            labels=list(range(9)),
+            labels=list(range(num_classes)),
         )
     )
 
-    print("\nClassification report - solo 7 azioni reali:")
-    print(
-        classification_report(
-            best_val_labels,
-            best_val_preds,
-            labels=list(range(7)),
-            target_names=[IDX_TO_LABEL[i] for i in range(7)],
-            zero_division=0,
+    if args.label_mode == "full":
+        print("\nClassification report - solo 7 azioni reali:")
+        print(
+            classification_report(
+                best_val_labels,
+                best_val_preds,
+                labels=list(range(7)),
+                target_names=[idx_to_label[i] for i in range(7)],
+                zero_division=0,
+            )
         )
-    )
 
 
 def main():
