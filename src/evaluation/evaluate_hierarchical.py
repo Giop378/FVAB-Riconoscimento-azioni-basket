@@ -171,6 +171,7 @@ def load_checkpoint_model(checkpoint_path: str, device: torch.device, label_mode
         dropout=float(config["dropout"]),
         pooling=str(config["pooling"]),
         max_len=int(config.get("max_len", 1024)),
+        last_mean_ratio=float(config.get("last_mean_ratio", 0.30)),
     ).to(device)
 
     state_dict = checkpoint.get("model_state_dict", checkpoint)

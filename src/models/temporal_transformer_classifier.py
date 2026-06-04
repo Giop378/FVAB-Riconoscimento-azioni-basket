@@ -77,6 +77,7 @@ class TemporalTransformerActionClassifier(nn.Module):
         dropout: float = 0.3,
         pooling: str = "cls",
         max_len: int = 1024,
+        last_mean_ratio: float = 0.30,
     ):
         super().__init__()
 
@@ -86,11 +87,18 @@ class TemporalTransformerActionClassifier(nn.Module):
                 f"Ricevuto d_model={d_model}, num_heads={num_heads}."
             )
 
-        if pooling not in {"cls", "mean"}:
-            raise ValueError("pooling deve essere 'cls' oppure 'mean'.")
+        if pooling not in {"cls", "mean", "last_mean"}:
+            raise ValueError("pooling deve essere 'cls', 'mean' oppure 'last_mean'.")
+
+        if not 0.0 < last_mean_ratio <= 1.0:
+            raise ValueError(
+                f"last_mean_ratio deve essere compreso tra 0 e 1. "
+                f"Ricevuto: {last_mean_ratio}."
+            )
 
         self.pooling = pooling
         self.d_model = d_model
+        self.last_mean_ratio = last_mean_ratio
 
         # Proietta le feature ConvNeXt da input_dim, es. 768,
         # alla dimensione interna del Transformer, es. 256.
@@ -98,6 +106,8 @@ class TemporalTransformerActionClassifier(nn.Module):
         self.input_norm = nn.LayerNorm(d_model)
 
         # Token CLS opzionale: rappresenta tutta la clip.
+        # Con mean/last_mean non aggiungiamo token: il pooling viene fatto
+        # direttamente sulle feature temporali dei frame reali.
         if pooling == "cls":
             self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         else:
@@ -154,6 +164,9 @@ class TemporalTransformerActionClassifier(nn.Module):
     def _masked_mean_pooling(self, encoded, padding_mask):
         """
         Media temporale ignorando il padding.
+        
+        Usa tutti i frame reali della clip. È adatta quando l'informazione
+        utile è distribuita lungo tutta la sequenza.
         """
         valid_mask = ~padding_mask  # True sui timestep reali
 
@@ -162,6 +175,32 @@ class TemporalTransformerActionClassifier(nn.Module):
         denom = valid_mask.sum(dim=1).clamp(min=1).unsqueeze(-1)
 
         return encoded.sum(dim=1) / denom
+
+    def _last_mean_pooling(self, encoded, lengths):
+        """
+        Media solo sugli ultimi frame reali della clip.
+
+        È pensata per task in cui l'informazione discriminante è concentrata
+        nella parte finale della sequenza, ad esempio l'esito del tiro:
+        la preparazione e il rilascio avvengono prima, mentre la palla che
+        entra/non entra nel canestro è visibile soprattutto negli ultimi frame.
+
+        encoded: [B, T, d_model], senza token CLS.
+        lengths: [B], numero reale di frame prima del padding.
+        """
+        pooled_outputs = []
+        max_seq_len = encoded.size(1)
+
+        for sample_idx in range(encoded.size(0)):
+            length = int(lengths[sample_idx].item())
+            length = max(1, min(length, max_seq_len))
+
+            last_k = max(1, int(round(length * self.last_mean_ratio)))
+            start = max(0, length - last_k)
+
+            pooled_outputs.append(encoded[sample_idx, start:length].mean(dim=0))
+
+        return torch.stack(pooled_outputs, dim=0)
 
     def forward(self, features, lengths, return_attention: bool = False):
         """
@@ -211,11 +250,18 @@ class TemporalTransformerActionClassifier(nn.Module):
         # Pooling finale.
         if self.pooling == "cls":
             final_representation = encoded[:, 0, :]
-        else:
+        elif self.pooling == "mean":
             final_representation = self._masked_mean_pooling(
                 encoded,
                 padding_mask,
             )
+        elif self.pooling == "last_mean":
+            final_representation = self._last_mean_pooling(
+                encoded,
+                lengths,
+            )
+        else:
+            raise ValueError(f"Pooling non supportato: {self.pooling}")
 
         logits = self.classifier(final_representation)
 

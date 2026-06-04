@@ -462,7 +462,16 @@ def parse_args():
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--ff-dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.3)
-    parser.add_argument("--pooling", type=str, default="cls", choices=["cls", "mean"])
+    parser.add_argument("--pooling", type=str, default="cls", choices=["cls", "mean", "last_mean"])
+    parser.add_argument(
+        "--last-mean-ratio",
+        type=float,
+        default=0.30,
+        help=(
+            "Percentuale finale della clip da usare con --pooling last_mean. "
+            "Esempio: 0.30 usa circa l'ultimo 30% dei frame reali."
+        ),
+    )
     parser.add_argument("--max-len", type=int, default=1024)
 
     parser.add_argument(
@@ -520,6 +529,7 @@ def build_model(args, device, num_classes: int):
         dropout=args.dropout,
         pooling=args.pooling,
         max_len=args.max_len,
+        last_mean_ratio=args.last_mean_ratio,
     ).to(device)
 
     model_config = {
@@ -532,6 +542,7 @@ def build_model(args, device, num_classes: int):
         "num_classes": num_classes,
         "dropout": args.dropout,
         "pooling": args.pooling,
+        "last_mean_ratio": args.last_mean_ratio,
         "max_len": args.max_len,
     }
 
