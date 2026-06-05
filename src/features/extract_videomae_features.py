@@ -33,23 +33,19 @@ def set_seed(seed: int) -> None:
 
 def read_video_rgb_frames(video_path: Path) -> List[np.ndarray]:
     """
-    Legge tutti i frame del video e li restituisce in RGB.
-
-    Output:
-        lista di array uint8 con shape [H, W, 3].
+    Legge tutti i frame del video e li restituisce in RGB uint8 [H, W, 3].
     """
     cap = cv2.VideoCapture(str(video_path))
 
     if not cap.isOpened():
         raise RuntimeError(f"Impossibile aprire il video: {video_path}")
 
-    frames = []
+    frames: List[np.ndarray] = []
 
     while True:
         ok, frame_bgr = cap.read()
         if not ok:
             break
-
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         frames.append(frame_rgb)
 
@@ -66,13 +62,10 @@ def sample_fixed_num_frames(
     num_frames: int,
 ) -> Tuple[List[np.ndarray], List[int]]:
     """
-    Campiona un numero fisso di frame.
+    Campiona num_frames frame uniformemente lungo tutta la clip.
 
-    - Se la clip ha almeno num_frames, campiona uniformemente lungo tutta la clip.
-    - Se la clip ha meno di num_frames, usa tutti i frame disponibili e ripete
-      l'ultimo frame fino ad arrivare a num_frames.
-
-    Questo evita di scartare le clip corte, mantenendo compatibilità con VideoMAE.
+    Se la clip ha meno di num_frames, ripete l'ultimo frame. Questo permette di
+    usare VideoMAE a 16 frame senza scartare le clip più corte.
     """
     total_frames = len(frames)
 
@@ -94,36 +87,112 @@ def sample_fixed_num_frames(
     return sampled_frames, sampled_indices
 
 
-@torch.no_grad()
-def extract_videomae_feature(
-    model: VideoMAEModel,
-    image_processor: AutoImageProcessor,
+def preprocess_frames_stretched(
     frames: List[np.ndarray],
+    image_size: int,
+    mean: List[float],
+    std: List[float],
+) -> torch.Tensor:
+    """
+    Preprocessing conservativo senza center crop.
+
+    Ogni frame viene ridimensionato direttamente a image_size x image_size,
+    quindi in modalità stretched. Questo evita di tagliare parti laterali del
+    campo dove possono trovarsi palla e canestro.
+
+    Output:
+        pixel_values [1, T, 3, H, W]
+    """
+    mean_arr = np.asarray(mean, dtype=np.float32).reshape(1, 1, 3)
+    std_arr = np.asarray(std, dtype=np.float32).reshape(1, 1, 3)
+
+    processed = []
+    for frame in frames:
+        resized = cv2.resize(
+            frame,
+            (image_size, image_size),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        resized = resized.astype(np.float32) / 255.0
+        normalized = (resized - mean_arr) / std_arr
+        chw = np.transpose(normalized, (2, 0, 1))
+        processed.append(chw)
+
+    pixel_values = torch.from_numpy(np.stack(processed, axis=0)).float()
+    pixel_values = pixel_values.unsqueeze(0)  # [1, T, C, H, W]
+    return pixel_values
+
+
+def get_spatial_tokens_per_temporal_step(model: VideoMAEModel, image_size: int) -> int:
+    """
+    Calcola quanti token spaziali corrispondono a ogni step temporale VideoMAE.
+
+    Per VideoMAE base tipicamente:
+        image_size = 224
+        patch_size = 16
+        spatial_tokens = 14 * 14 = 196
+    """
+    patch_size = getattr(model.config, "patch_size", 16)
+    if isinstance(patch_size, (tuple, list)):
+        patch_size = patch_size[0]
+
+    spatial_size = image_size // int(patch_size)
+    return spatial_size * spatial_size
+
+
+@torch.no_grad()
+def extract_videomae_temporal_feature(
+    model: VideoMAEModel,
+    pixel_values: torch.Tensor,
     device: torch.device,
+    image_size: int,
     use_fp16: bool = False,
 ) -> torch.Tensor:
     """
-    Estrae una feature clip-level da VideoMAE.
+    Estrae una sequenza temporale da VideoMAE, non una singola feature globale.
 
-    VideoMAE restituisce una sequenza di token spazio-temporali nel
-    last_hidden_state. Per ottenere una singola feature per clip facciamo
-    mean pooling sui token.
+    VideoMAE produce token spazio-temporali. Invece di fare una media globale
+    di tutti i token, li ricostruiamo come:
 
-    Output:
-        tensor CPU float32 con shape [1, hidden_size]
+        [num_temporal_tokens, num_spatial_tokens, hidden_size]
+
+    e poi facciamo mean pooling solo sui token spaziali. In questo modo resta
+    una sequenza temporale:
+
+        features.shape = [num_temporal_tokens, hidden_size]
+
+    Con VideoMAE base, 16 frame e tubelet_size=2, solitamente si ottiene:
+
+        features.shape = [8, 768]
+
+    Questa è la correzione rispetto al vecchio esperimento, dove veniva salvata
+    una sola feature [1, 768] e il classificatore riceveva una sequenza lunga 1.
     """
-    inputs = image_processor(frames, return_tensors="pt")
-    pixel_values = inputs["pixel_values"].to(device)
-
+    pixel_values = pixel_values.to(device)
     if use_fp16:
         pixel_values = pixel_values.half()
 
     outputs = model(pixel_values=pixel_values)
+    tokens = outputs.last_hidden_state.squeeze(0)  # [N, D]
 
-    # last_hidden_state: [B, num_tokens, hidden_size]
-    clip_feature = outputs.last_hidden_state.mean(dim=1)  # [B, hidden_size]
+    spatial_tokens = get_spatial_tokens_per_temporal_step(model, image_size=image_size)
 
-    return clip_feature.squeeze(0).float().cpu().unsqueeze(0)  # [1, hidden_size]
+    if tokens.shape[0] % spatial_tokens != 0:
+        raise RuntimeError(
+            "Numero di token VideoMAE non divisibile per i token spaziali. "
+            f"tokens={tokens.shape[0]}, spatial_tokens={spatial_tokens}. "
+            "Controlla image_size/patch_size del modello."
+        )
+
+    temporal_tokens = tokens.shape[0] // spatial_tokens
+
+    # [temporal_tokens, spatial_tokens, hidden_size]
+    tokens = tokens.reshape(temporal_tokens, spatial_tokens, tokens.shape[-1])
+
+    # Mean pooling spaziale, mantenendo la dimensione temporale.
+    temporal_features = tokens.mean(dim=1)  # [temporal_tokens, hidden_size]
+
+    return temporal_features.float().cpu()
 
 
 def get_row_value(row: pd.Series, *names: str, default=None):
@@ -142,7 +211,6 @@ def build_video_path(dataset_root: Path, row: pd.Series) -> Path:
         )
 
     video_path = Path(str(rel_path))
-
     if not video_path.is_absolute():
         video_path = dataset_root / video_path
 
@@ -152,8 +220,8 @@ def build_video_path(dataset_root: Path, row: pd.Series) -> Path:
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Estrae feature clip-level con VideoMAE usando 16 frame per clip. "
-            "Le feature vengono salvate nello stesso formato atteso da FeatureDataset."
+            "Estrae feature VideoMAE temporali a 16 frame, senza center crop, "
+            "salvandole nello stesso formato atteso da FeatureDataset."
         )
     )
 
@@ -173,13 +241,19 @@ def parse_args():
         "--output-dir",
         type=str,
         required=True,
-        help="Cartella in cui salvare le feature, es. data/features/videomae_base_16.",
+        help=(
+            "Cartella in cui salvare le feature, "
+            "es. data/features/videomae_kinetics16_temporal_stretch."
+        ),
     )
     parser.add_argument(
         "--model-name",
         type=str,
-        default="MCG-NJU/videomae-base",
-        help="Checkpoint Hugging Face VideoMAE.",
+        default="MCG-NJU/videomae-base-finetuned-kinetics",
+        help=(
+            "Checkpoint Hugging Face VideoMAE. Default: modello fine-tuned "
+            "su Kinetics, più adatto di videomae-base puro."
+        ),
     )
     parser.add_argument(
         "--num-frames",
@@ -188,19 +262,10 @@ def parse_args():
         help="Numero di frame da campionare per clip. Per VideoMAE base usare 16.",
     )
     parser.add_argument(
-        "--batch-size",
+        "--image-size",
         type=int,
-        default=1,
-        help=(
-            "Per ora lasciato per compatibilità. L'estrazione è clip-by-clip "
-            "per gestire video di durata variabile in modo semplice."
-        ),
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-        help="Non usato in questa versione clip-by-clip; lasciato per compatibilità.",
+        default=224,
+        help="Risoluzione quadrata stretched. Default 224, come VideoMAE base.",
     )
     parser.add_argument(
         "--shot-only",
@@ -217,11 +282,7 @@ def parse_args():
         action="store_true",
         help="Usa il modello in float16 su CUDA per ridurre memoria e accelerare.",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
+    parser.add_argument("--seed", type=int, default=42)
 
     return parser.parse_args()
 
@@ -254,22 +315,28 @@ def main():
     print(f"Device: {device}")
     print(f"Model: {args.model_name}")
     print(f"Num frames: {args.num_frames}")
+    print(f"Image size: {args.image_size}x{args.image_size} stretched")
+    print("Center crop: disattivato")
+    print("Output features: sequenza temporale VideoMAE, es. [8, 768]")
     print(f"Shot only: {args.shot_only}")
     print(f"Clip da processare: {len(manifest)}")
 
+    # Carichiamo comunque l'image processor per usare mean/std ufficiali del checkpoint,
+    # ma non gli facciamo fare resize/crop: il preprocessing stretched è manuale.
     image_processor = AutoImageProcessor.from_pretrained(args.model_name)
+    mean = getattr(image_processor, "image_mean", [0.485, 0.456, 0.406])
+    std = getattr(image_processor, "image_std", [0.229, 0.224, 0.225])
+
     model = VideoMAEModel.from_pretrained(args.model_name)
     model.eval()
     model.to(device)
 
-    if args.fp16:
-        if device.type != "cuda":
-            print("--fp16 richiesto ma CUDA non disponibile: continuo in float32.")
-            use_fp16 = False
-        else:
-            model.half()
-            use_fp16 = True
+    if args.fp16 and device.type == "cuda":
+        model.half()
+        use_fp16 = True
     else:
+        if args.fp16 and device.type != "cuda":
+            print("--fp16 richiesto ma CUDA non disponibile: continuo in float32.")
         use_fp16 = False
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -277,8 +344,9 @@ def main():
     processed = 0
     skipped = 0
     errors = []
+    feature_shapes = {}
 
-    for _, row in tqdm(manifest.iterrows(), total=len(manifest), desc="VideoMAE features"):
+    for _, row in tqdm(manifest.iterrows(), total=len(manifest), desc="VideoMAE temporal features"):
         label_name = str(row["label"])
 
         if label_name not in LABEL_TO_IDX:
@@ -289,7 +357,8 @@ def main():
             continue
 
         split = str(row["split"])
-        clip_id = str(get_row_value(row, "clip_id", default=Path(str(get_row_value(row, "path"))).stem))
+        path_value = get_row_value(row, "path", "filepath", "file_path", "video_path")
+        clip_id = str(get_row_value(row, "clip_id", default=Path(str(path_value)).stem))
         video_path = build_video_path(dataset_root, row)
 
         out_path = output_dir / split / label_name / f"{clip_id}.pt"
@@ -305,18 +374,28 @@ def main():
                 num_frames=args.num_frames,
             )
 
-            feature = extract_videomae_feature(
-                model=model,
-                image_processor=image_processor,
+            pixel_values = preprocess_frames_stretched(
                 frames=sampled_frames,
+                image_size=args.image_size,
+                mean=mean,
+                std=std,
+            )
+
+            features = extract_videomae_temporal_feature(
+                model=model,
+                pixel_values=pixel_values,
                 device=device,
+                image_size=args.image_size,
                 use_fp16=use_fp16,
             )
+
+            shape_key = str(tuple(features.shape))
+            feature_shapes[shape_key] = feature_shapes.get(shape_key, 0) + 1
 
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
             item = {
-                "features": feature,  # [1, hidden_size]
+                "features": features,  # [T_videomae, hidden_size], es. [8, 768]
                 "label": LABEL_TO_IDX[label_name],
                 "label_name": label_name,
                 "clip_id": clip_id,
@@ -327,7 +406,9 @@ def main():
                 "sampled_indices": sampled_indices,
                 "feature_extractor": "VideoMAE",
                 "model_name": args.model_name,
-                "pooling": "token_mean",
+                "preprocessing": "stretch_no_center_crop",
+                "image_size": args.image_size,
+                "token_pooling": "spatial_mean_keep_temporal",
             }
 
             torch.save(item, out_path)
@@ -343,10 +424,13 @@ def main():
     summary = {
         "model_name": args.model_name,
         "num_frames": args.num_frames,
+        "image_size": args.image_size,
         "shot_only": args.shot_only,
+        "preprocessing": "stretch_no_center_crop",
         "output_dir": str(output_dir),
         "processed": processed,
         "skipped": skipped,
+        "feature_shapes": feature_shapes,
         "errors": errors,
         "num_errors": len(errors),
     }
@@ -358,6 +442,7 @@ def main():
     print("\nEstrazione completata.")
     print(f"Feature create: {processed}")
     print(f"Feature saltate perché già esistenti: {skipped}")
+    print(f"Feature shapes: {feature_shapes}")
     print(f"Errori: {len(errors)}")
     print(f"Summary: {summary_path}")
 

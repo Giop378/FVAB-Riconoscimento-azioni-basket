@@ -28,6 +28,10 @@ tiro0 / tiro1
 |exp_29|Temporal Transformer d384|DINOv3-L/16 frozen|shot_type_only|3|40|64|5e-5|384|2|6|1024|0.45|5e-3|Mean|0.5|WeightedRandomSampler power 0.4|0.4804|0.8462|0.8410|0.8520|outputs/exp_29_dinov3_vitl16_transformer_mean_shot_type_only|
 |exp_30|Temporal Transformer d384|DINOv3-L/16 frozen|shot_outcome_only|2|40|64|5e-5|384|2|6|1024|0.45|5e-3|Mean|0.5|WeightedRandomSampler power 0.4|0.7302|0.6615|0.6425|0.6615|outputs/exp_30_dinov3_vitl16_transformer_mean_shot_outcome_only|
 |exp_31|Gerarchia L1+L2+L3|DINOv3-L/16 frozen|hierarchical end-to-end|8|-|64|-|384|2|6|1024|0.45|5e-3|Mean|-|-|-|0.8648|0.5981|0.8629|outputs/exp_31_dinov3_vitl16_hierarchical_end_to_end|
+|exp_32|Temporal Transformer d384|DINOv3-L/16 frozen|shot_outcome_only|2|40|64|5e-5|384|2|6|1024|0.45|5e-3|CLS|0.5|WeightedRandomSampler power 0.4|0.6593|0.6462|0.6289|0.6474|outputs/exp_32_dinov3_vitl16_transformer_cls_shot_outcome_only|
+|exp_33|Temporal Transformer d384|DINOv3-L/16 frozen|shot_outcome_only|2|40|64|5e-5|384|2|6|1024|0.45|5e-3|LastMean 0.30|0.5|WeightedRandomSampler power 0.4|0.7207|0.6462|0.6289|0.6474|outputs/exp_33_dinov3_vitl16_transformer_lastmean030_shot_outcome_only|
+|exp_34|Temporal Transformer d384|DINOv3-L/16 frozen|shot_outcome_only|2|40|64|5e-5|384|2|6|1024|0.30|5e-3|Mean|0.5|WeightedRandomSampler power 0.4|0.7056|0.6615|0.6299|0.6549|outputs/exp_34_dinov3_vitl16_transformer_mean_dropout030_shot_outcome_only|
+|exp_35|Temporal Transformer d384|DINOv3-L/16 frozen|shot_outcome_only|2|40|64|5e-5|384|2|6|1024|0.30|5e-3|Mean|0.5|No weighted sampler|0.6960|0.6154|0.6061|0.6200|outputs/exp_35_dinov3_vitl16_transformer_mean_dropout030_no_sampler_shot_outcome_only|
 
 ## Risultati aggregati su validation - classi rimappate
 
@@ -40,6 +44,10 @@ tiro0 / tiro1
 |exp_29|0.8462|0.85|0.85|0.84|0.87|0.85|0.85|
 |exp_30|0.6615|0.64|0.64|0.64|0.66|0.66|0.66|
 |exp_31|0.8648|0.63|0.61|0.60|0.87|0.86|0.86|
+|exp_32|0.6462|0.63|0.63|0.63|0.65|0.65|0.65|
+|exp_33|0.6462|0.63|0.63|0.63|0.65|0.65|0.65|
+|exp_34|0.6615|0.64|0.63|0.63|0.65|0.66|0.65|
+|exp_35|0.6154|0.61|0.61|0.61|0.63|0.62|0.62|
 
 ## Risultati aggregati sulle classi rilevanti
 
@@ -52,6 +60,10 @@ Questa tabella riporta le metriche calcolate solo sulle classi più rilevanti pe
 - **exp_29**: solo `tiroDaDue`, `tiroDaTre` e `tiroLibero`, addestrate filtrando il dataset sui soli tiri.
 - **exp_30**: solo `tiro0` e `tiro1`, addestrate filtrando il dataset sui soli tiri.
 - **exp_31**: solo le 7 azioni finali prodotte dalla gerarchia end-to-end, quindi senza `no-action`.
+- **exp_32**: solo `tiro0` e `tiro1`, come exp_30, ma con pooling `cls`.
+- **exp_33**: solo `tiro0` e `tiro1`, come exp_30, ma con pooling `last_mean` sull'ultimo 30% della clip.
+- **exp_34**: solo `tiro0` e `tiro1`, come exp_30, ma con dropout ridotto a 0.30.
+- **exp_35**: solo `tiro0` e `tiro1`, come exp_34, ma senza `WeightedRandomSampler`.
 
 |ID|Classi considerate|Micro Precision|Micro Recall|Micro F1|Macro Precision|Macro Recall|Macro F1|Weighted Precision|Weighted Recall|Weighted F1|
 |-|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|
@@ -62,6 +74,10 @@ Questa tabella riporta le metriche calcolate solo sulle classi più rilevanti pe
 |exp_29|tiroDaDue, tiroDaTre, tiroLibero|0.85|0.85|0.85|0.85|0.85|0.84|0.87|0.85|0.85|
 |exp_30|tiro0, tiro1|0.66|0.66|0.66|0.64|0.64|0.64|0.66|0.66|0.66|
 |exp_31|7 azioni finali|0.80|0.87|0.83|0.58|0.57|0.55|0.80|0.87|0.83|
+|exp_32|tiro0, tiro1|0.65|0.65|0.65|0.63|0.63|0.63|0.65|0.65|0.65|
+|exp_33|tiro0, tiro1|0.65|0.65|0.65|0.63|0.63|0.63|0.65|0.65|0.65|
+|exp_34|tiro0, tiro1|0.66|0.66|0.66|0.64|0.63|0.63|0.65|0.66|0.65|
+|exp_35|tiro0, tiro1|0.62|0.62|0.62|0.61|0.61|0.61|0.63|0.62|0.62|
 
 ## Risultati collassati senza esito del tiro
 
@@ -193,6 +209,63 @@ Confusion matrix:
  [  0   2  12   0   1]
  [  0   1   1  11   5]
  [ 32   3   0   1 227]]
+```
+
+
+### exp_32 - DINOv3-L/16 frozen, shot_outcome_only, CLS pooling, sampler power 0.4
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|tiro0|0.72|0.70|0.71|40|
+|tiro1|0.54|0.56|0.55|25|
+
+Confusion matrix:
+
+```text
+[[28 12]
+ [11 14]]
+```
+
+### exp_33 - DINOv3-L/16 frozen, shot_outcome_only, last_mean 0.30, sampler power 0.4
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|tiro0|0.72|0.70|0.71|40|
+|tiro1|0.54|0.56|0.55|25|
+
+Confusion matrix:
+
+```text
+[[28 12]
+ [11 14]]
+```
+
+### exp_34 - DINOv3-L/16 frozen, shot_outcome_only, mean pooling, dropout 0.30, sampler power 0.4
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|tiro0|0.70|0.78|0.74|40|
+|tiro1|0.57|0.48|0.52|25|
+
+Confusion matrix:
+
+```text
+[[31  9]
+ [13 12]]
+```
+
+### exp_35 - DINOv3-L/16 frozen, shot_outcome_only, mean pooling, dropout 0.30, no weighted sampler
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|tiro0|0.71|0.62|0.67|40|
+|tiro1|0.50|0.60|0.55|25|
+
+Confusion matrix:
+
+```text
+[[25 15]
+ [10 15]]
 ```
 
 ## Comandi utilizzati
@@ -349,6 +422,100 @@ python -m src.evaluation.evaluate_hierarchical \
   --output-dir outputs/exp_31_dinov3_vitl16_hierarchical_end_to_end
 ```
 
+
+### exp_32
+
+```bash
+python -m src.training.train \
+  --features-root data/features/dinov3_vitl16_336 \
+  --epochs 40 \
+  --batch-size 64 \
+  --lr 5e-5 \
+  --input-dim 1024 \
+  --d-model 384 \
+  --num-layers 2 \
+  --num-heads 6 \
+  --ff-dim 1024 \
+  --dropout 0.45 \
+  --weight-decay 5e-3 \
+  --pooling cls \
+  --class-weight-power 0.5 \
+  --sampler-power 0.4 \
+  --scheduler-patience 5 \
+  --label-mode shot_outcome_only \
+  --output-dir outputs/exp_32_dinov3_vitl16_transformer_cls_shot_outcome_only
+```
+
+### exp_33
+
+```bash
+python -m src.training.train \
+  --features-root data/features/dinov3_vitl16_336 \
+  --epochs 40 \
+  --batch-size 64 \
+  --lr 5e-5 \
+  --input-dim 1024 \
+  --d-model 384 \
+  --num-layers 2 \
+  --num-heads 6 \
+  --ff-dim 1024 \
+  --dropout 0.45 \
+  --weight-decay 5e-3 \
+  --pooling last_mean \
+  --last-mean-ratio 0.30 \
+  --class-weight-power 0.5 \
+  --sampler-power 0.4 \
+  --scheduler-patience 5 \
+  --label-mode shot_outcome_only \
+  --output-dir outputs/exp_33_dinov3_vitl16_transformer_lastmean030_shot_outcome_only
+```
+
+### exp_34
+
+```bash
+python -m src.training.train \
+  --features-root data/features/dinov3_vitl16_336 \
+  --epochs 40 \
+  --batch-size 64 \
+  --lr 5e-5 \
+  --input-dim 1024 \
+  --d-model 384 \
+  --num-layers 2 \
+  --num-heads 6 \
+  --ff-dim 1024 \
+  --dropout 0.30 \
+  --weight-decay 5e-3 \
+  --pooling mean \
+  --class-weight-power 0.5 \
+  --sampler-power 0.4 \
+  --scheduler-patience 5 \
+  --label-mode shot_outcome_only \
+  --output-dir outputs/exp_34_dinov3_vitl16_transformer_mean_dropout030_shot_outcome_only
+```
+
+### exp_35
+
+```bash
+python -m src.training.train \
+  --features-root data/features/dinov3_vitl16_336 \
+  --epochs 40 \
+  --batch-size 64 \
+  --lr 5e-5 \
+  --input-dim 1024 \
+  --d-model 384 \
+  --num-layers 2 \
+  --num-heads 6 \
+  --ff-dim 1024 \
+  --dropout 0.30 \
+  --weight-decay 5e-3 \
+  --pooling mean \
+  --class-weight-power 0.5 \
+  --no-weighted-sampler \
+  --scheduler-patience 5 \
+  --label-mode shot_outcome_only \
+  --output-dir outputs/exp_35_dinov3_vitl16_transformer_mean_dropout030_no_sampler_shot_outcome_only
+```
+
 ## Nota finale
 
 Gli esperimenti 25, 26 e 27 sono stati progettati come test diagnostici sulle classi, mantenendo invariata la configurazione del modello usata negli esperimenti migliori precedenti:
@@ -376,8 +543,12 @@ Il confronto tra gli esperimenti suggerisce che:
 - **exp_29** addestra il tipo di tiro solo sulle clip di tiro. Il risultato è buono: Val Macro F1 = 0.8410, con F1 = 0.87 su `tiroDaDue`, F1 = 0.74 su `tiroDaTre` e F1 = 0.91 su `tiroLibero`.
 - **exp_30** addestra l'esito solo sulle clip di tiro. Il risultato resta debole: Val Macro F1 = 0.6425, con F1 = 0.72 su `tiro0` e F1 = 0.56 su `tiro1`. Questo conferma che la distinzione segnato/sbagliato è il collo di bottiglia principale.
 - **exp_31** valuta la gerarchia completa end-to-end. La pipeline a 8 classi ottiene Accuracy = 0.8648 e Weighted F1 = 0.8629, ma la Macro F1 è solo 0.5981. Sulle sole 7 azioni finali, la Macro F1 scende a 0.55. Il risultato collassato senza esito è invece molto più solido, con Accuracy = 0.8907, Macro F1 = 0.8153 e Weighted F1 = 0.8901.
+- **exp_32** prova a sostituire il mean pooling con `cls` sul solo Stadio 3. Il risultato non migliora exp_30: Val Macro F1 = 0.6289, con F1 = 0.71 su `tiro0` e F1 = 0.55 su `tiro1`.
+- **exp_33** prova un pooling finale più focalizzato sugli ultimi frame (`last_mean` con ratio 0.30). Il comportamento resta identico a exp_32 e leggermente sotto exp_30, indicando che usare solo la parte finale della clip non è sufficiente per separare meglio `tiro0` e `tiro1`.
+- **exp_34** riduce il dropout da 0.45 a 0.30. L'accuracy resta 0.6615, ma la Macro F1 scende a 0.6299: il modello migliora `tiro0` con F1 = 0.74, ma peggiora `tiro1` con F1 = 0.52.
+- **exp_35** mantiene dropout 0.30 ma disattiva il `WeightedRandomSampler`. Il recall di `tiro1` sale a 0.60, ma peggiora `tiro0` e la Macro F1 scende a 0.6061. La rimozione del sampler sposta quindi il tipo di errore, senza produrre un miglioramento complessivo.
 
-La conclusione principale è che il modello distingue bene **azione/non-azione** e riconosce in modo abbastanza convincente il **tipo di tiro**, mentre la distinzione **segnato/sbagliato** rimane il punto più critico.
+La conclusione principale è che il modello distingue bene **azione/non-azione** e riconosce in modo abbastanza convincente il **tipo di tiro**, mentre la distinzione **segnato/sbagliato** rimane il punto più critico. Gli esperimenti 32-35 mostrano inoltre che piccoli cambiamenti conservativi su pooling finale, dropout e sampler non producono un miglioramento rilevante dello Stadio 3: il miglior modello per l'esito resta ancora exp_30.
 
 La gerarchia più coerente con i risultati ottenuti è quindi:
 
@@ -398,4 +569,5 @@ Per il proseguimento del progetto, le opzioni più sensate sono:
 
 1. mantenere la gerarchia come analisi sperimentale completa;
 2. usare come risultato principale la versione collassata senza esito del tiro;
-3. trattare l'esito `tiro0`/`tiro1` come limite attuale del dataset/modello, probabilmente legato alla necessità di avere più contesto temporale dopo il rilascio del tiro.
+3. trattare l'esito `tiro0`/`tiro1` come limite attuale del dataset/modello, probabilmente legato alla difficoltà di rappresentare con feature globali l'interazione tra palla e canestro;
+4. per migliorare ulteriormente lo Stadio 3, valutare modifiche più strutturali, ad esempio feature extractor video dedicati, feature/crop focalizzate sul canestro o una diversa costruzione delle clip di tiro.
