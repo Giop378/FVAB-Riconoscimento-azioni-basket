@@ -29,7 +29,7 @@ Thumbs.db
 # =========================
 # Dataset: ignorare tutti i dataset
 # =========================
-data/datasets/*
+data/
 !data/datasets/.gitkeep
 !data/datasets/README.md
 
