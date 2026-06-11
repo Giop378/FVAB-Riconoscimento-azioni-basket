@@ -32,7 +32,7 @@ rim
 
 Le annotazioni sono bounding box. La palla o il ferro vanno annotati solo se chiaramente visibili; in caso di occlusione, oggetto fuori inquadratura o frame ambiguo, la bounding box non viene inserita.
 
-## Comando utilizzato
+## Comando utilizzato per l'estrazione dei frame
 
 ```bash
 python src/annotations/extract_ball_rim_frames.py \
@@ -46,7 +46,7 @@ python src/annotations/extract_ball_rim_frames.py \
   --seed 42
 ```
 
-## Output prodotto
+## Output prodotto dall'estrazione
 
 Lo script produce una cartella con le immagini estratte, un file di mapping per mantenere la tracciabilità tra immagini e clip originali, e due archivi `.zip` da caricare separatamente in CVAT:
 
@@ -61,3 +61,170 @@ data/annotations/ball_rim_frames_sample/train/
 ```
 
 I due file `.zip` permettono di dividere il lavoro tra due annotatori, mantenendo tutti i frame della stessa clip nella stessa parte.
+
+## Annotazione in CVAT
+
+I due archivi sono stati caricati su CVAT come due task separati. Per entrambi i task sono state usate le stesse label, nello stesso ordine:
+
+```text
+0 = ball
+1 = rim
+```
+
+Sono state completate circa 1200 annotazioni complessive sui frame del training set, divise tra i due annotatori. Le annotazioni sono state esportate da CVAT in formato YOLO/Ultralytics YOLO, includendo anche le immagini.
+
+Gli zip esportati da CVAT vanno salvati nella seguente cartella:
+
+```text
+data/annotations/ball_rim_cvat_exports/train/
+├── train_part_01_yolo.zip
+└── train_part_02_yolo.zip
+```
+
+Esempio di comandi per creare la cartella e copiare gli zip:
+
+```bash
+mkdir -p data/annotations/ball_rim_cvat_exports/train
+
+cp /path/dove/sono/gli/zip/train_part_01_yolo.zip \
+  data/annotations/ball_rim_cvat_exports/train/
+
+cp /path/dove/sono/gli/zip/train_part_02_yolo.zip \
+  data/annotations/ball_rim_cvat_exports/train/
+```
+
+## Creazione del dataset YOLO
+
+I due export CVAT vengono uniti e divisi automaticamente in training e validation interna usando lo script:
+
+```text
+src/annotations/prepare_ball_rim_yolo_dataset.py
+```
+
+Il dataset YOLO finale viene salvato in:
+
+```text
+data/datasets/ball_rim_yolo_v1/
+├── images/
+│   ├── train/
+│   └── val/
+├── labels/
+│   ├── train/
+│   └── val/
+└── data.yaml
+```
+
+Comando utilizzato:
+
+```bash
+python src/annotations/prepare_ball_rim_yolo_dataset.py \
+  --zips \
+    data/annotations/ball_rim_cvat_exports/train/train_part_01_yolo.zip \
+    data/annotations/ball_rim_cvat_exports/train/train_part_02_yolo.zip \
+  --out data/datasets/ball_rim_yolo_v1 \
+  --val-ratio 0.10 \
+  --seed 42 \
+  --names ball rim
+```
+
+Se la cartella di output esiste già e si vuole rigenerare il dataset:
+
+```bash
+python src/annotations/prepare_ball_rim_yolo_dataset.py \
+  --zips \
+    data/annotations/ball_rim_cvat_exports/train/train_part_01_yolo.zip \
+    data/annotations/ball_rim_cvat_exports/train/train_part_02_yolo.zip \
+  --out data/datasets/ball_rim_yolo_v1 \
+  --val-ratio 0.10 \
+  --seed 42 \
+  --names ball rim \
+  --overwrite
+```
+
+La validation ottenuta con `--val-ratio 0.10` è solo una validation interna ricavata dai frame di training annotati. Serve per monitorare il primo addestramento del detector, non come valutazione finale definitiva.
+
+## Training del detector YOLO
+
+Il detector palla-canestro viene addestrato con lo script:
+
+```text
+src/training/train_ball_rim_yolo.py
+```
+
+Prima del training è necessario installare o aggiornare Ultralytics:
+
+```bash
+pip install -U ultralytics
+```
+
+Comando di training consigliato per il primo esperimento:
+
+```bash
+python src/training/train_ball_rim_yolo.py \
+  --data data/datasets/ball_rim_yolo_v1/data.yaml \
+  --model yolo11m.pt \
+  --imgsz 1280 \
+  --epochs 150 \
+  --batch 8 \
+  --device 0 \
+  --workers 8 \
+  --project outputs/ball_rim_detector \
+  --name yolo11m_1280_v1
+```
+
+Il modello scelto è `yolo11m.pt`, con risoluzione `1280`, perché la palla è un oggetto piccolo e può essere difficile da rilevare a risoluzioni basse.
+
+Se il training genera errore di memoria GPU, si può ridurre il batch size:
+
+```bash
+python src/training/train_ball_rim_yolo.py \
+  --data data/datasets/ball_rim_yolo_v1/data.yaml \
+  --model yolo11m.pt \
+  --imgsz 1280 \
+  --epochs 150 \
+  --batch 4 \
+  --device 0 \
+  --workers 8 \
+  --project outputs/ball_rim_detector \
+  --name yolo11m_1280_v1_batch4
+```
+
+Se anche con `batch=4` il training è troppo pesante, si può ridurre la risoluzione:
+
+```bash
+python src/training/train_ball_rim_yolo.py \
+  --data data/datasets/ball_rim_yolo_v1/data.yaml \
+  --model yolo11m.pt \
+  --imgsz 960 \
+  --epochs 150 \
+  --batch 8 \
+  --device 0 \
+  --workers 8 \
+  --project outputs/ball_rim_detector \
+  --name yolo11m_960_v1
+```
+
+Il miglior modello addestrato viene salvato in:
+
+```text
+outputs/ball_rim_detector/yolo11m_1280_v1/weights/best.pt
+```
+
+## Uso successivo del modello
+
+Il primo modello addestrato sui frame di training verrà usato per pre-annotare automaticamente i frame delle clip di validation. Le predizioni saranno poi corrette manualmente in CVAT, in modo da velocizzare la creazione di un set di validation annotato e ottenere una prima valutazione qualitativa degli errori del detector.
+
+Dopo la correzione manuale delle annotazioni di validation, sarà possibile creare una nuova versione del dataset:
+
+```text
+data/datasets/ball_rim_yolo_v2/
+├── images/
+│   ├── train/
+│   └── val/
+├── labels/
+│   ├── train/
+│   └── val/
+└── data.yaml
+```
+
+In questa seconda versione, il training set conterrà i frame annotati manualmente del training, mentre la validation conterrà i frame di validation pre-annotati dal modello e corretti manualmente.
