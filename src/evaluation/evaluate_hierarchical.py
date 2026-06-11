@@ -4,6 +4,7 @@ import csv
 import shlex
 import sys
 import traceback
+import numpy as np
 
 import torch
 from torch.utils.data import DataLoader
@@ -53,6 +54,138 @@ def get_reconstructed_command() -> str:
     parts = [sys.executable] + sys.argv
     return " ".join(shlex.quote(str(part)) for part in parts)
 
+
+
+TRACKING_METADATA_COLUMNS = {
+    "clip_id",
+    "split",
+    "label",
+    "path",
+    "video_frames",
+    "fps",
+    "sampled_frames",
+    "video_width",
+    "video_height",
+}
+
+
+def normalize_clip_key(path_value) -> str:
+    path_str = str(path_value).replace("\\", "/")
+    parts = [p for p in Path(path_str).parts if p not in {"", "."}]
+
+    split_idx = None
+    for idx, part in enumerate(parts):
+        if part in {"train", "val", "test"}:
+            split_idx = idx
+            break
+
+    if split_idx is not None:
+        parts = parts[split_idx:]
+
+    return Path(*parts).with_suffix("").as_posix()
+
+
+class TrackingFeatureStore:
+    def __init__(self, csv_path: str, feature_names=None, mean=None, std=None, normalized=False):
+        self.csv_path = Path(csv_path)
+
+        if not self.csv_path.exists():
+            raise FileNotFoundError(f"CSV feature tracking non trovato: {self.csv_path}")
+
+        self.feature_names = feature_names
+        self.rows_by_key = {}
+        self.normalized = bool(normalized)
+        self.mean = None if mean is None else np.array(mean, dtype=np.float32)
+        self.std = None if std is None else np.array(std, dtype=np.float32)
+
+        self._load()
+
+        if self.mean is None:
+            self.mean = np.zeros(self.num_features, dtype=np.float32)
+        if self.std is None:
+            self.std = np.ones(self.num_features, dtype=np.float32)
+
+        self.std = np.where(self.std < 1e-6, 1.0, self.std).astype(np.float32)
+
+    def _load(self):
+        with open(self.csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+
+            if reader.fieldnames is None:
+                raise ValueError(f"CSV tracking vuoto o non valido: {self.csv_path}")
+
+            if "path" not in reader.fieldnames:
+                raise ValueError(
+                    f"Il CSV tracking deve contenere la colonna 'path'. "
+                    f"Colonne presenti: {reader.fieldnames}"
+                )
+
+            if self.feature_names is None:
+                self.feature_names = [
+                    col for col in reader.fieldnames
+                    if col not in TRACKING_METADATA_COLUMNS
+                ]
+
+            if not self.feature_names:
+                raise ValueError("Nessuna feature tracking trovata nel CSV.")
+
+            for row in reader:
+                key = normalize_clip_key(row["path"])
+                vector = np.array(
+                    [float(row[name]) for name in self.feature_names],
+                    dtype=np.float32,
+                )
+                self.rows_by_key[key] = vector
+
+    @property
+    def num_features(self) -> int:
+        return len(self.feature_names)
+
+    def has(self, path_value) -> bool:
+        return normalize_clip_key(path_value) in self.rows_by_key
+
+    def get(self, path_value, missing_policy="zeros"):
+        key = normalize_clip_key(path_value)
+
+        if key in self.rows_by_key:
+            vector = self.rows_by_key[key].copy()
+        elif missing_policy == "zeros":
+            vector = np.zeros(self.num_features, dtype=np.float32)
+        else:
+            raise KeyError(
+                f"Feature tracking non trovate per path='{path_value}' "
+                f"con chiave normalizzata='{key}'."
+            )
+
+        if self.normalized:
+            vector = (vector - self.mean) / self.std
+
+        return vector.astype(np.float32)
+
+
+def append_tracking_to_features(features: torch.Tensor, tracking_features: torch.Tensor) -> torch.Tensor:
+    """
+    Concatena un vettore tracking [B, K] a ogni timestep delle feature video [B, T, D].
+    """
+    if tracking_features is None:
+        return features
+
+    if tracking_features.ndim != 2:
+        raise ValueError(
+            f"tracking_features deve avere forma [B, K], "
+            f"ricevuta {tuple(tracking_features.shape)}."
+        )
+
+    batch_size, seq_len, _ = features.shape
+
+    if tracking_features.shape[0] != batch_size:
+        raise ValueError(
+            f"Batch size tracking non coerente: features B={batch_size}, "
+            f"tracking B={tracking_features.shape[0]}."
+        )
+
+    tracking_sequence = tracking_features.unsqueeze(1).repeat(1, seq_len, 1)
+    return torch.cat([features, tracking_sequence.to(features.device, dtype=features.dtype)], dim=2)
 
 def normalize_idx_to_label(idx_to_label):
     if isinstance(idx_to_label, dict):
@@ -191,6 +324,7 @@ def predict_hierarchical_batch(
     idx_to_label_l1,
     idx_to_label_l2,
     idx_to_label_l3,
+    tracking_features=None,
 ):
     logits_l1 = model_l1(features, lengths)
     probs_l1 = torch.softmax(logits_l1, dim=1)
@@ -228,7 +362,14 @@ def predict_hierarchical_batch(
         probs_l2 = torch.softmax(logits_l2, dim=1)
         preds_l2 = probs_l2.argmax(dim=1)
 
-        logits_l3 = model_l3(shot_features, shot_lengths)
+        if tracking_features is not None:
+            shot_tracking_features = tracking_features.index_select(0, shot_indices_tensor)
+            shot_features_l3 = append_tracking_to_features(shot_features, shot_tracking_features)
+        else:
+            shot_tracking_features = None
+            shot_features_l3 = shot_features
+
+        logits_l3 = model_l3(shot_features_l3, shot_lengths)
         probs_l3 = torch.softmax(logits_l3, dim=1)
         preds_l3 = probs_l3.argmax(dim=1)
 
@@ -324,6 +465,43 @@ def run_evaluation(args):
     print(f"L3 checkpoint: {args.l3_checkpoint}")
     print(f"L3 idx_to_label: {idx_to_label_l3}")
 
+    tracking_store = None
+    tracking_missing_policy = args.tracking_missing_policy
+    l3_tracking_config = ckpt_l3.get("tracking_config") or config_l3.get("tracking_config")
+
+    if args.tracking_features_csv is not None:
+        feature_names = None
+        mean = None
+        std = None
+        normalized = False
+
+        if l3_tracking_config:
+            feature_names = l3_tracking_config.get("feature_names")
+            mean = l3_tracking_config.get("mean")
+            std = l3_tracking_config.get("std")
+            normalized = bool(l3_tracking_config.get("normalized", False))
+            tracking_missing_policy = args.tracking_missing_policy or l3_tracking_config.get("missing_policy", "zeros")
+
+        tracking_store = TrackingFeatureStore(
+            args.tracking_features_csv,
+            feature_names=feature_names,
+            mean=mean,
+            std=std,
+            normalized=normalized,
+        )
+
+        print("\n# Feature tracking per L3")
+        print(f"CSV tracking: {args.tracking_features_csv}")
+        print(f"Numero feature tracking: {tracking_store.num_features}")
+        print(f"Normalizzate con statistiche del checkpoint L3: {normalized}")
+        print(f"Missing policy: {tracking_missing_policy}")
+
+    elif int(config_l3.get("tracking_input_dim", 0)) > 0:
+        raise ValueError(
+            "Il checkpoint L3 richiede feature tracking, ma non è stato passato "
+            "--tracking-features-csv."
+        )
+
     original_mapping = original_idx_to_label()
 
     y_true_final = []
@@ -336,6 +514,28 @@ def run_evaluation(args):
         features = batch["features"].to(device)
         lengths = batch["lengths"].to(device)
         labels = batch["labels"].cpu().tolist()
+
+        tracking_features = None
+        tracking_available = [False] * len(labels)
+
+        if tracking_store is not None:
+            tracking_vectors = []
+            for i in range(len(labels)):
+                global_idx = sample_offset + i
+                sample_path = get_sample_path(dataset, global_idx)
+                tracking_available[i] = tracking_store.has(sample_path)
+                tracking_vectors.append(
+                    tracking_store.get(
+                        sample_path,
+                        missing_policy=tracking_missing_policy,
+                    )
+                )
+
+            tracking_features = torch.tensor(
+                np.stack(tracking_vectors, axis=0),
+                dtype=features.dtype,
+                device=device,
+            )
 
         (
             final_preds,
@@ -354,6 +554,7 @@ def run_evaluation(args):
             idx_to_label_l1=idx_to_label_l1,
             idx_to_label_l2=idx_to_label_l2,
             idx_to_label_l3=idx_to_label_l3,
+            tracking_features=tracking_features,
         )
 
         for i, original_idx in enumerate(labels):
@@ -378,6 +579,8 @@ def run_evaluation(args):
                     "p_l1": f"{p_l1[i]:.6f}",
                     "p_l2": "" if p_l2[i] is None else f"{p_l2[i]:.6f}",
                     "p_l3": "" if p_l3[i] is None else f"{p_l3[i]:.6f}",
+                    "tracking_used": int(tracking_store is not None),
+                    "tracking_available": int(tracking_available[i]),
                     "correct": int(true_final == pred_final),
                 }
             )
@@ -451,6 +654,23 @@ def parse_args():
     parser.add_argument("--l1-checkpoint", type=str, required=True)
     parser.add_argument("--l2-checkpoint", type=str, required=True)
     parser.add_argument("--l3-checkpoint", type=str, required=True)
+
+    parser.add_argument(
+        "--tracking-features-csv",
+        type=str,
+        default=None,
+        help=(
+            "CSV prodotto da extract_ball_rim_tracking_features.py. "
+            "Necessario se il checkpoint L3 è stato addestrato con feature tracking."
+        ),
+    )
+    parser.add_argument(
+        "--tracking-missing-policy",
+        type=str,
+        default="zeros",
+        choices=["zeros", "error"],
+        help="Comportamento se una clip non ha feature tracking associate.",
+    )
 
     parser.add_argument("--cpu", action="store_true", help="Forza l'esecuzione su CPU.")
 

@@ -4,6 +4,8 @@ import random
 import sys
 import shlex
 import traceback
+import csv
+import json
 
 import numpy as np
 import torch
@@ -298,6 +300,255 @@ class LabelMappedDataset(Dataset):
         return sample
 
 
+
+TRACKING_METADATA_COLUMNS = {
+    "clip_id",
+    "split",
+    "label",
+    "path",
+    "video_frames",
+    "fps",
+    "sampled_frames",
+    "video_width",
+    "video_height",
+}
+
+
+def normalize_clip_key(path_value) -> str:
+    """
+    Normalizza il path di una clip/feature in una chiave confrontabile.
+
+    Esempi convertiti nella stessa forma:
+    - train/tiroDaDue0/clip_000001.mp4 -> train/tiroDaDue0/clip_000001
+    - data/features/.../train/tiroDaDue0/clip_000001.pt -> train/tiroDaDue0/clip_000001
+    """
+    path_str = str(path_value).replace("\\", "/")
+    parts = [p for p in Path(path_str).parts if p not in {"", "."}]
+
+    split_idx = None
+    for idx, part in enumerate(parts):
+        if part in {"train", "val", "test"}:
+            split_idx = idx
+            break
+
+    if split_idx is not None:
+        parts = parts[split_idx:]
+
+    normalized = Path(*parts).with_suffix("").as_posix()
+    return normalized
+
+
+def get_base_item_path_from_label_dataset(label_dataset, idx: int) -> str:
+    """
+    Recupera il path originale associato a un elemento di LabelMappedDataset.
+    Serve per associare ogni feature video alla riga corrispondente del CSV tracking.
+    """
+    if hasattr(label_dataset, "indices") and hasattr(label_dataset, "base_dataset"):
+        base_idx = label_dataset.indices[idx]
+        base_dataset = label_dataset.base_dataset
+
+        if hasattr(base_dataset, "items"):
+            item = base_dataset.items[base_idx]
+
+            if isinstance(item, dict):
+                if "path" in item:
+                    return str(item["path"])
+                return str(item)
+
+            return str(item)
+
+    if hasattr(label_dataset, "base_dataset") and hasattr(label_dataset.base_dataset, "items"):
+        item = label_dataset.base_dataset.items[idx]
+        if isinstance(item, dict):
+            return str(item.get("path", item))
+        return str(item)
+
+    return ""
+
+
+class TrackingFeatureStore:
+    def __init__(self, csv_path: str, feature_names=None):
+        self.csv_path = Path(csv_path)
+
+        if not self.csv_path.exists():
+            raise FileNotFoundError(f"CSV feature tracking non trovato: {self.csv_path}")
+
+        self.rows_by_key = {}
+        self.feature_names = feature_names
+        self.mean = None
+        self.std = None
+        self.normalized = False
+
+        self._load()
+
+    def _load(self):
+        with open(self.csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+
+            if reader.fieldnames is None:
+                raise ValueError(f"CSV tracking vuoto o non valido: {self.csv_path}")
+
+            if "path" not in reader.fieldnames:
+                raise ValueError(
+                    f"Il CSV tracking deve contenere la colonna 'path'. "
+                    f"Colonne presenti: {reader.fieldnames}"
+                )
+
+            if self.feature_names is None:
+                self.feature_names = [
+                    col for col in reader.fieldnames
+                    if col not in TRACKING_METADATA_COLUMNS
+                ]
+
+            if not self.feature_names:
+                raise ValueError("Nessuna feature tracking trovata nel CSV.")
+
+            for row in reader:
+                key = normalize_clip_key(row["path"])
+
+                try:
+                    vector = np.array(
+                        [float(row[name]) for name in self.feature_names],
+                        dtype=np.float32,
+                    )
+                except KeyError as exc:
+                    raise KeyError(
+                        f"Feature mancante nel CSV tracking: {exc}. "
+                        f"Feature attese: {self.feature_names}"
+                    ) from exc
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Valore non numerico nel CSV tracking per path={row.get('path')}."
+                    ) from exc
+
+                self.rows_by_key[key] = vector
+
+        self.mean = np.zeros(self.num_features, dtype=np.float32)
+        self.std = np.ones(self.num_features, dtype=np.float32)
+
+    @property
+    def num_features(self) -> int:
+        return len(self.feature_names)
+
+    def has(self, path_value) -> bool:
+        return normalize_clip_key(path_value) in self.rows_by_key
+
+    def get_raw(self, path_value, missing_policy="zeros"):
+        key = normalize_clip_key(path_value)
+
+        if key in self.rows_by_key:
+            return self.rows_by_key[key].copy()
+
+        if missing_policy == "zeros":
+            return np.zeros(self.num_features, dtype=np.float32)
+
+        raise KeyError(
+            f"Feature tracking non trovate per path='{path_value}' "
+            f"con chiave normalizzata='{key}'."
+        )
+
+    def get(self, path_value, missing_policy="zeros"):
+        vector = self.get_raw(path_value, missing_policy=missing_policy)
+        if self.normalized:
+            vector = (vector - self.mean) / self.std
+        return vector.astype(np.float32)
+
+    def fit_normalizer_from_label_dataset(self, label_dataset):
+        vectors = []
+        missing = 0
+
+        for idx in range(len(label_dataset)):
+            path = get_base_item_path_from_label_dataset(label_dataset, idx)
+            if self.has(path):
+                vectors.append(self.get_raw(path, missing_policy="error"))
+            else:
+                missing += 1
+
+        if not vectors:
+            raise RuntimeError(
+                "Impossibile normalizzare le feature tracking: "
+                "nessun campione del training set ha feature tracking associate."
+            )
+
+        matrix = np.stack(vectors, axis=0).astype(np.float32)
+        self.mean = matrix.mean(axis=0).astype(np.float32)
+        self.std = matrix.std(axis=0).astype(np.float32)
+        self.std = np.where(self.std < 1e-6, 1.0, self.std).astype(np.float32)
+        self.normalized = True
+
+        print("\n# Normalizzazione feature tracking")
+        print(f"Campioni usati per stimare mean/std: {len(vectors)}")
+        print(f"Campioni train senza feature tracking: {missing}")
+
+    def get_config(self):
+        return {
+            "enabled": True,
+            "csv_path": str(self.csv_path),
+            "num_features": self.num_features,
+            "feature_names": list(self.feature_names),
+            "normalized": bool(self.normalized),
+            "mean": self.mean.tolist() if self.mean is not None else None,
+            "std": self.std.tolist() if self.std is not None else None,
+        }
+
+
+class TrackingAugmentedDataset(Dataset):
+    """
+    Concatena a ogni timestep delle feature video un vettore globale di feature tracking.
+
+    Input originale:
+      features: [T, D]
+
+    Output:
+      features: [T, D + K]
+
+    dove K è il numero di feature estratte da YOLO palla/canestro.
+    """
+
+    def __init__(self, label_dataset: Dataset, tracking_store: TrackingFeatureStore, missing_policy="zeros"):
+        self.label_dataset = label_dataset
+        self.tracking_store = tracking_store
+        self.missing_policy = missing_policy
+
+        self.missing_count = 0
+        for idx in range(len(label_dataset)):
+            path = get_base_item_path_from_label_dataset(label_dataset, idx)
+            if not tracking_store.has(path):
+                self.missing_count += 1
+
+        print("\n# TrackingAugmentedDataset")
+        print(f"Campioni: {len(label_dataset)}")
+        print(f"Feature tracking: {tracking_store.num_features}")
+        print(f"Campioni senza tracking features: {self.missing_count}")
+        print(f"Missing policy: {missing_policy}")
+
+    def __len__(self):
+        return len(self.label_dataset)
+
+    def __getitem__(self, idx):
+        sample = dict(self.label_dataset[idx])
+
+        features = sample["features"]
+        if not torch.is_tensor(features):
+            features = torch.tensor(features, dtype=torch.float32)
+        else:
+            features = features.float()
+
+        path = get_base_item_path_from_label_dataset(self.label_dataset, idx)
+        tracking_vector = self.tracking_store.get(path, missing_policy=self.missing_policy)
+        tracking_tensor = torch.tensor(tracking_vector, dtype=features.dtype)
+
+        if features.ndim != 2:
+            raise ValueError(
+                f"Le feature video devono avere forma [T, D], "
+                f"ma per {path} hanno forma {tuple(features.shape)}."
+            )
+
+        tracking_sequence = tracking_tensor.unsqueeze(0).repeat(features.shape[0], 1)
+        sample["features"] = torch.cat([features, tracking_sequence], dim=1)
+
+        return sample
+
 def get_dataset_labels_and_counts(dataset, num_classes: int):
     labels = []
     counts = torch.zeros(num_classes, dtype=torch.float)
@@ -493,6 +744,31 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--tracking-features-csv",
+        type=str,
+        default=None,
+        help=(
+            "CSV prodotto da extract_ball_rim_tracking_features.py. "
+            "Se indicato, le feature tracking vengono concatenate alle feature video."
+        ),
+    )
+    parser.add_argument(
+        "--tracking-missing-policy",
+        type=str,
+        default="zeros",
+        choices=["zeros", "error"],
+        help=(
+            "Comportamento se una clip non ha feature tracking: "
+            "zeros = vettore nullo, error = interrompe il training."
+        ),
+    )
+    parser.add_argument(
+        "--no-normalize-tracking-features",
+        action="store_true",
+        help="Disattiva la normalizzazione z-score delle feature tracking calcolata sul train set.",
+    )
+
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -518,9 +794,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_model(args, device, num_classes: int):
+def build_model(args, device, num_classes: int, tracking_dim: int = 0, tracking_config=None):
+    input_dim = int(args.input_dim)
+    actual_input_dim = input_dim + int(tracking_dim)
+
     model = TemporalTransformerActionClassifier(
-        input_dim=args.input_dim,
+        input_dim=actual_input_dim,
         d_model=args.d_model,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
@@ -534,7 +813,9 @@ def build_model(args, device, num_classes: int):
 
     model_config = {
         "model_type": "temporal_transformer",
-        "input_dim": args.input_dim,
+        "input_dim": actual_input_dim,
+        "base_input_dim": input_dim,
+        "tracking_input_dim": int(tracking_dim),
         "d_model": args.d_model,
         "num_layers": args.num_layers,
         "num_heads": args.num_heads,
@@ -544,10 +825,10 @@ def build_model(args, device, num_classes: int):
         "pooling": args.pooling,
         "last_mean_ratio": args.last_mean_ratio,
         "max_len": args.max_len,
+        "tracking_config": tracking_config,
     }
 
     return model, model_config
-
 
 def run_training(args):
     print("# Comando utilizzato")
@@ -647,7 +928,13 @@ def run_training(args):
         generator=data_loader_generator,
     )
 
-    model, model_config = build_model(args, device, num_classes=num_classes)
+    model, model_config = build_model(
+        args,
+        device,
+        num_classes=num_classes,
+        tracking_dim=tracking_dim,
+        tracking_config=tracking_config,
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -743,6 +1030,7 @@ def run_training(args):
                     "label_mapping": label_mapping,
                     "original_idx_to_label": get_original_idx_to_label(),
                     "model_config": model_config,
+                    "tracking_config": tracking_config,
                     "training_config": vars(args),
                     "class_weights": class_weights.detach().cpu()
                     if class_weights is not None
