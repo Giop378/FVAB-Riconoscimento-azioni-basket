@@ -902,6 +902,39 @@ def run_training(args):
         sampler_enabled = True
         print("\nWeightedRandomSampler attivato.")
 
+    tracking_dim = 0
+    tracking_config = None
+
+    if args.tracking_features_csv is not None:
+        print("\n# Feature tracking palla/canestro")
+        tracking_store = TrackingFeatureStore(args.tracking_features_csv)
+
+        if args.no_normalize_tracking_features:
+            print("Normalizzazione feature tracking disattivata.")
+        else:
+            tracking_store.fit_normalizer_from_label_dataset(train_dataset)
+
+        tracking_dim = tracking_store.num_features
+        tracking_config = tracking_store.get_config()
+
+        train_dataset = TrackingAugmentedDataset(
+            train_dataset,
+            tracking_store,
+            missing_policy=args.tracking_missing_policy,
+        )
+        val_dataset = TrackingAugmentedDataset(
+            val_dataset,
+            tracking_store,
+            missing_policy=args.tracking_missing_policy,
+        )
+
+        print(f"Input dim feature video: {args.input_dim}")
+        print(f"Input dim feature tracking: {tracking_dim}")
+        print(f"Input dim totale modello: {args.input_dim + tracking_dim}")
+    else:
+        print("\n# Feature tracking palla/canestro")
+        print("Feature tracking non usate.")
+
     data_loader_generator = torch.Generator()
     data_loader_generator.manual_seed(args.seed)
 
