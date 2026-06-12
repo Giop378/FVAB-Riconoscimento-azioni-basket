@@ -483,7 +483,185 @@ class TrackingFeatureStore:
     def get_config(self):
         return {
             "enabled": True,
+            "type": "aggregate",
             "csv_path": str(self.csv_path),
+            "num_features": self.num_features,
+            "feature_names": list(self.feature_names),
+            "normalized": bool(self.normalized),
+            "mean": self.mean.tolist() if self.mean is not None else None,
+            "std": self.std.tolist() if self.std is not None else None,
+        }
+
+
+def interpolate_sequence_array(sequence: np.ndarray, target_len: int) -> np.ndarray:
+    """
+    Ridimensiona una sequenza [S, K] a [target_len, K] con interpolazione lineare.
+    Serve per allineare le feature tracking temporali alla lunghezza delle feature DINOv3.
+    """
+    target_len = int(target_len)
+
+    if target_len <= 0:
+        return np.zeros((0, sequence.shape[1] if sequence.ndim == 2 else 0), dtype=np.float32)
+
+    sequence = np.asarray(sequence, dtype=np.float32)
+
+    if sequence.ndim != 2:
+        raise ValueError(f"La sequenza tracking deve avere forma [S, K], ricevuta {sequence.shape}.")
+
+    source_len, num_features = sequence.shape
+
+    if source_len == 0:
+        return np.zeros((target_len, num_features), dtype=np.float32)
+
+    if source_len == target_len:
+        return sequence.astype(np.float32)
+
+    if source_len == 1:
+        return np.repeat(sequence, repeats=target_len, axis=0).astype(np.float32)
+
+    source_x = np.linspace(0.0, 1.0, source_len, dtype=np.float32)
+    target_x = np.linspace(0.0, 1.0, target_len, dtype=np.float32)
+
+    resized = np.empty((target_len, num_features), dtype=np.float32)
+    for feature_idx in range(num_features):
+        resized[:, feature_idx] = np.interp(target_x, source_x, sequence[:, feature_idx])
+
+    return resized.astype(np.float32)
+
+
+class TrackingSequenceFeatureStore:
+    """
+    Carica sequenze temporali di tracking palla/canestro salvate in un file NPZ.
+
+    Ogni clip è associata a una matrice [S, K], dove S è il numero di frame
+    campionati dal detector e K il numero di feature per frame. In training la
+    sequenza viene interpolata alla lunghezza reale della sequenza DINOv3 [T, D].
+    """
+
+    def __init__(
+        self,
+        npz_path: str,
+        index_path: str = None,
+        feature_names=None,
+        mean=None,
+        std=None,
+        normalized=False,
+    ):
+        self.npz_path = Path(npz_path)
+        if not self.npz_path.exists():
+            raise FileNotFoundError(f"File NPZ tracking temporale non trovato: {self.npz_path}")
+
+        if index_path is None:
+            index_path = self.npz_path.with_name("tracking_sequence_index.json")
+
+        self.index_path = Path(index_path)
+        if not self.index_path.exists():
+            raise FileNotFoundError(
+                f"Indice tracking temporale non trovato: {self.index_path}. "
+                "Passa --tracking-sequence-index oppure genera l'indice con lo script di estrazione."
+            )
+
+        with open(self.index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+
+        self.feature_names = feature_names or index_data.get("feature_names")
+        if not self.feature_names:
+            raise ValueError("Nomi feature tracking temporali non presenti nell'indice.")
+
+        self.rows_by_key = {}
+        sequences = index_data.get("sequences", {})
+        for key, value in sequences.items():
+            if isinstance(value, dict):
+                self.rows_by_key[key] = value.get("array_key")
+            else:
+                self.rows_by_key[key] = str(value)
+
+        if not self.rows_by_key:
+            raise ValueError(f"Nessuna sequenza tracking indicizzata in {self.index_path}.")
+
+        self.data = np.load(self.npz_path)
+        self.normalized = bool(normalized)
+        self.mean = None if mean is None else np.array(mean, dtype=np.float32)
+        self.std = None if std is None else np.array(std, dtype=np.float32)
+
+        if self.mean is None:
+            self.mean = np.zeros(self.num_features, dtype=np.float32)
+        if self.std is None:
+            self.std = np.ones(self.num_features, dtype=np.float32)
+
+        self.std = np.where(self.std < 1e-6, 1.0, self.std).astype(np.float32)
+
+    @property
+    def num_features(self) -> int:
+        return len(self.feature_names)
+
+    def has(self, path_value) -> bool:
+        return normalize_clip_key(path_value) in self.rows_by_key
+
+    def get_raw(self, path_value, target_len=None, missing_policy="zeros"):
+        key = normalize_clip_key(path_value)
+
+        if key in self.rows_by_key:
+            array_key = self.rows_by_key[key]
+            if array_key not in self.data:
+                raise KeyError(
+                    f"Array '{array_key}' non trovato in {self.npz_path} "
+                    f"per path='{path_value}'."
+                )
+            sequence = np.asarray(self.data[array_key], dtype=np.float32)
+        elif missing_policy == "zeros":
+            length = int(target_len) if target_len is not None else 1
+            sequence = np.zeros((max(1, length), self.num_features), dtype=np.float32)
+        else:
+            raise KeyError(
+                f"Sequenza tracking non trovata per path='{path_value}' "
+                f"con chiave normalizzata='{key}'."
+            )
+
+        if target_len is not None:
+            sequence = interpolate_sequence_array(sequence, int(target_len))
+
+        return sequence.astype(np.float32)
+
+    def get(self, path_value, target_len=None, missing_policy="zeros"):
+        sequence = self.get_raw(path_value, target_len=target_len, missing_policy=missing_policy)
+        if self.normalized:
+            sequence = (sequence - self.mean.reshape(1, -1)) / self.std.reshape(1, -1)
+        return sequence.astype(np.float32)
+
+    def fit_normalizer_from_label_dataset(self, label_dataset):
+        sequences = []
+        missing = 0
+
+        for idx in range(len(label_dataset)):
+            path = get_base_item_path_from_label_dataset(label_dataset, idx)
+            if self.has(path):
+                sequences.append(self.get_raw(path, missing_policy="error"))
+            else:
+                missing += 1
+
+        if not sequences:
+            raise RuntimeError(
+                "Impossibile normalizzare le sequenze tracking: "
+                "nessun campione del training set ha feature tracking associate."
+            )
+
+        matrix = np.concatenate(sequences, axis=0).astype(np.float32)
+        self.mean = matrix.mean(axis=0).astype(np.float32)
+        self.std = matrix.std(axis=0).astype(np.float32)
+        self.std = np.where(self.std < 1e-6, 1.0, self.std).astype(np.float32)
+        self.normalized = True
+
+        print("\n# Normalizzazione sequenze tracking")
+        print(f"Frame/sequenze usati per stimare mean/std: {matrix.shape[0]}")
+        print(f"Campioni train senza sequenze tracking: {missing}")
+
+    def get_config(self):
+        return {
+            "enabled": True,
+            "type": "temporal_sequence",
+            "npz_path": str(self.npz_path),
+            "index_path": str(self.index_path),
             "num_features": self.num_features,
             "feature_names": list(self.feature_names),
             "normalized": bool(self.normalized),
@@ -548,6 +726,74 @@ class TrackingAugmentedDataset(Dataset):
         sample["features"] = torch.cat([features, tracking_sequence], dim=1)
 
         return sample
+
+
+class TemporalTrackingAugmentedDataset(Dataset):
+    """
+    Concatena a ogni timestep delle feature video una sequenza temporale di
+    feature palla/canestro allineata alla lunghezza della clip.
+
+    Input originale:
+      features: [T, D]
+      tracking sequence: [S, K]
+
+    Output:
+      features: [T, D + K]
+    """
+
+    def __init__(self, label_dataset: Dataset, tracking_store: TrackingSequenceFeatureStore, missing_policy="zeros"):
+        self.label_dataset = label_dataset
+        self.tracking_store = tracking_store
+        self.missing_policy = missing_policy
+
+        self.missing_count = 0
+        for idx in range(len(label_dataset)):
+            path = get_base_item_path_from_label_dataset(label_dataset, idx)
+            if not tracking_store.has(path):
+                self.missing_count += 1
+
+        print("\n# TemporalTrackingAugmentedDataset")
+        print(f"Campioni: {len(label_dataset)}")
+        print(f"Feature tracking temporali per frame: {tracking_store.num_features}")
+        print(f"Campioni senza tracking sequences: {self.missing_count}")
+        print(f"Missing policy: {missing_policy}")
+
+    def __len__(self):
+        return len(self.label_dataset)
+
+    def __getitem__(self, idx):
+        sample = dict(self.label_dataset[idx])
+
+        features = sample["features"]
+        if not torch.is_tensor(features):
+            features = torch.tensor(features, dtype=torch.float32)
+        else:
+            features = features.float()
+
+        if features.ndim != 2:
+            path = get_base_item_path_from_label_dataset(self.label_dataset, idx)
+            raise ValueError(
+                f"Le feature video devono avere forma [T, D], "
+                f"ma per {path} hanno forma {tuple(features.shape)}."
+            )
+
+        path = get_base_item_path_from_label_dataset(self.label_dataset, idx)
+        tracking_sequence = self.tracking_store.get(
+            path,
+            target_len=features.shape[0],
+            missing_policy=self.missing_policy,
+        )
+        tracking_tensor = torch.tensor(tracking_sequence, dtype=features.dtype)
+
+        if tracking_tensor.shape[0] != features.shape[0]:
+            raise ValueError(
+                f"Lunghezza tracking non coerente per {path}: "
+                f"features T={features.shape[0]}, tracking T={tracking_tensor.shape[0]}."
+            )
+
+        sample["features"] = torch.cat([features, tracking_tensor], dim=1)
+        return sample
+
 
 def get_dataset_labels_and_counts(dataset, num_classes: int):
     labels = []
@@ -750,7 +996,26 @@ def parse_args():
         default=None,
         help=(
             "CSV prodotto da extract_ball_rim_tracking_features.py. "
-            "Se indicato, le feature tracking vengono concatenate alle feature video."
+            "Se indicato, le feature tracking aggregate vengono concatenate alle feature video."
+        ),
+    )
+    parser.add_argument(
+        "--tracking-sequences-npz",
+        type=str,
+        default=None,
+        help=(
+            "File NPZ con sequenze temporali di tracking palla/canestro. "
+            "Se indicato, ogni sequenza [S, K] viene interpolata a [T, K] "
+            "e concatenata alle feature video frame per frame."
+        ),
+    )
+    parser.add_argument(
+        "--tracking-sequence-index",
+        type=str,
+        default=None,
+        help=(
+            "JSON indice associato a --tracking-sequences-npz. "
+            "Default: tracking_sequence_index.json nella stessa cartella del file NPZ."
         ),
     )
     parser.add_argument(
@@ -905,8 +1170,14 @@ def run_training(args):
     tracking_dim = 0
     tracking_config = None
 
+    if args.tracking_features_csv is not None and args.tracking_sequences_npz is not None:
+        raise ValueError(
+            "Usare una sola modalità tracking: --tracking-features-csv "
+            "oppure --tracking-sequences-npz, non entrambe."
+        )
+
     if args.tracking_features_csv is not None:
-        print("\n# Feature tracking palla/canestro")
+        print("\n# Feature tracking palla/canestro aggregate")
         tracking_store = TrackingFeatureStore(args.tracking_features_csv)
 
         if args.no_normalize_tracking_features:
@@ -929,7 +1200,37 @@ def run_training(args):
         )
 
         print(f"Input dim feature video: {args.input_dim}")
-        print(f"Input dim feature tracking: {tracking_dim}")
+        print(f"Input dim feature tracking aggregate: {tracking_dim}")
+        print(f"Input dim totale modello: {args.input_dim + tracking_dim}")
+
+    elif args.tracking_sequences_npz is not None:
+        print("\n# Feature tracking palla/canestro temporali")
+        tracking_store = TrackingSequenceFeatureStore(
+            args.tracking_sequences_npz,
+            index_path=args.tracking_sequence_index,
+        )
+
+        if args.no_normalize_tracking_features:
+            print("Normalizzazione sequenze tracking disattivata.")
+        else:
+            tracking_store.fit_normalizer_from_label_dataset(train_dataset)
+
+        tracking_dim = tracking_store.num_features
+        tracking_config = tracking_store.get_config()
+
+        train_dataset = TemporalTrackingAugmentedDataset(
+            train_dataset,
+            tracking_store,
+            missing_policy=args.tracking_missing_policy,
+        )
+        val_dataset = TemporalTrackingAugmentedDataset(
+            val_dataset,
+            tracking_store,
+            missing_policy=args.tracking_missing_policy,
+        )
+
+        print(f"Input dim feature video: {args.input_dim}")
+        print(f"Input dim feature tracking temporali: {tracking_dim}")
         print(f"Input dim totale modello: {args.input_dim + tracking_dim}")
     else:
         print("\n# Feature tracking palla/canestro")

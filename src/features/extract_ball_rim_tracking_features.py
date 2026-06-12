@@ -65,6 +65,39 @@ TRACKING_FEATURE_NAMES = [
 ]
 
 
+TEMPORAL_TRACKING_FEATURE_NAMES = [
+    "t_rel",
+    "ball_detected",
+    "rim_detected",
+    "both_detected",
+    "ball_conf",
+    "rim_conf",
+    "ball_xc",
+    "ball_yc",
+    "ball_w",
+    "ball_h",
+    "ball_area",
+    "rim_xc",
+    "rim_yc",
+    "rim_w",
+    "rim_h",
+    "rim_area",
+    "dx",
+    "dy",
+    "ball_rim_dist",
+    "ball_near_rim",
+    "ball_above_rim",
+    "ball_below_rim",
+    "ball_vx",
+    "ball_vy",
+    "ball_speed",
+    "ball_ax",
+    "ball_ay",
+    "ball_acceleration",
+    "ball_rim_dist_delta",
+]
+
+
 class Tee:
     def __init__(self, *streams):
         self.streams = streams
@@ -120,6 +153,26 @@ def last_or_default(values, default=0.0):
     if not values:
         return default
     return safe_float(values[-1], default=default)
+
+
+def normalize_clip_key(path_value) -> str:
+    """
+    Normalizza il path di una clip in una chiave stabile per associare
+    feature video, feature aggregate e sequenze temporali.
+    """
+    path_str = str(path_value).replace("\\", "/")
+    parts = [p for p in Path(path_str).parts if p not in {"", "."}]
+
+    split_idx = None
+    for idx, part in enumerate(parts):
+        if part in {"train", "val", "test"}:
+            split_idx = idx
+            break
+
+    if split_idx is not None:
+        parts = parts[split_idx:]
+
+    return Path(*parts).with_suffix("").as_posix()
 
 
 def read_manifest(manifest_path: Path, dataset_root: Path, splits, labels, max_clips=None):
@@ -530,6 +583,107 @@ def aggregate_clip_features(frame_rows, fps, near_threshold):
     return {name: safe_float(features.get(name, 0.0), default=0.0) for name in TRACKING_FEATURE_NAMES}
 
 
+def compute_temporal_sequence_features(frame_rows, fps):
+    """
+    Converte le detection per-frame in una sequenza [S, K] di feature temporali.
+
+    A differenza delle 39 feature aggregate per clip, questa rappresentazione
+    conserva l'ordine temporale e include posizione, distanza palla-canestro,
+    velocità e accelerazione della palla.
+    """
+    rows = sorted(frame_rows, key=lambda r: int(r["frame_order"]))
+
+    if not rows:
+        return np.zeros((0, len(TEMPORAL_TRACKING_FEATURE_NAMES)), dtype=np.float32)
+
+    sequence_rows = []
+    prev_row = None
+    prev_vx = None
+    prev_vy = None
+    prev_speed = None
+
+    for row in rows:
+        ball_detected = int(row["ball_detected"]) == 1
+        rim_detected = int(row["rim_detected"]) == 1
+        both_detected = int(row["both_detected"]) == 1
+
+        ball_vx = 0.0
+        ball_vy = 0.0
+        ball_speed = 0.0
+        ball_ax = 0.0
+        ball_ay = 0.0
+        ball_acceleration = 0.0
+        dist_delta = 0.0
+        current_velocity_valid = False
+
+        if prev_row is not None:
+            delta_frames = int(row["frame_idx"]) - int(prev_row["frame_idx"])
+            dt = delta_frames / fps if fps > 0 and delta_frames > 0 else 0.0
+
+            prev_ball_detected = int(prev_row["ball_detected"]) == 1
+            prev_both_detected = int(prev_row["both_detected"]) == 1
+
+            if dt > 0 and ball_detected and prev_ball_detected:
+                ball_vx = (float(row["ball_xc"]) - float(prev_row["ball_xc"])) / dt
+                ball_vy = (float(row["ball_yc"]) - float(prev_row["ball_yc"])) / dt
+                ball_speed = math.sqrt(ball_vx * ball_vx + ball_vy * ball_vy)
+                current_velocity_valid = True
+
+                if prev_vx is not None and prev_vy is not None and prev_speed is not None:
+                    ball_ax = (ball_vx - prev_vx) / dt
+                    ball_ay = (ball_vy - prev_vy) / dt
+                    ball_acceleration = (ball_speed - prev_speed) / dt
+
+            if dt > 0 and both_detected and prev_both_detected:
+                dist_delta = (float(row["ball_rim_dist"]) - float(prev_row["ball_rim_dist"])) / dt
+
+        feature_values = {
+            "t_rel": float(row["t_rel"]),
+            "ball_detected": float(row["ball_detected"]),
+            "rim_detected": float(row["rim_detected"]),
+            "both_detected": float(row["both_detected"]),
+            "ball_conf": float(row["ball_conf"]),
+            "rim_conf": float(row["rim_conf"]),
+            "ball_xc": float(row["ball_xc"]),
+            "ball_yc": float(row["ball_yc"]),
+            "ball_w": float(row["ball_w"]),
+            "ball_h": float(row["ball_h"]),
+            "ball_area": float(row["ball_area"]),
+            "rim_xc": float(row["rim_xc"]),
+            "rim_yc": float(row["rim_yc"]),
+            "rim_w": float(row["rim_w"]),
+            "rim_h": float(row["rim_h"]),
+            "rim_area": float(row["rim_area"]),
+            "dx": float(row["dx"]),
+            "dy": float(row["dy"]),
+            "ball_rim_dist": float(row["ball_rim_dist"]),
+            "ball_near_rim": float(row["ball_near_rim"]),
+            "ball_above_rim": float(row["ball_above_rim"]),
+            "ball_below_rim": float(row["ball_below_rim"]),
+            "ball_vx": ball_vx,
+            "ball_vy": ball_vy,
+            "ball_speed": ball_speed,
+            "ball_ax": ball_ax,
+            "ball_ay": ball_ay,
+            "ball_acceleration": ball_acceleration,
+            "ball_rim_dist_delta": dist_delta,
+        }
+
+        sequence_rows.append([
+            safe_float(feature_values[name], default=0.0)
+            for name in TEMPORAL_TRACKING_FEATURE_NAMES
+        ])
+
+        if current_velocity_valid:
+            prev_vx = ball_vx
+            prev_vy = ball_vy
+            prev_speed = ball_speed
+
+        prev_row = row
+
+    return np.asarray(sequence_rows, dtype=np.float32)
+
+
 def process_clip(
     row,
     model,
@@ -672,6 +826,58 @@ def write_csv(path: Path, rows, fieldnames):
                     cleaned[key] = value
 
             writer.writerow(cleaned)
+
+
+def write_temporal_sequences(output_dir: Path, sequence_entries):
+    """
+    Salva le sequenze tracking in formato NPZ più un indice JSON path -> array.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    npz_path = output_dir / "tracking_sequences.npz"
+    index_path = output_dir / "tracking_sequence_index.json"
+    feature_names_path = output_dir / "tracking_sequence_feature_names.json"
+
+    arrays = {}
+    index = {
+        "type": "temporal_sequence",
+        "npz_path": str(npz_path),
+        "feature_names": TEMPORAL_TRACKING_FEATURE_NAMES,
+        "num_features": len(TEMPORAL_TRACKING_FEATURE_NAMES),
+        "sequences": {},
+    }
+
+    for array_idx, entry in enumerate(sequence_entries):
+        array_key = f"seq_{array_idx:06d}"
+        arrays[array_key] = entry["sequence"].astype(np.float32)
+
+        normalized_key = normalize_clip_key(entry["path"])
+        index["sequences"][normalized_key] = {
+            "array_key": array_key,
+            "clip_id": entry.get("clip_id", ""),
+            "split": entry.get("split", ""),
+            "label": entry.get("label", ""),
+            "path": entry.get("path", ""),
+            "sampled_frames": int(entry["sequence"].shape[0]),
+        }
+
+    np.savez_compressed(npz_path, **arrays)
+
+    with open(index_path, "w", encoding="utf-8") as f:
+        json.dump(index, f, indent=2, ensure_ascii=False)
+
+    with open(feature_names_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "feature_names": TEMPORAL_TRACKING_FEATURE_NAMES,
+                "num_features": len(TEMPORAL_TRACKING_FEATURE_NAMES),
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    return npz_path, index_path, feature_names_path
 
 
 def parse_args():
@@ -840,6 +1046,15 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--save-temporal-sequences",
+        action="store_true",
+        help=(
+            "Salva anche tracking_sequences.npz e tracking_sequence_index.json, "
+            "cioè feature palla/canestro per-frame utilizzabili come tracking temporale."
+        ),
+    )
+
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Permette di sovrascrivere file già esistenti.",
@@ -862,10 +1077,18 @@ def main():
     tracking_csv_path = output_dir / "tracking_features.csv"
     per_frame_csv_path = output_dir / "per_frame_detections.csv"
     feature_names_path = output_dir / "tracking_feature_names.json"
+    tracking_sequences_npz_path = output_dir / "tracking_sequences.npz"
+    tracking_sequence_index_path = output_dir / "tracking_sequence_index.json"
 
     if tracking_csv_path.exists() and not args.overwrite:
         raise FileExistsError(
             f"File già esistente: {tracking_csv_path}. "
+            "Usa --overwrite per rigenerarlo."
+        )
+
+    if args.save_temporal_sequences and tracking_sequences_npz_path.exists() and not args.overwrite:
+        raise FileExistsError(
+            f"File già esistente: {tracking_sequences_npz_path}. "
             "Usa --overwrite per rigenerarlo."
         )
 
@@ -938,6 +1161,7 @@ def main():
 
             clip_rows = []
             all_frame_rows = []
+            temporal_sequence_entries = []
             errors = []
 
             print("\n# Estrazione feature")
@@ -973,6 +1197,21 @@ def main():
 
                     if args.save_per_frame:
                         all_frame_rows.extend(frame_rows)
+
+                    if args.save_temporal_sequences:
+                        temporal_sequence = compute_temporal_sequence_features(
+                            frame_rows=frame_rows,
+                            fps=float(clip_row.get("fps", 25.0)),
+                        )
+                        temporal_sequence_entries.append(
+                            {
+                                "clip_id": clip_row["clip_id"],
+                                "split": clip_row["split"],
+                                "label": clip_row["label"],
+                                "path": clip_row["path"],
+                                "sequence": temporal_sequence,
+                            }
+                        )
 
                 except Exception as exc:
                     msg = f"{type(exc).__name__}: {exc}"
@@ -1067,6 +1306,15 @@ def main():
 
                 print(f"Detection per frame salvate in: {per_frame_csv_path}")
 
+            if args.save_temporal_sequences:
+                npz_path, index_path, sequence_feature_names_path = write_temporal_sequences(
+                    output_dir=output_dir,
+                    sequence_entries=temporal_sequence_entries,
+                )
+                print(f"Sequenze tracking temporali salvate in: {npz_path}")
+                print(f"Indice sequenze tracking salvato in: {index_path}")
+                print(f"Nomi feature tracking temporali salvati in: {sequence_feature_names_path}")
+
             if errors:
                 errors_path = output_dir / "errors.csv"
                 write_csv(
@@ -1079,7 +1327,10 @@ def main():
             print("\n# Riepilogo")
             print(f"Clip processate correttamente: {len(clip_rows)}")
             print(f"Clip con errore: {len(errors)}")
-            print(f"Numero feature tracking: {len(TRACKING_FEATURE_NAMES)}")
+            print(f"Numero feature tracking aggregate: {len(TRACKING_FEATURE_NAMES)}")
+            if args.save_temporal_sequences:
+                print(f"Numero feature tracking temporali per frame: {len(TEMPORAL_TRACKING_FEATURE_NAMES)}")
+                print(f"Sequenze temporali salvate: {len(temporal_sequence_entries)}")
 
         except Exception:
             print("\nERRORE DURANTE L'ESECUZIONE:", file=sys.stderr)

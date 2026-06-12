@@ -94,6 +94,7 @@ Il risultato è adeguato per usare il detector come generatore di feature: il re
 |ID|Modello|Feature extractor / tracking|Label mode / valutazione|Classi|Epoche|Batch size|LR|d_model|Layers|Heads|FF dim|Dropout|Weight decay|Pooling|Class weight power|Sampler|Val Loss|Val Accuracy|Val Macro F1|Val Weighted F1|Output dir|
 |-|-|-|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-|-:|-|-:|-:|-:|-:|-|
 |exp_l3_tracking_v1|Temporal Transformer d256|DINOv3-L/16 frozen + YOLO ball/rim tracking|shot_outcome_only|2|50|64|5e-5|256|2|4|768|0.45|5e-3|Mean|0.5|WeightedRandomSampler power 0.5|0.4656|0.8154|0.8132|0.8179|outputs/exp_l3_tracking_v1|
+|exp_l3_tracking_v2_d384_sampler04|Temporal Transformer d384|DINOv3-L/16 frozen + YOLO ball/rim tracking|shot_outcome_only|2|50|64|5e-5|384|2|6|1024|0.45|5e-3|Mean|0.5|WeightedRandomSampler power 0.4|0.4559|0.7846|0.7842|0.7865|outputs/exp_l3_tracking_v2_d384_sampler04|
 |exp_38|Gerarchia L1+L2+L3 tracking|DINOv3-L/16 frozen + YOLO ball/rim tracking nello Stadio 3|hierarchical end-to-end|8|-|64|-|misto|misto|misto|misto|misto|misto|Mean|-|-|-|0.8759|0.6996|0.8766|outputs/exp_38_dinov3_vitl16_hierarchical_tracking_l3|
 |exp_39|Temporal Transformer d256 + late fusion tracking|DINOv3-L/16 frozen + YOLO ball/rim tracking su tutte le clip train/val|non-hierarchical, idle/non-gioco -> no-action|8|40|64|5e-5|256|2|4|768|0.45|5e-3|Mean|0.5|WeightedRandomSampler power 0.5|0.5429|0.8426|0.5620|0.8447|outputs/exp_39_nonhierarchical_dinov3_tracking_noaction|
 
@@ -102,6 +103,7 @@ Il risultato è adeguato per usare il detector come generatore di feature: il re
 |ID|Accuracy|Macro Precision|Macro Recall|Macro F1|Weighted Precision|Weighted Recall|Weighted F1|
 |-|-:|-:|-:|-:|-:|-:|-:|
 |exp_l3_tracking_v1|0.8154|0.82|0.83|0.8132|0.84|0.82|0.8179|
+|exp_l3_tracking_v2_d384_sampler04|0.7846|0.81|0.82|0.7842|0.84|0.78|0.7865|
 |exp_38|0.8759|0.74|0.72|0.6996|0.89|0.88|0.8766|
 |exp_39|0.8426|0.61|0.57|0.5620|0.86|0.84|0.8447|
 
@@ -110,6 +112,7 @@ Il risultato è adeguato per usare il detector come generatore di feature: il re
 Questa tabella riporta le metriche calcolate sulle classi più rilevanti per ciascun esperimento:
 
 - **exp_l3_tracking_v1**: solo `tiro0` e `tiro1`, con feature tracking palla/canestro concatenate alle feature DINOv3.
+- **exp_l3_tracking_v2_d384_sampler04**: solo `tiro0` e `tiro1`, con feature tracking palla/canestro e configurazione più grande ispirata a `exp_31` / `exp_30` (`d_model=384`, `num_heads=6`, `ff_dim=1024`, `sampler_power=0.4`).
 - **exp_38**: solo le 7 azioni finali prodotte dalla nuova gerarchia end-to-end con Stadio 3 tracking.
 - **exp_38 collassato**: valutazione della nuova gerarchia collassando l'esito del tiro, cioè considerando solo il tipo di tiro.
 - **exp_39**: solo le 7 azioni reali del modello non gerarchico a 8 classi con `idle` e `non-gioco` uniti in `no-action`.
@@ -117,6 +120,7 @@ Questa tabella riporta le metriche calcolate sulle classi più rilevanti per cia
 |ID|Classi considerate|Micro Precision|Micro Recall|Micro F1|Macro Precision|Macro Recall|Macro F1|Weighted Precision|Weighted Recall|Weighted F1|
 |-|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|
 |exp_l3_tracking_v1|tiro0, tiro1|0.82|0.82|0.82|0.82|0.83|0.81|0.84|0.82|0.82|
+|exp_l3_tracking_v2_d384_sampler04|tiro0, tiro1|0.78|0.78|0.78|0.81|0.82|0.78|0.84|0.78|0.79|
 |exp_38|7 azioni finali|0.82|0.89|0.85|0.71|0.70|0.67|0.84|0.89|0.85|
 |exp_38 collassato|tipo azione senza esito|0.89|0.89|0.89|0.84|0.81|0.82|0.90|0.89|0.89|
 |exp_39|7 azioni finali|0.76|0.86|0.80|0.56|0.54|0.52|0.77|0.86|0.80|
@@ -136,6 +140,24 @@ Confusion matrix:
 [[30 10]
  [ 2 23]]
 ```
+
+### exp_l3_tracking_v2_d384_sampler04 - DINOv3-L/16 frozen + YOLO ball/rim tracking, shot_outcome_only
+
+Questo esperimento mantiene il tracking palla/canestro sullo Stadio 3, ma usa una configurazione più grande e più vicina agli esperimenti `exp_30` / `exp_31`: `d_model=384`, `num_heads=6`, `ff_dim=1024` e `sampler_power=0.4`. Il miglior checkpoint viene salvato alla quinta epoca.
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|tiro0|0.96|0.68|0.79|40|
+|tiro1|0.65|0.96|0.77|25|
+
+Confusion matrix:
+
+```text
+[[27 13]
+ [ 1 24]]
+```
+
+Rispetto a `exp_l3_tracking_v1`, questa configurazione peggiora leggermente la Macro F1 (`0.7842` contro `0.8132`) e aumenta i falsi positivi su `tiro1`: i `tiro0` predetti come `tiro1` passano da 10 a 13. Il modello più grande recupera quasi tutti i tiri segnati, ma diventa meno conservativo sugli sbagliati.
 
 ### exp_38 - Gerarchia end-to-end con Stadio 3 tracking, 8 classi finali con no-action
 
@@ -356,6 +378,32 @@ python -m src.training.train \
   --seed 42
 ```
 
+### exp_l3_tracking_v2_d384_sampler04 - Training Stadio 3 con tracking e parametri d384
+
+```bash
+python -m src.training.train \
+  --features-root data/features/dinov3_vitl16_336 \
+  --output-dir outputs/exp_l3_tracking_v2_d384_sampler04 \
+  --label-mode shot_outcome_only \
+  --tracking-features-csv data/features/ball_rim_tracking_features_v1/tracking_features.csv \
+  --epochs 50 \
+  --batch-size 64 \
+  --lr 5e-5 \
+  --input-dim 1024 \
+  --d-model 384 \
+  --num-layers 2 \
+  --num-heads 6 \
+  --ff-dim 1024 \
+  --dropout 0.45 \
+  --weight-decay 5e-3 \
+  --pooling mean \
+  --class-weight-power 0.5 \
+  --sampler-power 0.4 \
+  --scheduler-patience 5 \
+  --num-workers 2 \
+  --seed 42
+```
+
 ### exp_38 - Gerarchia end-to-end con Stadio 3 tracking
 
 ```bash
@@ -402,6 +450,8 @@ Rispetto al precedente riferimento per lo Stadio 3, `exp_30`, che otteneva Accur
 
 Il beneficio si riflette anche nella gerarchia end-to-end `exp_38`, in cui vengono mantenuti invariati Stadio 1 e Stadio 2 e viene sostituito solo lo Stadio 3. Rispetto alla precedente gerarchia `exp_31`, la Macro F1 sulle 8 classi passa da 0.5981 a 0.6996, mentre sulle sole 7 azioni finali passa da circa 0.55 a 0.67. La valutazione collassata senza esito resta invariata, confermando che il salto deriva principalmente dalla migliore classificazione dell’esito del tiro.
 
+L'esperimento `exp_l3_tracking_v2_d384_sampler04` prova ad aumentare la capacità dello Stadio 3 usando la configurazione più grande degli esperimenti `exp_30` / `exp_31` (`d_model=384`, `num_heads=6`, `ff_dim=1024`) e riportando il sampler a `power=0.4`. Il risultato non migliora `exp_l3_tracking_v1`: la Macro F1 scende da 0.8132 a 0.7842. La matrice di confusione mostra che il modello diventa più sbilanciato verso `tiro1`, con 13 `tiro0` classificati come `tiro1` e un solo `tiro1` classificato come `tiro0`. Per questo motivo il checkpoint `exp_l3_tracking_v1` resta il miglior candidato per lo Stadio 3 tracking.
+
 Il successivo esperimento `exp_39` riporta il tracking anche nel modello non gerarchico a 8 classi, con `idle` e `non-gioco` uniti in `no-action`. Questa soluzione è più semplice dal punto di vista del codice e dell'inferenza, perché non richiede il routing tra stadi. Tuttavia, sui risultati di validation ottiene Accuracy = 0.8426 e Macro F1 = 0.5620 sulle 8 classi, mentre sulle sole 7 azioni finali raggiunge Macro F1 = 0.52. Il risultato è quindi inferiore alla gerarchia con tracking `exp_38`, soprattutto sulle classi rare dei tiri.
 
-Nel complesso, questi risultati mostrano che le informazioni esplicite sulla relazione spaziale e temporale tra palla e canestro riducono in modo significativo il principale collo di bottiglia della gerarchia precedente. Il modello non gerarchico con late fusion rappresenta una versione più semplice e pulita della pipeline, ma in questa configurazione non supera ancora la gerarchia end-to-end con Stadio 3 tracking.
+Nel complesso, questi risultati mostrano che le informazioni esplicite sulla relazione spaziale e temporale tra palla e canestro riducono in modo significativo il principale collo di bottiglia della gerarchia precedente. Il tentativo di aumentare ulteriormente la capacità dello Stadio 3 non porta benefici; conviene quindi mantenere `exp_l3_tracking_v1` come riferimento e, per eventuali miglioramenti senza nuovi training pesanti, lavorare sul tuning della soglia decisionale di `tiro1` oppure sull'analisi manuale degli errori dello Stadio 3. Il modello non gerarchico con late fusion rappresenta una versione più semplice e pulita della pipeline, ma in questa configurazione non supera ancora la gerarchia end-to-end con Stadio 3 tracking.

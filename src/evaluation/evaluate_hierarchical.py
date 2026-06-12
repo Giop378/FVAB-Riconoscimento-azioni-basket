@@ -1,6 +1,7 @@
 from pathlib import Path
 import argparse
 import csv
+import json
 import shlex
 import sys
 import traceback
@@ -163,6 +164,124 @@ class TrackingFeatureStore:
         return vector.astype(np.float32)
 
 
+def interpolate_sequence_array(sequence: np.ndarray, target_len: int) -> np.ndarray:
+    target_len = int(target_len)
+
+    if target_len <= 0:
+        return np.zeros((0, sequence.shape[1] if sequence.ndim == 2 else 0), dtype=np.float32)
+
+    sequence = np.asarray(sequence, dtype=np.float32)
+
+    if sequence.ndim != 2:
+        raise ValueError(f"La sequenza tracking deve avere forma [S, K], ricevuta {sequence.shape}.")
+
+    source_len, num_features = sequence.shape
+
+    if source_len == 0:
+        return np.zeros((target_len, num_features), dtype=np.float32)
+
+    if source_len == target_len:
+        return sequence.astype(np.float32)
+
+    if source_len == 1:
+        return np.repeat(sequence, repeats=target_len, axis=0).astype(np.float32)
+
+    source_x = np.linspace(0.0, 1.0, source_len, dtype=np.float32)
+    target_x = np.linspace(0.0, 1.0, target_len, dtype=np.float32)
+
+    resized = np.empty((target_len, num_features), dtype=np.float32)
+    for feature_idx in range(num_features):
+        resized[:, feature_idx] = np.interp(target_x, source_x, sequence[:, feature_idx])
+
+    return resized.astype(np.float32)
+
+
+class TrackingSequenceFeatureStore:
+    def __init__(self, npz_path: str, index_path: str = None, feature_names=None, mean=None, std=None, normalized=False):
+        self.npz_path = Path(npz_path)
+
+        if not self.npz_path.exists():
+            raise FileNotFoundError(f"File NPZ tracking temporale non trovato: {self.npz_path}")
+
+        if index_path is None:
+            index_path = self.npz_path.with_name("tracking_sequence_index.json")
+
+        self.index_path = Path(index_path)
+        if not self.index_path.exists():
+            raise FileNotFoundError(
+                f"Indice tracking temporale non trovato: {self.index_path}. "
+                "Passa --tracking-sequence-index oppure genera l'indice con lo script di estrazione."
+            )
+
+        with open(self.index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+
+        self.feature_names = feature_names or index_data.get("feature_names")
+        if not self.feature_names:
+            raise ValueError("Nomi feature tracking temporali non presenti nell'indice.")
+
+        self.rows_by_key = {}
+        sequences = index_data.get("sequences", {})
+        for key, value in sequences.items():
+            if isinstance(value, dict):
+                self.rows_by_key[key] = value.get("array_key")
+            else:
+                self.rows_by_key[key] = str(value)
+
+        if not self.rows_by_key:
+            raise ValueError(f"Nessuna sequenza tracking indicizzata in {self.index_path}.")
+
+        self.data = np.load(self.npz_path)
+        self.normalized = bool(normalized)
+        self.mean = None if mean is None else np.array(mean, dtype=np.float32)
+        self.std = None if std is None else np.array(std, dtype=np.float32)
+
+        if self.mean is None:
+            self.mean = np.zeros(self.num_features, dtype=np.float32)
+        if self.std is None:
+            self.std = np.ones(self.num_features, dtype=np.float32)
+
+        self.std = np.where(self.std < 1e-6, 1.0, self.std).astype(np.float32)
+
+    @property
+    def num_features(self) -> int:
+        return len(self.feature_names)
+
+    def has(self, path_value) -> bool:
+        return normalize_clip_key(path_value) in self.rows_by_key
+
+    def get_raw(self, path_value, target_len=None, missing_policy="zeros"):
+        key = normalize_clip_key(path_value)
+
+        if key in self.rows_by_key:
+            array_key = self.rows_by_key[key]
+            if array_key not in self.data:
+                raise KeyError(
+                    f"Array '{array_key}' non trovato in {self.npz_path} "
+                    f"per path='{path_value}'."
+                )
+            sequence = np.asarray(self.data[array_key], dtype=np.float32)
+        elif missing_policy == "zeros":
+            length = int(target_len) if target_len is not None else 1
+            sequence = np.zeros((max(1, length), self.num_features), dtype=np.float32)
+        else:
+            raise KeyError(
+                f"Sequenza tracking non trovata per path='{path_value}' "
+                f"con chiave normalizzata='{key}'."
+            )
+
+        if target_len is not None:
+            sequence = interpolate_sequence_array(sequence, int(target_len))
+
+        return sequence.astype(np.float32)
+
+    def get(self, path_value, target_len=None, missing_policy="zeros"):
+        sequence = self.get_raw(path_value, target_len=target_len, missing_policy=missing_policy)
+        if self.normalized:
+            sequence = (sequence - self.mean.reshape(1, -1)) / self.std.reshape(1, -1)
+        return sequence.astype(np.float32)
+
+
 def append_tracking_to_features(features: torch.Tensor, tracking_features: torch.Tensor) -> torch.Tensor:
     """
     Concatena un vettore tracking [B, K] a ogni timestep delle feature video [B, T, D].
@@ -186,6 +305,28 @@ def append_tracking_to_features(features: torch.Tensor, tracking_features: torch
 
     tracking_sequence = tracking_features.unsqueeze(1).repeat(1, seq_len, 1)
     return torch.cat([features, tracking_sequence.to(features.device, dtype=features.dtype)], dim=2)
+
+
+def append_tracking_sequence_to_features(features: torch.Tensor, tracking_sequences: torch.Tensor) -> torch.Tensor:
+    """
+    Concatena una sequenza tracking [B, T, K] alle feature video [B, T, D].
+    """
+    if tracking_sequences is None:
+        return features
+
+    if tracking_sequences.ndim != 3:
+        raise ValueError(
+            f"tracking_sequences deve avere forma [B, T, K], "
+            f"ricevuta {tuple(tracking_sequences.shape)}."
+        )
+
+    if tracking_sequences.shape[:2] != features.shape[:2]:
+        raise ValueError(
+            f"Shape tracking temporale non coerente: features {tuple(features.shape)}, "
+            f"tracking {tuple(tracking_sequences.shape)}."
+        )
+
+    return torch.cat([features, tracking_sequences.to(features.device, dtype=features.dtype)], dim=2)
 
 def normalize_idx_to_label(idx_to_label):
     if isinstance(idx_to_label, dict):
@@ -325,6 +466,7 @@ def predict_hierarchical_batch(
     idx_to_label_l2,
     idx_to_label_l3,
     tracking_features=None,
+    tracking_sequences=None,
 ):
     logits_l1 = model_l1(features, lengths)
     probs_l1 = torch.softmax(logits_l1, dim=1)
@@ -362,11 +504,13 @@ def predict_hierarchical_batch(
         probs_l2 = torch.softmax(logits_l2, dim=1)
         preds_l2 = probs_l2.argmax(dim=1)
 
-        if tracking_features is not None:
+        if tracking_sequences is not None:
+            shot_tracking_sequences = tracking_sequences.index_select(0, shot_indices_tensor)
+            shot_features_l3 = append_tracking_sequence_to_features(shot_features, shot_tracking_sequences)
+        elif tracking_features is not None:
             shot_tracking_features = tracking_features.index_select(0, shot_indices_tensor)
             shot_features_l3 = append_tracking_to_features(shot_features, shot_tracking_features)
         else:
-            shot_tracking_features = None
             shot_features_l3 = shot_features
 
         logits_l3 = model_l3(shot_features_l3, shot_lengths)
@@ -466,10 +610,30 @@ def run_evaluation(args):
     print(f"L3 idx_to_label: {idx_to_label_l3}")
 
     tracking_store = None
+    tracking_sequence_store = None
     tracking_missing_policy = args.tracking_missing_policy
     l3_tracking_config = ckpt_l3.get("tracking_config") or config_l3.get("tracking_config")
+    l3_tracking_type = "none"
 
-    if args.tracking_features_csv is not None:
+    if l3_tracking_config:
+        l3_tracking_type = l3_tracking_config.get("type", "aggregate")
+    elif int(config_l3.get("tracking_input_dim", 0)) > 0:
+        # Checkpoint vecchi con tracking, prima dell'introduzione del campo type.
+        l3_tracking_type = "aggregate"
+
+    if args.tracking_features_csv is not None and args.tracking_sequences_npz is not None:
+        raise ValueError(
+            "Usare una sola sorgente tracking in valutazione: --tracking-features-csv "
+            "oppure --tracking-sequences-npz, non entrambe."
+        )
+
+    if l3_tracking_type == "aggregate" and int(config_l3.get("tracking_input_dim", 0)) > 0:
+        if args.tracking_features_csv is None:
+            raise ValueError(
+                "Il checkpoint L3 richiede feature tracking aggregate, ma non è stato passato "
+                "--tracking-features-csv."
+            )
+
         feature_names = None
         mean = None
         std = None
@@ -490,16 +654,50 @@ def run_evaluation(args):
             normalized=normalized,
         )
 
-        print("\n# Feature tracking per L3")
+        print("\n# Feature tracking aggregate per L3")
         print(f"CSV tracking: {args.tracking_features_csv}")
         print(f"Numero feature tracking: {tracking_store.num_features}")
         print(f"Normalizzate con statistiche del checkpoint L3: {normalized}")
         print(f"Missing policy: {tracking_missing_policy}")
 
+    elif l3_tracking_type == "temporal_sequence":
+        npz_path = args.tracking_sequences_npz
+        index_path = args.tracking_sequence_index
+
+        if l3_tracking_config:
+            npz_path = npz_path or l3_tracking_config.get("npz_path")
+            index_path = index_path or l3_tracking_config.get("index_path")
+
+        if npz_path is None:
+            raise ValueError(
+                "Il checkpoint L3 richiede sequenze tracking temporali, ma non è stato passato "
+                "--tracking-sequences-npz e il path non è disponibile nel checkpoint."
+            )
+
+        feature_names = l3_tracking_config.get("feature_names") if l3_tracking_config else None
+        mean = l3_tracking_config.get("mean") if l3_tracking_config else None
+        std = l3_tracking_config.get("std") if l3_tracking_config else None
+        normalized = bool(l3_tracking_config.get("normalized", False)) if l3_tracking_config else False
+
+        tracking_sequence_store = TrackingSequenceFeatureStore(
+            npz_path,
+            index_path=index_path,
+            feature_names=feature_names,
+            mean=mean,
+            std=std,
+            normalized=normalized,
+        )
+
+        print("\n# Feature tracking temporali per L3")
+        print(f"NPZ tracking: {npz_path}")
+        print(f"Indice tracking: {tracking_sequence_store.index_path}")
+        print(f"Numero feature tracking per frame: {tracking_sequence_store.num_features}")
+        print(f"Normalizzate con statistiche del checkpoint L3: {normalized}")
+        print(f"Missing policy: {tracking_missing_policy}")
+
     elif int(config_l3.get("tracking_input_dim", 0)) > 0:
         raise ValueError(
-            "Il checkpoint L3 richiede feature tracking, ma non è stato passato "
-            "--tracking-features-csv."
+            f"Tipo tracking L3 non supportato o non configurato: {l3_tracking_type}."
         )
 
     original_mapping = original_idx_to_label()
@@ -516,6 +714,7 @@ def run_evaluation(args):
         labels = batch["labels"].cpu().tolist()
 
         tracking_features = None
+        tracking_sequences = None
         tracking_available = [False] * len(labels)
 
         if tracking_store is not None:
@@ -533,6 +732,30 @@ def run_evaluation(args):
 
             tracking_features = torch.tensor(
                 np.stack(tracking_vectors, axis=0),
+                dtype=features.dtype,
+                device=device,
+            )
+
+        if tracking_sequence_store is not None:
+            max_seq_len = features.shape[1]
+            tracking_sequence_vectors = []
+            for i in range(len(labels)):
+                global_idx = sample_offset + i
+                sample_path = get_sample_path(dataset, global_idx)
+                tracking_available[i] = tracking_sequence_store.has(sample_path)
+                real_len = int(lengths[i].item())
+                sequence = tracking_sequence_store.get(
+                    sample_path,
+                    target_len=real_len,
+                    missing_policy=tracking_missing_policy,
+                )
+
+                padded = np.zeros((max_seq_len, tracking_sequence_store.num_features), dtype=np.float32)
+                padded[:real_len] = sequence[:real_len]
+                tracking_sequence_vectors.append(padded)
+
+            tracking_sequences = torch.tensor(
+                np.stack(tracking_sequence_vectors, axis=0),
                 dtype=features.dtype,
                 device=device,
             )
@@ -555,6 +778,7 @@ def run_evaluation(args):
             idx_to_label_l2=idx_to_label_l2,
             idx_to_label_l3=idx_to_label_l3,
             tracking_features=tracking_features,
+            tracking_sequences=tracking_sequences,
         )
 
         for i, original_idx in enumerate(labels):
@@ -579,7 +803,7 @@ def run_evaluation(args):
                     "p_l1": f"{p_l1[i]:.6f}",
                     "p_l2": "" if p_l2[i] is None else f"{p_l2[i]:.6f}",
                     "p_l3": "" if p_l3[i] is None else f"{p_l3[i]:.6f}",
-                    "tracking_used": int(tracking_store is not None),
+                    "tracking_used": int(tracking_store is not None or tracking_sequence_store is not None),
                     "tracking_available": int(tracking_available[i]),
                     "correct": int(true_final == pred_final),
                 }
@@ -661,7 +885,25 @@ def parse_args():
         default=None,
         help=(
             "CSV prodotto da extract_ball_rim_tracking_features.py. "
-            "Necessario se il checkpoint L3 è stato addestrato con feature tracking."
+            "Necessario se il checkpoint L3 è stato addestrato con feature tracking aggregate."
+        ),
+    )
+    parser.add_argument(
+        "--tracking-sequences-npz",
+        type=str,
+        default=None,
+        help=(
+            "File NPZ con sequenze temporali di tracking palla/canestro. "
+            "Necessario se il checkpoint L3 è stato addestrato con tracking temporale."
+        ),
+    )
+    parser.add_argument(
+        "--tracking-sequence-index",
+        type=str,
+        default=None,
+        help=(
+            "JSON indice associato a --tracking-sequences-npz. "
+            "Default: tracking_sequence_index.json nella stessa cartella del file NPZ."
         ),
     )
     parser.add_argument(
