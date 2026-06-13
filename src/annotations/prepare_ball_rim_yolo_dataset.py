@@ -1,462 +1,533 @@
-import argparse
-import random
+import csv
 import shutil
 import zipfile
 from pathlib import Path
-from tempfile import TemporaryDirectory
-from collections import Counter, defaultdict
 
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+# ============================================================
+# Parametri fissi
+# ============================================================
+
+EXPORTS_DIR = Path("data/annotations/ball_rim_cvat_exports")
+OUTPUT_DIR = Path("data/datasets/ball_rim_yolo")
+
+EXPECTED_CLASS_NAMES = ["ball", "rim"]
+
+EXPORTS = {
+    "train_part_01": {
+        "zip_name": "train_part_01_cvat_yolo.zip",
+        "split": "train",
+    },
+    "train_part_02": {
+        "zip_name": "train_part_02_cvat_yolo.zip",
+        "split": "train",
+    },
+    "train_context": {
+        "zip_name": "train_context_cvat_yolo.zip",
+        "split": "train",
+    },
+    "val": {
+        "zip_name": "val_cvat_yolo.zip",
+        "split": "val",
+    },
+}
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
-def safe_name(text: str) -> str:
-    return (
-        text.replace("\\", "_")
-        .replace("/", "_")
-        .replace(" ", "_")
-        .replace(":", "_")
-        .replace("__", "_")
-    )
+# ============================================================
+# Utility
+# ============================================================
+
+def clean_dir(path: Path):
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
 
 
-def read_class_names(root: Path):
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def extract_zip(zip_path: Path, extract_dir: Path):
+    clean_dir(extract_dir)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+
+
+def find_class_names(extract_dir: Path) -> list[str]:
     """
-    Prova a leggere i nomi delle classi da export YOLO/CVAT.
-    Supporta:
-    - obj.names
-    - classes.txt
-    - *.names
-    - data.yaml semplice
+    Cerca i nomi delle classi nell'export CVAT.
+
+    Formati gestiti:
+    - data.yaml / dataset.yaml con:
+        names:
+          0: ball
+          1: rim
+      oppure:
+        names: [ball, rim]
+
+    - obj.names:
+        ball
+        rim
+
+    - classes.txt:
+        ball
+        rim
     """
-    candidates = []
 
-    for name in ["obj.names", "classes.txt"]:
-        candidates.extend(root.rglob(name))
+    yaml_candidates = list(extract_dir.rglob("data.yaml")) + list(extract_dir.rglob("dataset.yaml"))
 
-    candidates.extend(root.rglob("*.names"))
-
-    for p in candidates:
-        lines = [
-            line.strip()
-            for line in p.read_text(encoding="utf-8", errors="ignore").splitlines()
-            if line.strip()
-        ]
-        if lines:
-            return lines
-
-    yaml_files = list(root.rglob("data.yaml")) + list(root.rglob("*.yaml")) + list(root.rglob("*.yml"))
-
-    for p in yaml_files:
-        text = p.read_text(encoding="utf-8", errors="ignore").splitlines()
-        names = []
-
-        # Caso:
-        # names:
-        #   0: ball
-        #   1: rim
-        in_names = False
-        indexed = {}
-
-        for line in text:
-            stripped = line.strip()
-
-            if stripped.startswith("names:"):
-                in_names = True
-
-                # Caso: names: [ball, rim]
-                if "[" in stripped and "]" in stripped:
-                    inside = stripped.split("[", 1)[1].split("]", 1)[0]
-                    names = [x.strip().strip("'\"") for x in inside.split(",") if x.strip()]
-                    return names
-
-                continue
-
-            if in_names:
-                if not stripped:
-                    continue
-
-                if ":" in stripped:
-                    k, v = stripped.split(":", 1)
-                    k = k.strip()
-                    v = v.strip().strip("'\"")
-
-                    if k.isdigit() and v:
-                        indexed[int(k)] = v
-                    elif not line.startswith(" ") and not line.startswith("-"):
-                        break
-
-                elif stripped.startswith("-"):
-                    names.append(stripped[1:].strip().strip("'\""))
-
-        if indexed:
-            return [indexed[i] for i in sorted(indexed.keys())]
+    for yaml_path in yaml_candidates:
+        text = read_text(yaml_path)
+        names = parse_names_from_yaml_text(text)
 
         if names:
             return names
 
-    return None
+    for names_file in list(extract_dir.rglob("obj.names")) + list(extract_dir.rglob("classes.txt")):
+        lines = [
+            line.strip()
+            for line in read_text(names_file).splitlines()
+            if line.strip()
+        ]
+
+        if lines:
+            return lines
+
+    raise RuntimeError(
+        f"Impossibile trovare i nomi delle classi in: {extract_dir}. "
+        "Controlla che l'export CVAT contenga data.yaml, dataset.yaml, obj.names oppure classes.txt."
+    )
 
 
-def is_yolo_label_file(path: Path) -> bool:
+def parse_names_from_yaml_text(text: str) -> list[str]:
     """
-    Esclude file txt che non sono label YOLO, tipo train.txt, val.txt, obj.names.
+    Parser semplice per leggere 'names' dai file yaml esportati da CVAT/Ultralytics.
+    Evita dipendenze esterne da PyYAML.
     """
-    excluded_names = {
-        "train.txt",
-        "val.txt",
-        "valid.txt",
-        "test.txt",
-        "obj.names",
-        "classes.txt",
-    }
 
-    if path.name.lower() in excluded_names:
+    lines = text.splitlines()
+
+    # Caso: names: [ball, rim]
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("names:") and "[" in stripped and "]" in stripped:
+            inside = stripped.split("[", 1)[1].split("]", 1)[0]
+            names = [
+                item.strip().strip("'").strip('"')
+                for item in inside.split(",")
+                if item.strip()
+            ]
+            return names
+
+    # Caso:
+    # names:
+    #   0: ball
+    #   1: rim
+    names_block_started = False
+    indexed_names = {}
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("names:"):
+            names_block_started = True
+            continue
+
+        if names_block_started:
+            if not stripped:
+                continue
+
+            # Se inizia una nuova chiave yaml fuori dal blocco names, fermati.
+            if not line.startswith(" ") and not line.startswith("\t") and ":" in stripped:
+                break
+
+            if ":" in stripped:
+                key, value = stripped.split(":", 1)
+                key = key.strip()
+                value = value.strip().strip("'").strip('"')
+
+                if key.isdigit() and value:
+                    indexed_names[int(key)] = value
+
+    if indexed_names:
+        return [indexed_names[i] for i in sorted(indexed_names.keys())]
+
+    return []
+
+
+def check_class_order(class_names: list[str], export_name: str):
+    """
+    Controllo rigido:
+    classe 0 = ball
+    classe 1 = rim
+
+    Non viene fatto nessun mapping o remapping.
+    """
+
+    if class_names != EXPECTED_CLASS_NAMES:
+        raise RuntimeError(
+            f"[{export_name}] Ordine classi non valido.\n"
+            f"Atteso: {EXPECTED_CLASS_NAMES}\n"
+            f"Trovato: {class_names}\n\n"
+            "Correggi le label nel task CVAT oppure riesporta il dataset con ordine classi corretto."
+        )
+
+    print(f"[{export_name}] Controllo classi OK: 0=ball, 1=rim")
+
+
+def is_image_file(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def is_possible_label_file(path: Path) -> bool:
+    if path.suffix.lower() != ".txt":
         return False
 
-    if path.suffix.lower() != ".txt":
+    ignored_names = {
+        "classes.txt",
+        "obj.names",
+        "train.txt",
+        "valid.txt",
+        "val.txt",
+        "test.txt",
+    }
+
+    if path.name.lower() in ignored_names:
         return False
 
     return True
 
 
-def clean_yolo_label(src_label: Path | None, dst_label: Path, num_classes: int):
+def collect_images(extract_dir: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in extract_dir.rglob("*")
+        if path.is_file() and is_image_file(path)
+    )
+
+
+def collect_label_files_by_stem(extract_dir: Path) -> dict[str, Path]:
+    label_files = {}
+
+    for path in sorted(extract_dir.rglob("*")):
+        if not path.is_file():
+            continue
+
+        if not is_possible_label_file(path):
+            continue
+
+        stem = path.stem
+
+        if stem in label_files:
+            raise RuntimeError(
+                f"Trovati più file label con lo stesso nome '{stem}' in {extract_dir}:\n"
+                f"- {label_files[stem]}\n"
+                f"- {path}"
+            )
+
+        label_files[stem] = path
+
+    return label_files
+
+
+def validate_yolo_label_file(label_path: Path, export_name: str):
     """
-    Copia una label YOLO mantenendo solo righe valide:
+    Controlla che ogni riga del file label sia nel formato YOLO:
     class_id x_center y_center width height
 
-    Se l'immagine non ha label, crea un .txt vuoto.
+    Non modifica class_id.
+    Verifica solo che class_id sia 0 o 1 e che le coordinate siano in [0, 1].
     """
-    dst_label.parent.mkdir(parents=True, exist_ok=True)
 
-    if src_label is None or not src_label.exists():
-        dst_label.write_text("", encoding="utf-8")
-        return Counter()
+    text = read_text(label_path)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    cleaned_lines = []
-    counts = Counter()
-
-    for line_num, line in enumerate(src_label.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
-        line = line.strip()
-
-        if not line:
-            continue
-
+    for line_idx, line in enumerate(lines, start=1):
         parts = line.split()
 
-        if len(parts) < 5:
-            print(f"[WARN] Riga ignorata in {src_label}, riga {line_num}: {line}")
-            continue
+        if len(parts) != 5:
+            raise RuntimeError(
+                f"[{export_name}] Label non valida in {label_path}, riga {line_idx}:\n"
+                f"{line}\n"
+                "Formato atteso: class_id x_center y_center width height"
+            )
 
-        # Se per errore ci sono colonne extra, ad esempio confidenza, tengo solo le prime 5.
-        parts = parts[:5]
+        class_id_str = parts[0]
+
+        if not class_id_str.isdigit():
+            raise RuntimeError(
+                f"[{export_name}] class_id non intero in {label_path}, riga {line_idx}:\n"
+                f"{line}"
+            )
+
+        class_id = int(class_id_str)
+
+        if class_id not in {0, 1}:
+            raise RuntimeError(
+                f"[{export_name}] class_id non valido in {label_path}, riga {line_idx}:\n"
+                f"{line}\n"
+                "Sono ammessi solo 0=ball e 1=rim."
+            )
 
         try:
-            class_id = int(float(parts[0]))
-            coords = [float(x) for x in parts[1:5]]
+            coords = [float(value) for value in parts[1:]]
         except ValueError:
-            print(f"[WARN] Riga non valida in {src_label}, riga {line_num}: {line}")
-            continue
-
-        if class_id < 0 or class_id >= num_classes:
-            print(f"[WARN] Classe fuori range in {src_label}, riga {line_num}: {line}")
-            continue
-
-        if not all(0.0 <= c <= 1.0 for c in coords):
-            print(f"[WARN] Coordinate non normalizzate in {src_label}, riga {line_num}: {line}")
-            continue
-
-        cleaned_lines.append(f"{class_id} {coords[0]:.6f} {coords[1]:.6f} {coords[2]:.6f} {coords[3]:.6f}")
-        counts[class_id] += 1
-
-    dst_label.write_text("\n".join(cleaned_lines) + ("\n" if cleaned_lines else ""), encoding="utf-8")
-    return counts
-
-
-def collect_samples(extracted_roots):
-    """
-    Trova immagini e relative label YOLO.
-    Funziona sia con export CVAT tipo:
-    obj_train_data/img.jpg + obj_train_data/img.txt
-
-    sia con struttura:
-    images/.../img.jpg + labels/.../img.txt
-    """
-    samples = []
-
-    for zip_index, root in enumerate(extracted_roots):
-        zip_prefix = f"zip{zip_index + 1}"
-
-        label_files = [
-            p for p in root.rglob("*.txt")
-            if is_yolo_label_file(p)
-        ]
-
-        labels_by_stem = defaultdict(list)
-        labels_by_relative_hint = {}
-
-        for label in label_files:
-            labels_by_stem[label.stem].append(label)
-
-            # Caso images/train/x.jpg -> labels/train/x.txt
-            rel = label.relative_to(root)
-            labels_by_relative_hint[str(rel.with_suffix(""))] = label
-
-        image_files = [
-            p for p in root.rglob("*")
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTS and "__MACOSX" not in str(p)
-        ]
-
-        for image in image_files:
-            rel = image.relative_to(root)
-            label = None
-
-            # Caso label nella stessa cartella dell'immagine
-            same_dir_label = image.with_suffix(".txt")
-            if same_dir_label.exists() and is_yolo_label_file(same_dir_label):
-                label = same_dir_label
-
-            # Caso images/... -> labels/...
-            if label is None:
-                rel_str = str(rel.with_suffix(""))
-                rel_label_guess = rel_str.replace("images", "labels")
-                label = labels_by_relative_hint.get(rel_label_guess)
-
-            # Fallback: label con stesso stem
-            if label is None:
-                candidates = labels_by_stem.get(image.stem, [])
-                if len(candidates) == 1:
-                    label = candidates[0]
-                elif len(candidates) > 1:
-                    # Prendo la più vicina come path testuale
-                    candidates = sorted(candidates, key=lambda p: len(str(p)))
-                    label = candidates[0]
-                    print(f"[WARN] Più label trovate per {image.name}. Uso: {label}")
-
-            unique_stem = safe_name(f"{zip_prefix}_{rel.with_suffix('')}")
-            samples.append(
-                {
-                    "image": image,
-                    "label": label,
-                    "stem": unique_stem,
-                }
+            raise RuntimeError(
+                f"[{export_name}] Coordinate non numeriche in {label_path}, riga {line_idx}:\n"
+                f"{line}"
             )
 
-    return samples
+        for coord in coords:
+            if coord < 0.0 or coord > 1.0:
+                raise RuntimeError(
+                    f"[{export_name}] Coordinata fuori range [0, 1] in {label_path}, riga {line_idx}:\n"
+                    f"{line}"
+                )
 
 
-def write_data_yaml(out_dir: Path, class_names):
-    names_block = "\n".join([f"  {i}: {name}" for i, name in enumerate(class_names)])
+def copy_export_to_dataset(
+    export_name: str,
+    zip_path: Path,
+    split: str,
+    temp_root: Path,
+    output_images_dir: Path,
+    output_labels_dir: Path,
+) -> dict:
+    extract_dir = temp_root / export_name
+    extract_zip(zip_path, extract_dir)
 
-    text = f"""path: {out_dir.as_posix()}
+    class_names = find_class_names(extract_dir)
+    check_class_order(class_names, export_name)
 
-train: images/train
-val: images/val
+    images = collect_images(extract_dir)
+    labels_by_stem = collect_label_files_by_stem(extract_dir)
 
-names:
-{names_block}
-"""
+    if not images:
+        raise RuntimeError(f"[{export_name}] Nessuna immagine trovata nell'export: {zip_path}")
 
-    (out_dir / "data.yaml").write_text(text, encoding="utf-8")
+    stats = {
+        "export": export_name,
+        "zip": str(zip_path),
+        "split": split,
+        "images": 0,
+        "labels_with_objects": 0,
+        "empty_labels": 0,
+        "boxes_ball": 0,
+        "boxes_rim": 0,
+    }
 
+    for image_path in images:
+        output_image_path = output_images_dir / image_path.name
+        output_label_path = output_labels_dir / f"{image_path.stem}.txt"
+
+        if output_image_path.exists():
+            raise RuntimeError(
+                f"[{export_name}] Immagine duplicata nel dataset finale: {output_image_path.name}"
+            )
+
+        if output_label_path.exists():
+            raise RuntimeError(
+                f"[{export_name}] Label duplicata nel dataset finale: {output_label_path.name}"
+            )
+
+        shutil.copy2(image_path, output_image_path)
+
+        source_label_path = labels_by_stem.get(image_path.stem)
+
+        if source_label_path is None:
+            # Immagine senza oggetti: mantiene il frame negativo creando label vuota.
+            output_label_path.write_text("", encoding="utf-8")
+            stats["empty_labels"] += 1
+        else:
+            validate_yolo_label_file(source_label_path, export_name)
+
+            label_text = read_text(source_label_path)
+            output_label_path.write_text(label_text, encoding="utf-8")
+
+            non_empty_lines = [
+                line.strip()
+                for line in label_text.splitlines()
+                if line.strip()
+            ]
+
+            if non_empty_lines:
+                stats["labels_with_objects"] += 1
+            else:
+                stats["empty_labels"] += 1
+
+            for line in non_empty_lines:
+                class_id = int(line.split()[0])
+
+                if class_id == 0:
+                    stats["boxes_ball"] += 1
+                elif class_id == 1:
+                    stats["boxes_rim"] += 1
+
+        stats["images"] += 1
+
+    print(
+        f"[{export_name}] Copiate {stats['images']} immagini in split '{split}' "
+        f"({stats['labels_with_objects']} con box, {stats['empty_labels']} senza box)."
+    )
+
+    return stats
+
+
+def write_data_yaml(output_dir: Path):
+    data_yaml = output_dir / "data.yaml"
+
+    content = "\n".join(
+        [
+            f"path: {output_dir.as_posix()}",
+            "train: images/train",
+            "val: images/val",
+            "",
+            "names:",
+            "  0: ball",
+            "  1: rim",
+            "",
+        ]
+    )
+
+    data_yaml.write_text(content, encoding="utf-8")
+
+
+def write_summary(output_dir: Path, all_stats: list[dict]):
+    summary_path = output_dir / "dataset_summary.txt"
+
+    total_train_images = sum(s["images"] for s in all_stats if s["split"] == "train")
+    total_val_images = sum(s["images"] for s in all_stats if s["split"] == "val")
+    total_ball = sum(s["boxes_ball"] for s in all_stats)
+    total_rim = sum(s["boxes_rim"] for s in all_stats)
+
+    lines = []
+    lines.append("Dataset YOLO ball/rim")
+    lines.append("=====================")
+    lines.append("")
+    lines.append(f"Export directory: {EXPORTS_DIR}")
+    lines.append(f"Output directory: {OUTPUT_DIR}")
+    lines.append("")
+    lines.append("Classi:")
+    lines.append("  0: ball")
+    lines.append("  1: rim")
+    lines.append("")
+    lines.append("Split:")
+    lines.append(f"  train images: {total_train_images}")
+    lines.append(f"  val images:   {total_val_images}")
+    lines.append("")
+    lines.append("Box totali:")
+    lines.append(f"  ball: {total_ball}")
+    lines.append(f"  rim:  {total_rim}")
+    lines.append("")
+    lines.append("Dettaglio export:")
+    lines.append("")
+
+    for stats in all_stats:
+        lines.append(f"- {stats['export']}")
+        lines.append(f"  zip: {stats['zip']}")
+        lines.append(f"  split: {stats['split']}")
+        lines.append(f"  images: {stats['images']}")
+        lines.append(f"  labels_with_objects: {stats['labels_with_objects']}")
+        lines.append(f"  empty_labels: {stats['empty_labels']}")
+        lines.append(f"  boxes_ball: {stats['boxes_ball']}")
+        lines.append(f"  boxes_rim: {stats['boxes_rim']}")
+        lines.append("")
+
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_csv_summary(output_dir: Path, all_stats: list[dict]):
+    csv_path = output_dir / "dataset_summary.csv"
+
+    fieldnames = [
+        "export",
+        "zip",
+        "split",
+        "images",
+        "labels_with_objects",
+        "empty_labels",
+        "boxes_ball",
+        "boxes_rim",
+    ]
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_stats)
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Unisce export YOLO/CVAT e crea dataset YOLO train/val."
-    )
+    if not EXPORTS_DIR.exists():
+        raise FileNotFoundError(
+            f"Cartella export CVAT non trovata: {EXPORTS_DIR}"
+        )
 
-    parser.add_argument(
-        "--zips",
-        nargs="+",
-        required=True,
-        help="Path degli zip esportati da CVAT in formato YOLO."
-    )
+    images_train_dir = OUTPUT_DIR / "images" / "train"
+    images_val_dir = OUTPUT_DIR / "images" / "val"
+    labels_train_dir = OUTPUT_DIR / "labels" / "train"
+    labels_val_dir = OUTPUT_DIR / "labels" / "val"
+    temp_root = OUTPUT_DIR / "_tmp_cvat_exports"
 
-    parser.add_argument(
-        "--out",
-        required=True,
-        help="Cartella output del dataset YOLO."
-    )
+    clean_dir(OUTPUT_DIR)
 
-    parser.add_argument(
-        "--val-ratio",
-        type=float,
-        default=0.10,
-        help="Percentuale di immagini da usare come validation interna. Default: 0.10"
-    )
+    images_train_dir.mkdir(parents=True, exist_ok=True)
+    images_val_dir.mkdir(parents=True, exist_ok=True)
+    labels_train_dir.mkdir(parents=True, exist_ok=True)
+    labels_val_dir.mkdir(parents=True, exist_ok=True)
+    temp_root.mkdir(parents=True, exist_ok=True)
 
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Seed per split riproducibile. Default: 42"
-    )
+    all_stats = []
 
-    parser.add_argument(
-        "--names",
-        nargs="+",
-        default=None,
-        help="Nomi classi in ordine. Esempio: --names palla canestro"
-    )
+    for export_name, config in EXPORTS.items():
+        zip_path = EXPORTS_DIR / config["zip_name"]
+        split = config["split"]
 
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Sovrascrive la cartella output se esiste."
-    )
-
-    args = parser.parse_args()
-
-    zip_paths = [Path(p) for p in args.zips]
-    out_dir = Path(args.out)
-
-    for z in zip_paths:
-        if not z.exists():
-            raise FileNotFoundError(f"Zip non trovato: {z}")
-
-    if out_dir.exists():
-        if args.overwrite:
-            shutil.rmtree(out_dir)
-        else:
-            raise FileExistsError(
-                f"La cartella output esiste già: {out_dir}. "
-                f"Usa --overwrite per sovrascriverla."
+        if not zip_path.exists():
+            raise FileNotFoundError(
+                f"[{export_name}] Zip non trovato: {zip_path}"
             )
 
-    out_images_train = out_dir / "images" / "train"
-    out_images_val = out_dir / "images" / "val"
-    out_labels_train = out_dir / "labels" / "train"
-    out_labels_val = out_dir / "labels" / "val"
-
-    for p in [out_images_train, out_images_val, out_labels_train, out_labels_val]:
-        p.mkdir(parents=True, exist_ok=True)
-
-    with TemporaryDirectory() as tmp:
-        tmp_dir = Path(tmp)
-        extracted_roots = []
-        source_class_names = []
-
-        print("[INFO] Estrazione zip...")
-
-        for i, zip_path in enumerate(zip_paths):
-            extract_dir = tmp_dir / f"zip_{i + 1}"
-            extract_dir.mkdir(parents=True, exist_ok=True)
-
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(extract_dir)
-
-            extracted_roots.append(extract_dir)
-
-            names = read_class_names(extract_dir)
-            if names:
-                source_class_names.append(names)
-                print(f"[INFO] Classi trovate in {zip_path.name}: {names}")
-            else:
-                print(f"[WARN] Nessun file classi trovato in {zip_path.name}")
-
-        if source_class_names:
-            first = source_class_names[0]
-            for names in source_class_names[1:]:
-                if names != first:
-                    raise ValueError(
-                        "Gli zip hanno classi diverse o in ordine diverso:\n"
-                        f"Primo zip: {first}\n"
-                        f"Altro zip: {names}\n"
-                        "Correggere l'ordine delle label in CVAT oppure riesportare."
-                    )
-
-        if args.names is not None:
-            class_names = args.names
-
-            if source_class_names and len(class_names) != len(source_class_names[0]):
-                raise ValueError(
-                    f"--names contiene {len(class_names)} classi, "
-                    f"ma dagli export ne risultano {len(source_class_names[0])}."
-                )
-
-            if source_class_names and class_names != source_class_names[0]:
-                print(
-                    "[WARN] I nomi passati con --names sono diversi da quelli esportati da CVAT.\n"
-                    f"       CVAT:   {source_class_names[0]}\n"
-                    f"       Output: {class_names}\n"
-                    "       Va bene solo se state rinominando le classi mantenendo lo stesso ordine."
-                )
-
-        elif source_class_names:
-            class_names = source_class_names[0]
-
+        if split == "train":
+            output_images_dir = images_train_dir
+            output_labels_dir = labels_train_dir
+        elif split == "val":
+            output_images_dir = images_val_dir
+            output_labels_dir = labels_val_dir
         else:
-            class_names = ["ball", "rim"]
-            print(f"[WARN] Uso classi di default: {class_names}")
+            raise ValueError(f"Split non valido per {export_name}: {split}")
 
-        num_classes = len(class_names)
+        print(f"\n[{export_name}] Elaborazione export: {zip_path}")
 
-        print("[INFO] Raccolta immagini e label...")
-        samples = collect_samples(extracted_roots)
+        stats = copy_export_to_dataset(
+            export_name=export_name,
+            zip_path=zip_path,
+            split=split,
+            temp_root=temp_root,
+            output_images_dir=output_images_dir,
+            output_labels_dir=output_labels_dir,
+        )
 
-        if not samples:
-            raise RuntimeError("Nessuna immagine trovata negli zip.")
+        all_stats.append(stats)
 
-        random.seed(args.seed)
-        random.shuffle(samples)
+    shutil.rmtree(temp_root, ignore_errors=True)
 
-        num_val = max(1, round(len(samples) * args.val_ratio))
-        val_samples = samples[:num_val]
-        train_samples = samples[num_val:]
+    write_data_yaml(OUTPUT_DIR)
+    write_summary(OUTPUT_DIR, all_stats)
+    write_csv_summary(OUTPUT_DIR, all_stats)
 
-        print(f"[INFO] Totale immagini: {len(samples)}")
-        print(f"[INFO] Train: {len(train_samples)}")
-        print(f"[INFO] Val:   {len(val_samples)}")
-
-        summary = {
-            "train": Counter(),
-            "val": Counter(),
-        }
-
-        missing_labels = {
-            "train": 0,
-            "val": 0,
-        }
-
-        def copy_split(split_name, split_samples, out_img_dir, out_lbl_dir):
-            for sample in split_samples:
-                src_img = sample["image"]
-                src_lbl = sample["label"]
-
-                dst_img_name = sample["stem"] + src_img.suffix.lower()
-                dst_lbl_name = sample["stem"] + ".txt"
-
-                dst_img = out_img_dir / dst_img_name
-                dst_lbl = out_lbl_dir / dst_lbl_name
-
-                shutil.copy2(src_img, dst_img)
-
-                if src_lbl is None:
-                    missing_labels[split_name] += 1
-
-                counts = clean_yolo_label(src_lbl, dst_lbl, num_classes)
-                summary[split_name].update(counts)
-
-        copy_split("train", train_samples, out_images_train, out_labels_train)
-        copy_split("val", val_samples, out_images_val, out_labels_val)
-
-        write_data_yaml(out_dir, class_names)
-
-        print("\n[DONE] Dataset creato in:")
-        print(f"       {out_dir}")
-        print("\n[INFO] Classi:")
-        for i, name in enumerate(class_names):
-            print(f"       {i}: {name}")
-
-        print("\n[INFO] Box per split:")
-        for split in ["train", "val"]:
-            print(f"       {split}:")
-            for class_id, class_name in enumerate(class_names):
-                print(f"         {class_name}: {summary[split][class_id]}")
-            print(f"         immagini senza label trovata: {missing_labels[split]}")
-
-        print("\n[INFO] File YAML:")
-        print(f"       {out_dir / 'data.yaml'}")
+    print("\nDataset YOLO creato correttamente.")
+    print(f"Output: {OUTPUT_DIR}")
+    print(f"YAML:   {OUTPUT_DIR / 'data.yaml'}")
+    print(f"Report: {OUTPUT_DIR / 'dataset_summary.txt'}")
+    print(f"CSV:    {OUTPUT_DIR / 'dataset_summary.csv'}")
 
 
 if __name__ == "__main__":
