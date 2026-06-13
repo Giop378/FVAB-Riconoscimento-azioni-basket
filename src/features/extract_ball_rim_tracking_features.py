@@ -21,6 +21,23 @@ SHOT_LABELS = {
     "tiroLibero1",
 }
 
+CONTEXT_LABELS = {
+    "passaggio",
+    "idle",
+    "non-gioco",
+}
+
+ALL_LABELS = sorted(SHOT_LABELS | CONTEXT_LABELS)
+ALL_SPLITS = ["train", "val", "test"]
+
+DEFAULT_DATASET_ROOT = "data/datasets/dataset_basket_v1"
+DEFAULT_MANIFEST = "data/datasets/dataset_basket_v1/manifest.csv"
+DEFAULT_YOLO_WEIGHTS = (
+    "runs/detect/outputs/ball_rim_detector/"
+    "yolo11m_1280_v2/weights/best.pt"
+)
+DEFAULT_OUTPUT_DIR = "data/features/ball_rim_tracking_features_clip_complete"
+
 
 TRACKING_FEATURE_NAMES = [
     "ball_detect_rate",
@@ -883,52 +900,53 @@ def write_temporal_sequences(output_dir: Path, sequence_entries):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Estrae feature di tracking palla/canestro dalle clip di tiro "
-            "usando un detector YOLO addestrato su ball/rim."
+            "Estrae feature di tracking palla/canestro da tutte le clip del dataset "
+            "usando un detector YOLO addestrato su ball/rim. Di default processa "
+            "train, val e test e tutte le 9 classi."
         )
     )
 
     parser.add_argument(
         "--dataset-root",
         type=str,
-        required=True,
-        help="Root del dataset video, es. data/datasets/dataset_basket_v1",
+        default=DEFAULT_DATASET_ROOT,
+        help="Root del dataset video.",
     )
 
     parser.add_argument(
         "--manifest",
         type=str,
-        required=True,
+        default=DEFAULT_MANIFEST,
         help="Path al manifest.csv del dataset.",
     )
 
     parser.add_argument(
         "--yolo-weights",
         type=str,
-        required=True,
+        default=DEFAULT_YOLO_WEIGHTS,
         help="Path al best.pt del detector ball/rim.",
     )
 
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="data/features/ball_rim_tracking_features_v1",
-        help="Cartella in cui salvare tracking_features.csv e per_frame_detections.csv.",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Cartella in cui salvare tracking_features.csv e gli altri output.",
     )
 
     parser.add_argument(
         "--splits",
         nargs="+",
-        default=["train", "val"],
+        default=ALL_SPLITS,
         choices=["train", "val", "test"],
-        help="Split da processare.",
+        help="Split da processare. Default: train val test.",
     )
 
     parser.add_argument(
         "--labels",
         nargs="+",
-        default=sorted(SHOT_LABELS),
-        help="Label da includere. Default: tutte le classi di tiro.",
+        default=ALL_LABELS,
+        help="Label da includere. Default: tutte le 9 classi del dataset.",
     )
 
     parser.add_argument(
@@ -937,7 +955,7 @@ def parse_args():
         default=48,
         help=(
             "Numero di frame campionati per clip. "
-            "Usa 0 per processare tutti i frame."
+            "Default: 48. Usa 0 per processare tutti i frame di ogni clip."
         ),
     )
 
@@ -1045,14 +1063,23 @@ def parse_args():
         help="Salva anche per_frame_detections.csv. Può essere grande.",
     )
 
-    parser.add_argument(
+    temporal_group = parser.add_mutually_exclusive_group()
+    temporal_group.add_argument(
         "--save-temporal-sequences",
+        dest="save_temporal_sequences",
         action="store_true",
         help=(
-            "Salva anche tracking_sequences.npz e tracking_sequence_index.json, "
+            "Salva tracking_sequences.npz e tracking_sequence_index.json, "
             "cioè feature palla/canestro per-frame utilizzabili come tracking temporale."
         ),
     )
+    temporal_group.add_argument(
+        "--no-save-temporal-sequences",
+        dest="save_temporal_sequences",
+        action="store_false",
+        help="Disabilita il salvataggio delle sequenze temporali.",
+    )
+    parser.set_defaults(save_temporal_sequences=True)
 
     parser.add_argument(
         "--overwrite",
@@ -1061,7 +1088,6 @@ def parse_args():
     )
 
     return parser.parse_args()
-
 
 def main():
     args = parse_args()
