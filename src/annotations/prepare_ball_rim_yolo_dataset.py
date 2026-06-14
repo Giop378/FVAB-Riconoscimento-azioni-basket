@@ -7,28 +7,44 @@ from pathlib import Path
 # ============================================================
 # Parametri fissi
 # ============================================================
+# Versione v3: dataset YOLO shot-only con split corretti.
+# Train: 1183 frame di tiro estratti dalle clip train.
+# Val: frame di tiro estratti dalle clip validation, filtrati dal mapping CSV.
 
 EXPORTS_DIR = Path("data/annotations/ball_rim_cvat_exports")
-OUTPUT_DIR = Path("data/datasets/ball_rim_yolo")
+OUTPUT_DIR = Path("data/datasets/ball_rim_yolo_shot_only_v3")
 
 EXPECTED_CLASS_NAMES = ["ball", "rim"]
+
+# Dataset v3: train solo sui 1183 frame di tiro dello split train;
+# validation solo sui frame di tiro estratti dalle clip dello split val.
+# Il file mapping serve per filtrare dal file val_cvat_yolo.zip i soli frame
+# appartenenti alle classi di tiro, escludendo passaggio/idle/non-gioco.
+VAL_FRAME_MAPPING = Path("data/annotations/ball_rim_frames_sample/val/val_frame_mapping.csv")
+SHOT_LABELS = {
+    "tiroDaDue0",
+    "tiroDaDue1",
+    "tiroDaTre0",
+    "tiroDaTre1",
+    "tiroLibero0",
+    "tiroLibero1",
+}
 
 EXPORTS = {
     "train_part_01": {
         "zip_name": "train_part_01_cvat_yolo.zip",
         "split": "train",
+        "filter": None,
     },
     "train_part_02": {
         "zip_name": "train_part_02_cvat_yolo.zip",
         "split": "train",
+        "filter": None,
     },
-    "train_context": {
-        "zip_name": "train_context_cvat_yolo.zip",
-        "split": "train",
-    },
-    "val": {
+    "val_shots": {
         "zip_name": "val_cvat_yolo.zip",
         "split": "val",
+        "filter": "shot_labels_from_mapping",
     },
 }
 
@@ -47,6 +63,97 @@ def clean_dir(path: Path):
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def get_row_image_name(row: dict) -> str | None:
+    """
+    Recupera in modo robusto il nome file dell'immagine dal mapping CSV
+    generato dallo script di estrazione frame.
+    """
+    candidate_columns = [
+        "image_name",
+        "image_filename",
+        "filename",
+        "file_name",
+        "image",
+        "image_path",
+        "frame_path",
+        "output_path",
+        "saved_path",
+        "path",
+        "frame_file",
+    ]
+
+    for column in candidate_columns:
+        value = row.get(column)
+        if value:
+            return Path(str(value).replace("\\", "/")).name
+
+    # Fallback: prende il primo valore che sembra un'immagine.
+    for value in row.values():
+        value = str(value).strip()
+        if Path(value.replace("\\", "/")).suffix.lower() in IMAGE_EXTENSIONS:
+            return Path(value.replace("\\", "/")).name
+
+    return None
+
+
+def load_allowed_val_shot_images(mapping_path: Path) -> set[str]:
+    """
+    Legge il mapping dei frame validation e restituisce i nomi delle sole
+    immagini appartenenti a clip di tiro.
+    """
+    if not mapping_path.exists():
+        raise FileNotFoundError(
+            f"Mapping validation non trovato: {mapping_path}\n"
+            "Serve per filtrare val_cvat_yolo.zip e mantenere solo i frame di tiro."
+        )
+
+    allowed = set()
+    total_rows = 0
+    skipped_no_image_name = 0
+
+    with mapping_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise RuntimeError(f"Mapping CSV vuoto o non valido: {mapping_path}")
+
+        if "label" not in reader.fieldnames:
+            raise RuntimeError(
+                f"Nel mapping CSV manca la colonna 'label': {mapping_path}\n"
+                f"Colonne presenti: {reader.fieldnames}"
+            )
+
+        for row in reader:
+            total_rows += 1
+            label = str(row.get("label", "")).strip()
+            if label not in SHOT_LABELS:
+                continue
+
+            image_name = get_row_image_name(row)
+            if image_name is None:
+                skipped_no_image_name += 1
+                continue
+
+            allowed.add(image_name)
+
+    if not allowed:
+        raise RuntimeError(
+            f"Nessuna immagine di tiro trovata nel mapping: {mapping_path}. "
+            "Controlla nomi colonne e label."
+        )
+
+    print(
+        f"[val_shots] Mapping validation: {total_rows} righe, "
+        f"{len(allowed)} immagini di tiro selezionate"
+    )
+    if skipped_no_image_name:
+        print(
+            f"[val_shots][WARN] Righe tiro senza nome immagine riconosciuto: "
+            f"{skipped_no_image_name}"
+        )
+
+    return allowed
 
 
 def extract_zip(zip_path: Path, extract_dir: Path):
@@ -296,6 +403,7 @@ def copy_export_to_dataset(
     temp_root: Path,
     output_images_dir: Path,
     output_labels_dir: Path,
+    allowed_image_names: set[str] | None = None,
 ) -> dict:
     extract_dir = temp_root / export_name
     extract_zip(zip_path, extract_dir)
@@ -318,9 +426,14 @@ def copy_export_to_dataset(
         "empty_labels": 0,
         "boxes_ball": 0,
         "boxes_rim": 0,
+        "skipped_images": 0,
     }
 
     for image_path in images:
+        if allowed_image_names is not None and image_path.name not in allowed_image_names:
+            stats["skipped_images"] += 1
+            continue
+
         output_image_path = output_images_dir / image_path.name
         output_label_path = output_labels_dir / f"{image_path.stem}.txt"
 
@@ -371,7 +484,8 @@ def copy_export_to_dataset(
 
     print(
         f"[{export_name}] Copiate {stats['images']} immagini in split '{split}' "
-        f"({stats['labels_with_objects']} con box, {stats['empty_labels']} senza box)."
+        f"({stats['labels_with_objects']} con box, {stats['empty_labels']} senza box, "
+        f"{stats['skipped_images']} escluse dal filtro)."
     )
 
     return stats
@@ -385,6 +499,7 @@ def write_data_yaml(output_dir: Path):
             f"path: {output_dir.as_posix()}",
             "train: images/train",
             "val: images/val",
+            "nc: 2",
             "",
             "names:",
             "  0: ball",
@@ -433,6 +548,7 @@ def write_summary(output_dir: Path, all_stats: list[dict]):
         lines.append(f"  images: {stats['images']}")
         lines.append(f"  labels_with_objects: {stats['labels_with_objects']}")
         lines.append(f"  empty_labels: {stats['empty_labels']}")
+        lines.append(f"  skipped_images: {stats.get('skipped_images', 0)}")
         lines.append(f"  boxes_ball: {stats['boxes_ball']}")
         lines.append(f"  boxes_rim: {stats['boxes_rim']}")
         lines.append("")
@@ -452,6 +568,7 @@ def write_csv_summary(output_dir: Path, all_stats: list[dict]):
         "empty_labels",
         "boxes_ball",
         "boxes_rim",
+        "skipped_images",
     ]
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -485,6 +602,7 @@ def main():
     temp_root.mkdir(parents=True, exist_ok=True)
 
     all_stats = []
+    allowed_val_shot_images = load_allowed_val_shot_images(VAL_FRAME_MAPPING)
 
     for export_name, config in EXPORTS.items():
         zip_path = EXPORTS_DIR / config["zip_name"]
@@ -506,6 +624,10 @@ def main():
 
         print(f"\n[{export_name}] Elaborazione export: {zip_path}")
 
+        allowed_image_names = None
+        if config.get("filter") == "shot_labels_from_mapping":
+            allowed_image_names = allowed_val_shot_images
+
         stats = copy_export_to_dataset(
             export_name=export_name,
             zip_path=zip_path,
@@ -513,6 +635,7 @@ def main():
             temp_root=temp_root,
             output_images_dir=output_images_dir,
             output_labels_dir=output_labels_dir,
+            allowed_image_names=allowed_image_names,
         )
 
         all_stats.append(stats)

@@ -298,6 +298,45 @@ data/datasets/ball_rim_yolo/
 
 Le immagini senza box sono state mantenute nel dataset, perché rappresentano esempi negativi utili per ridurre falsi positivi, soprattutto nei frame di `idle` e `non-gioco` in cui palla e/o canestro non sono visibili.
 
+
+## Detector YOLO11m v1 precedente
+
+Prima dell'ampliamento del dataset palla/canestro è stato addestrato un primo detector YOLO11m, indicato come versione `v1`, usando esclusivamente frame estratti da clip di tiro del training set. Questo modello è stato utilizzato come primo generatore di feature tracking per gli esperimenti iniziali sullo Stadio 3 della gerarchia.
+
+Il dataset del modello precedente era composto da **1183 frame totali**, ottenuti dalle sei classi di tiro:
+
+```text
+tiroDaDue0, tiroDaDue1, tiroDaTre0, tiroDaTre1, tiroLibero0, tiroLibero1
+```
+
+I frame erano stati estratti solo dalla parte finale delle clip di tiro, usando le percentuali:
+
+```text
+0.70, 0.85, 0.95, 1.00
+```
+
+Questa scelta era coerente con l'obiettivo iniziale: migliorare la distinzione tra tiro segnato e tiro sbagliato, concentrandosi sui momenti in cui la palla si avvicina al canestro e l'esito diventa osservabile. Tuttavia, il dataset non conteneva esempi provenienti da `passaggio`, `idle` e `non-gioco`, quindi il detector non era stato addestrato in modo esplicito a gestire contesti senza tiro.
+
+### Split usato nel modello precedente
+
+Nel modello precedente il **10% dei 1183 frame** è stato usato come validation interna YOLO, mentre il restante 90% è stato usato per il training. È importante sottolineare che questi frame provenivano comunque tutti da clip dello split `train` del dataset di action recognition.
+
+Di conseguenza, la validation del detector `v1` non era una validation completamente indipendente rispetto al dataset video: serviva soprattutto a monitorare l'addestramento YOLO, ma poteva produrre metriche più ottimistiche perché i frame di training e validation provenivano dallo stesso insieme di clip di tiro. Per questo motivo il confronto diretto con il detector `v2` deve essere interpretato con cautela.
+
+### Risultati del modello precedente
+
+Il file `results.csv` del training YOLO del modello precedente riporta metriche aggregate sulle due classi `ball` e `rim`. Il training è arrivato a **150 epoche**. La metrica più severa, `mAP50-95`, ha raggiunto il valore massimo all'epoca 133.
+
+| Riferimento | Epoca | Precision | Recall | mAP50 | mAP50-95 |
+|---|---:|---:|---:|---:|---:|
+| Miglior mAP50-95 | 133 | 0.9506 | 0.9388 | 0.9714 | 0.5268 |
+| Miglior mAP50 | 79 | 0.9653 | 0.9562 | 0.9881 | 0.5049 |
+| Ultima epoca | 150 | 0.9548 | 0.9414 | 0.9754 | 0.5240 |
+
+Le metriche indicano che il detector precedente era già buono sui frame di tiro: la precision e la recall aggregate restano alte e il valore di mAP50 è elevato. Il limite principale non è quindi la qualità apparente sulle immagini di validation interna, ma la composizione del dataset usato per addestrarlo e validarlo: essendo basato solo sui tiri e con validation derivata dalle clip di train, il modello `v1` era meno adatto a essere applicato ai livelli della gerarchia che lavorano anche su `passaggio`, `idle` e `non-gioco`.
+
+Per questo motivo è stato successivamente costruito il dataset esteso con 1663 immagini di training e 320 immagini di validation provenienti anche dallo split `val`, includendo frame di contesto. Il detector `v2` è quindi più indicato per gli esperimenti futuri su Stadio 1 e Stadio 2, mentre il modello `v1` resta una baseline storica utile per il confronto.
+
 ## Addestramento del detector YOLO11m v2
 
 Il nuovo detector è stato addestrato sul dataset YOLO unificato, partendo dal modello pre-addestrato standard `yolo11m.pt` e non dal detector precedente. Questa scelta rende l'esperimento più pulito: il modello apprende dal nuovo dataset completo, che include sia i frame di tiro già utilizzati in precedenza sia i nuovi contesti di passaggio, idle e non-gioco.
@@ -373,7 +412,7 @@ Questo indica che proseguire fino a 150 epoche avrebbe probabilmente aumentato i
 
 ### Confronto con il detector precedente
 
-Il confronto con il detector precedente deve essere interpretato con cautela, perché il modello precedente veniva validato su frame estratti dalle clip di training. Di conseguenza le sue metriche di validation erano più ottimistiche e non direttamente confrontabili con quelle del nuovo modello.
+Il confronto con il detector precedente deve essere interpretato con cautela, perché il modello precedente era stato addestrato su 1183 frame di tiro e validato usando il 10% di quegli stessi frame, tutti provenienti da clip dello split `train` del dataset di action recognition. Di conseguenza le sue metriche di validation erano più ottimistiche e non direttamente confrontabili con quelle del nuovo modello.
 
 Il nuovo detector, invece, è stato validato su 320 frame provenienti dallo split `val`, con clip diverse da quelle di training e con tutte le 9 classi rappresentate dove disponibili. Le metriche ottenute sono quindi più affidabili come stima della generalizzazione, anche se il validation set resta relativamente piccolo e alcune classi rare hanno pochi esempi.
 

@@ -27,7 +27,7 @@ La pipeline introdotta è composta da tre passaggi:
 2. Estrazione di feature numeriche di tracking per ogni clip di tiro del dataset, usando il detector YOLO addestrato.
 3. Uso delle feature tracking insieme alle feature video DINOv3-L/16: inizialmente mediante concatenazione nello Stadio 3 della gerarchia, poi tramite late fusion nel modello non gerarchico.
 
-Le feature tracking vengono salvate in due versioni:
+Le feature tracking vengono salvate in più versioni:
 
 ```text
 data/features/ball_rim_tracking_features_v1/
@@ -57,6 +57,16 @@ data/features/ball_rim_tracking_temporal_v1/
 ```
 
 Questa terza versione contiene sequenze temporali di tracking palla/canestro estratte sulle clip di tiro. A differenza delle feature aggregate, ogni clip è rappresentata da una sequenza per-frame allineabile alle feature video DINOv3 ed è stata usata nel nuovo Stadio 3 temporale `exp_l3_tracking_temporal_v1`.
+
+```text
+data/features/ball_rim_tracking_features_clip_complete/
+├── tracking_sequences.npz
+├── tracking_sequence_index.json
+├── tracking_sequence_feature_names.json
+└── extract_tracking_results.txt
+```
+
+Questa quarta versione contiene sequenze temporali di tracking palla/canestro ottenute dalla nuova estrazione sulle clip complete. Mantiene la stessa rappresentazione temporale a 29 feature per frame, ma viene usata per verificare se un campionamento più esteso della clip migliori lo Stadio 3. È stata usata nello Stadio 3 `exp_l3_tracking_temporal_clip_complete_v1` e nella relativa valutazione gerarchica end-to-end `exp_41`.
 
 Nel primo esperimento di tracking sono state usate **39 feature** palla/canestro, normalizzate sul training set e concatenate a ogni timestep delle feature video. L'input dello Stadio 3 passa quindi da `1024` a `1063` dimensioni:
 
@@ -114,8 +124,10 @@ Il risultato è adeguato per usare il detector come generatore di feature: il re
 |exp_l3_tracking_v1|Temporal Transformer d256|DINOv3-L/16 frozen + YOLO ball/rim tracking|shot_outcome_only|2|50|64|5e-5|256|2|4|768|0.45|5e-3|Mean|0.5|WeightedRandomSampler power 0.5|0.4656|0.8154|0.8132|0.8179|outputs/exp_l3_tracking_v1|
 |exp_l3_tracking_v2_d384_sampler04|Temporal Transformer d384|DINOv3-L/16 frozen + YOLO ball/rim tracking|shot_outcome_only|2|50|64|5e-5|384|2|6|1024|0.45|5e-3|Mean|0.5|WeightedRandomSampler power 0.4|0.4559|0.7846|0.7842|0.7865|outputs/exp_l3_tracking_v2_d384_sampler04|
 |exp_l3_tracking_temporal_v1|Temporal Transformer d256|DINOv3-L/16 frozen + YOLO ball/rim tracking temporale|shot_outcome_only|2|100|64|5e-5|256|2|4|768|0.45|5e-3|Mean|0.5|WeightedRandomSampler power 0.5|0.4576|0.8769|0.8733|0.8782|outputs/exp_l3_tracking_temporal_v1|
+|exp_l3_tracking_temporal_clip_complete_v1|Temporal Transformer d256|DINOv3-L/16 frozen + YOLO ball/rim tracking temporale su clip complete|shot_outcome_only|2|50|32|1e-4|256|2|4|512|0.30|1e-3|Last mean 0.30|0.5|WeightedRandomSampler power 0.5|0.4628|0.8000|0.7969|0.8027|outputs/exp_l3_tracking_temporal_clip_complete_v1|
 |exp_38|Gerarchia L1+L2+L3 tracking|DINOv3-L/16 frozen + YOLO ball/rim tracking nello Stadio 3|hierarchical end-to-end|8|-|64|-|misto|misto|misto|misto|misto|misto|Mean|-|-|-|0.8759|0.6996|0.8766|outputs/exp_38_dinov3_vitl16_hierarchical_tracking_l3|
 |exp_40|Gerarchia L1+L2+L3 tracking temporale|DINOv3-L/16 frozen + YOLO ball/rim tracking temporale nello Stadio 3|hierarchical end-to-end|8|-|64|-|misto|misto|misto|misto|misto|misto|Mean|-|-|-|0.8815|0.7223|0.8808|outputs/exp_40_dinov3_hierarchical_tracking_temporal_l3|
+|exp_41|Gerarchia L1+L2+L3 tracking temporale su clip complete|DINOv3-L/16 frozen + YOLO ball/rim tracking temporale nello Stadio 3|hierarchical end-to-end|8|-|64|-|misto|misto|misto|misto|misto|misto|misto|-|-|-|0.8741|0.6779|0.8741|outputs/exp_41_dinov3_hierarchical_tracking_temporal_clip_complete_l3|
 |exp_39|Temporal Transformer d256 + late fusion tracking|DINOv3-L/16 frozen + YOLO ball/rim tracking su tutte le clip train/val|non-hierarchical, idle/non-gioco -> no-action|8|40|64|5e-5|256|2|4|768|0.45|5e-3|Mean|0.5|WeightedRandomSampler power 0.5|0.5429|0.8426|0.5620|0.8447|outputs/exp_39_nonhierarchical_dinov3_tracking_noaction|
 
 ## Risultati aggregati su validation
@@ -125,8 +137,10 @@ Il risultato è adeguato per usare il detector come generatore di feature: il re
 |exp_l3_tracking_v1|0.8154|0.82|0.83|0.8132|0.84|0.82|0.8179|
 |exp_l3_tracking_v2_d384_sampler04|0.7846|0.81|0.82|0.7842|0.84|0.78|0.7865|
 |exp_l3_tracking_temporal_v1|0.8769|0.87|0.89|0.8733|0.89|0.88|0.8782|
+|exp_l3_tracking_temporal_clip_complete_v1|0.8000|0.80|0.81|0.7969|0.82|0.80|0.8027|
 |exp_38|0.8759|0.74|0.72|0.6996|0.89|0.88|0.8766|
 |exp_40|0.8815|0.74|0.73|0.7223|0.89|0.88|0.8808|
+|exp_41|0.8741|0.71|0.68|0.6779|0.89|0.87|0.8741|
 |exp_39|0.8426|0.61|0.57|0.5620|0.86|0.84|0.8447|
 
 ## Risultati aggregati sulle classi rilevanti
@@ -136,10 +150,13 @@ Questa tabella riporta le metriche calcolate sulle classi più rilevanti per cia
 - **exp_l3_tracking_v1**: solo `tiro0` e `tiro1`, con feature tracking palla/canestro concatenate alle feature DINOv3.
 - **exp_l3_tracking_v2_d384_sampler04**: solo `tiro0` e `tiro1`, con feature tracking palla/canestro e configurazione più grande ispirata a `exp_31` / `exp_30` (`d_model=384`, `num_heads=6`, `ff_dim=1024`, `sampler_power=0.4`).
 - **exp_l3_tracking_temporal_v1**: solo `tiro0` e `tiro1`, con sequenze temporali palla/canestro concatenate alle feature DINOv3 frame per frame.
+- **exp_l3_tracking_temporal_clip_complete_v1**: solo `tiro0` e `tiro1`, con sequenze temporali palla/canestro estratte sulle clip complete e concatenate alle feature DINOv3 frame per frame.
 - **exp_38**: solo le 7 azioni finali prodotte dalla nuova gerarchia end-to-end con Stadio 3 tracking.
 - **exp_38 collassato**: valutazione della nuova gerarchia collassando l'esito del tiro, cioè considerando solo il tipo di tiro.
 - **exp_40**: solo le 7 azioni finali prodotte dalla gerarchia end-to-end con Stadio 3 basato su tracking temporale.
 - **exp_40 collassato**: valutazione della gerarchia con tracking temporale collassando l'esito del tiro, cioè considerando solo il tipo di tiro.
+- **exp_41**: solo le 7 azioni finali prodotte dalla gerarchia end-to-end con Stadio 3 basato sul nuovo tracking temporale da clip complete.
+- **exp_41 collassato**: valutazione della stessa gerarchia collassando l'esito del tiro, cioè considerando solo il tipo di tiro.
 - **exp_39**: solo le 7 azioni reali del modello non gerarchico a 8 classi con `idle` e `non-gioco` uniti in `no-action`.
 
 |ID|Classi considerate|Micro Precision|Micro Recall|Micro F1|Macro Precision|Macro Recall|Macro F1|Weighted Precision|Weighted Recall|Weighted F1|
@@ -147,10 +164,13 @@ Questa tabella riporta le metriche calcolate sulle classi più rilevanti per cia
 |exp_l3_tracking_v1|tiro0, tiro1|0.82|0.82|0.82|0.82|0.83|0.81|0.84|0.82|0.82|
 |exp_l3_tracking_v2_d384_sampler04|tiro0, tiro1|0.78|0.78|0.78|0.81|0.82|0.78|0.84|0.78|0.79|
 |exp_l3_tracking_temporal_v1|tiro0, tiro1|0.88|0.88|0.88|0.87|0.89|0.87|0.89|0.88|0.88|
+|exp_l3_tracking_temporal_clip_complete_v1|tiro0, tiro1|0.80|0.80|0.80|0.80|0.81|0.80|0.82|0.80|0.80|
 |exp_38|7 azioni finali|0.82|0.89|0.85|0.71|0.70|0.67|0.84|0.89|0.85|
 |exp_38 collassato|tipo azione senza esito|0.89|0.89|0.89|0.84|0.81|0.82|0.90|0.89|0.89|
 |exp_40|7 azioni finali|0.83|0.90|0.86|0.71|0.71|0.70|0.83|0.90|0.86|
 |exp_40 collassato|tipo azione senza esito|0.89|0.89|0.89|0.84|0.81|0.82|0.90|0.89|0.89|
+|exp_41|7 azioni finali|0.82|0.88|0.85|0.68|0.66|0.65|0.83|0.88|0.85|
+|exp_41 collassato|tipo azione senza esito|0.89|0.89|0.89|0.84|0.81|0.82|0.90|0.89|0.89|
 |exp_39|7 azioni finali|0.76|0.86|0.80|0.56|0.54|0.52|0.77|0.86|0.80|
 
 ## Risultati per classe su validation
@@ -205,6 +225,24 @@ Confusion matrix:
 
 Rispetto a `exp_l3_tracking_v1`, il tracking temporale migliora sia la Macro F1 (`0.8733` contro `0.8132`) sia l'equilibrio tra le due classi. In particolare, i falsi `tiro1` diminuiscono da 10 a 6, mantenendo invariati i falsi `tiro0` su `tiro1` reali.
 
+### exp_l3_tracking_temporal_clip_complete_v1 - DINOv3-L/16 frozen + YOLO ball/rim tracking temporale su clip complete, shot_outcome_only
+
+Questo esperimento usa la nuova estrazione `ball_rim_tracking_features_clip_complete`, mantenendo 29 feature temporali per frame ma cambiando la sorgente delle sequenze tracking. Rispetto a `exp_l3_tracking_temporal_v1`, vengono usati iperparametri meno regolarizzati e un pooling `last_mean` sugli ultimi frame della clip (`last_mean_ratio=0.30`). Il miglior checkpoint viene salvato all'epoca 10; nelle epoche successive il training arriva quasi a prestazioni perfette, ma la validation non migliora, indicando overfitting.
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|tiro0|0.91|0.75|0.82|40|
+|tiro1|0.69|0.88|0.77|25|
+
+Confusion matrix:
+
+```text
+[[30 10]
+ [ 3 22]]
+```
+
+Rispetto a `exp_l3_tracking_temporal_v1`, il risultato peggiora: la Macro F1 scende da `0.8733` a `0.7969`. Gli errori aumentano in entrambe le direzioni: i `tiro0` predetti come `tiro1` passano da 6 a 10, mentre i `tiro1` predetti come `tiro0` passano da 2 a 3. Questo esperimento non sostituisce quindi il precedente miglior riferimento dello Stadio 3.
+
 ### Estrazione sequenze temporali tracking palla/canestro
 
 ```bash
@@ -214,6 +252,24 @@ python -m src.features.extract_ball_rim_tracking_features \
   --yolo-weights runs/detect/outputs/ball_rim_detector/yolo11m_1280_v1/weights/best.pt \
   --output-dir data/features/ball_rim_tracking_temporal_v1 \
   --splits train val \
+  --num-frames 48 \
+  --sample-mode uniform \
+  --imgsz 1280 \
+  --conf 0.10 \
+  --batch-size 16 \
+  --device 0 \
+  --save-temporal-sequences \
+  --overwrite
+```
+
+### Estrazione sequenze temporali tracking palla/canestro su clip complete
+
+```bash
+python -m src.features.extract_ball_rim_tracking_features \
+  --dataset-root data/datasets/dataset_basket_v1 \
+  --manifest data/datasets/dataset_basket_v1/manifest.csv \
+  --yolo-weights runs/detect/outputs/ball_rim_detector/yolo11m_1280_v1/weights/best.pt \
+  --output-dir data/features/ball_rim_tracking_features_clip_complete \
   --num-frames 48 \
   --sample-mode uniform \
   --imgsz 1280 \
@@ -274,6 +330,31 @@ python -m src.training.train \
   --sampler-power 0.5 \
   --num-workers 0 \
   --seed 42
+```
+
+### exp_l3_tracking_temporal_clip_complete_v1 - Training Stadio 3 con tracking temporale su clip complete
+
+```bash
+python -m src.training.train \
+  --features-root data/features/dinov3_vitl16_336 \
+  --output-dir outputs/exp_l3_tracking_temporal_clip_complete_v1 \
+  --label-mode shot_outcome_only \
+  --input-dim 1024 \
+  --epochs 50 \
+  --batch-size 32 \
+  --num-workers 0 \
+  --lr 1e-4 \
+  --weight-decay 1e-3 \
+  --d-model 256 \
+  --num-layers 2 \
+  --num-heads 4 \
+  --ff-dim 512 \
+  --dropout 0.3 \
+  --pooling last_mean \
+  --last-mean-ratio 0.30 \
+  --tracking-sequences-npz data/features/ball_rim_tracking_features_clip_complete/tracking_sequences.npz \
+  --tracking-sequence-index data/features/ball_rim_tracking_features_clip_complete/tracking_sequence_index.json \
+  --tracking-missing-policy error
 ```
 
 ### exp_38 - Gerarchia end-to-end con Stadio 3 tracking, 8 classi finali con no-action
@@ -464,6 +545,101 @@ Confusion matrix:
 ```
 
 
+### exp_41 - Gerarchia end-to-end con Stadio 3 tracking temporale su clip complete, 8 classi finali con no-action
+
+In questo esperimento vengono mantenuti invariati Stadio 1 e Stadio 2, mentre lo Stadio 3 usa il checkpoint `exp_l3_tracking_temporal_clip_complete_v1` basato sulla nuova estrazione temporale da clip complete.
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|passaggio|0.86|0.97|0.91|212|
+|tiroDaDue0|0.77|0.48|0.59|21|
+|tiroDaDue1|0.45|0.82|0.58|11|
+|tiroDaTre0|0.77|0.83|0.80|12|
+|tiroDaTre1|0.20|0.33|0.25|3|
+|tiroLibero0|1.00|0.71|0.83|7|
+|tiroLibero1|0.71|0.45|0.56|11|
+|no-action|0.95|0.86|0.90|263|
+
+Confusion matrix:
+
+```text
+[[205   1   0   0   0   0   0   6]
+ [  0  10   7   2   1   0   0   1]
+ [  0   0   9   0   2   0   0   0]
+ [  0   1   0  10   0   0   0   1]
+ [  0   0   1   1   1   0   0   0]
+ [  0   0   0   0   0   5   1   1]
+ [  0   0   1   0   1   0   5   4]
+ [ 32   1   2   0   0   0   1 227]]
+```
+
+### exp_41 - solo 7 azioni finali
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|passaggio|0.86|0.97|0.91|212|
+|tiroDaDue0|0.77|0.48|0.59|21|
+|tiroDaDue1|0.45|0.82|0.58|11|
+|tiroDaTre0|0.77|0.83|0.80|12|
+|tiroDaTre1|0.20|0.33|0.25|3|
+|tiroLibero0|1.00|0.71|0.83|7|
+|tiroLibero1|0.71|0.45|0.56|11|
+
+Metriche aggregate sulle sole 7 azioni:
+
+|Metrica|Valore|
+|-|-:|
+|Micro F1|0.85|
+|Macro F1|0.65|
+|Weighted F1|0.85|
+
+Confusion matrix:
+
+```text
+[[205   1   0   0   0   0   0]
+ [  0  10   7   2   1   0   0]
+ [  0   0   9   0   2   0   0]
+ [  0   1   0  10   0   0   0]
+ [  0   0   1   1   1   0   0]
+ [  0   0   0   0   0   5   1]
+ [  0   0   1   0   1   0   5]]
+```
+
+### exp_41 - valutazione collassata senza esito del tiro
+
+In questa valutazione le classi finali dei tiri vengono ricondotte al solo tipo di azione, ignorando l'esito:
+
+```text
+tiroDaDue0, tiroDaDue1 -> tiroDaDue
+tiroDaTre0, tiroDaTre1 -> tiroDaTre
+tiroLibero0, tiroLibero1 -> tiroLibero
+```
+
+|Metrica|Valore|
+|-|-:|
+|Accuracy tipo azione|0.8907|
+|Macro F1 tipo azione|0.8153|
+|Weighted F1 tipo azione|0.8901|
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|passaggio|0.86|0.97|0.91|212|
+|tiroDaDue|0.79|0.81|0.80|32|
+|tiroDaTre|0.67|0.80|0.73|15|
+|tiroLibero|0.92|0.61|0.73|18|
+|no-action|0.95|0.86|0.90|263|
+
+Confusion matrix:
+
+```text
+[[205   1   0   0   6]
+ [  0  26   5   0   1]
+ [  0   2  12   0   1]
+ [  0   1   1  11   5]
+ [ 32   3   0   1 227]]
+```
+
+
 ### exp_39 - Modello non gerarchico con late fusion tracking, 8 classi con no-action
 
 In questo esperimento viene abbandonata la gerarchia e viene addestrato un unico modello non gerarchico sulle 8 classi finali. Le classi `idle` e `non-gioco` vengono accorpate in `no-action`.
@@ -565,6 +741,24 @@ python -m src.features.extract_ball_rim_tracking_features \
   --overwrite
 ```
 
+### Estrazione sequenze temporali tracking palla/canestro su clip complete
+
+```bash
+python -m src.features.extract_ball_rim_tracking_features \
+  --dataset-root data/datasets/dataset_basket_v1 \
+  --manifest data/datasets/dataset_basket_v1/manifest.csv \
+  --yolo-weights runs/detect/outputs/ball_rim_detector/yolo11m_1280_v1/weights/best.pt \
+  --output-dir data/features/ball_rim_tracking_features_clip_complete \
+  --num-frames 48 \
+  --sample-mode uniform \
+  --imgsz 1280 \
+  --conf 0.10 \
+  --batch-size 16 \
+  --device 0 \
+  --save-temporal-sequences \
+  --overwrite
+```
+
 ### exp_l3_tracking_v1 - Training Stadio 3 con tracking
 
 ```bash
@@ -661,6 +855,31 @@ python -m src.training.train \
   --seed 42
 ```
 
+### exp_l3_tracking_temporal_clip_complete_v1 - Training Stadio 3 con tracking temporale su clip complete
+
+```bash
+python -m src.training.train \
+  --features-root data/features/dinov3_vitl16_336 \
+  --output-dir outputs/exp_l3_tracking_temporal_clip_complete_v1 \
+  --label-mode shot_outcome_only \
+  --input-dim 1024 \
+  --epochs 50 \
+  --batch-size 32 \
+  --num-workers 0 \
+  --lr 1e-4 \
+  --weight-decay 1e-3 \
+  --d-model 256 \
+  --num-layers 2 \
+  --num-heads 4 \
+  --ff-dim 512 \
+  --dropout 0.3 \
+  --pooling last_mean \
+  --last-mean-ratio 0.30 \
+  --tracking-sequences-npz data/features/ball_rim_tracking_features_clip_complete/tracking_sequences.npz \
+  --tracking-sequence-index data/features/ball_rim_tracking_features_clip_complete/tracking_sequence_index.json \
+  --tracking-missing-policy error
+```
+
 ### exp_38 - Gerarchia end-to-end con Stadio 3 tracking
 
 ```bash
@@ -691,6 +910,24 @@ python -m src.evaluation.evaluate_hierarchical \
   --tracking-sequences-npz data/features/ball_rim_tracking_temporal_v1/tracking_sequences.npz \
   --tracking-sequence-index data/features/ball_rim_tracking_temporal_v1/tracking_sequence_index.json \
   --output-dir outputs/exp_40_dinov3_hierarchical_tracking_temporal_l3
+```
+
+
+### exp_41 - Gerarchia end-to-end con Stadio 3 tracking temporale su clip complete
+
+```bash
+python -m src.evaluation.evaluate_hierarchical \
+  --features-root data/features/dinov3_vitl16_336 \
+  --split val \
+  --batch-size 64 \
+  --num-workers 2 \
+  --output-dir outputs/exp_41_dinov3_hierarchical_tracking_temporal_clip_complete_l3 \
+  --l1-checkpoint outputs/exp_28_dinov3_vitl16_transformer_mean_action_noaction/best_model.pt \
+  --l2-checkpoint outputs/exp_29_dinov3_vitl16_transformer_mean_shot_type_only/best_model.pt \
+  --l3-checkpoint outputs/exp_l3_tracking_temporal_clip_complete_v1/best_model.pt \
+  --tracking-sequences-npz data/features/ball_rim_tracking_features_clip_complete/tracking_sequences.npz \
+  --tracking-sequence-index data/features/ball_rim_tracking_features_clip_complete/tracking_sequence_index.json \
+  --tracking-missing-policy error
 ```
 
 
@@ -730,4 +967,8 @@ Il beneficio si riflette anche nella gerarchia end-to-end `exp_40`, in cui vengo
 
 Il successivo esperimento `exp_39` riporta il tracking anche nel modello non gerarchico a 8 classi, con `idle` e `non-gioco` uniti in `no-action`. Questa soluzione è più semplice dal punto di vista del codice e dell'inferenza, perché non richiede il routing tra stadi. Tuttavia, sui risultati di validation ottiene Accuracy = 0.8426 e Macro F1 = 0.5620 sulle 8 classi, mentre sulle sole 7 azioni finali raggiunge Macro F1 = 0.52. Il risultato è quindi inferiore sia alla gerarchia con tracking aggregato `exp_38` sia alla nuova gerarchia con tracking temporale `exp_40`.
 
-Nel complesso, questi risultati mostrano che le informazioni esplicite sulla relazione spaziale e temporale tra palla e canestro riducono in modo significativo il principale collo di bottiglia della gerarchia precedente. Il nuovo riferimento migliore diventa `exp_l3_tracking_temporal_v1` per lo Stadio 3 e `exp_40` per la gerarchia end-to-end. Eventuali miglioramenti successivi dovrebbero concentrarsi su analisi degli errori residui, tuning della soglia decisionale di `tiro1` o regolarizzazione/early stopping del modello temporale, dato che dopo circa 50 epoche il training continua a migliorare ma la validation si stabilizza.
+L'esperimento `exp_l3_tracking_temporal_clip_complete_v1` verifica una nuova estrazione temporale da clip complete e usa una configurazione più leggera/meno regolarizzata (`batch_size=32`, `lr=1e-4`, `dropout=0.3`, `weight_decay=1e-3`, `pooling=last_mean`). Il risultato non migliora il precedente riferimento temporale: Accuracy = 0.8000, Macro F1 = 0.7969 e Weighted F1 = 0.8027. La matrice di confusione mostra un aumento degli errori rispetto a `exp_l3_tracking_temporal_v1`, con 10 `tiro0` classificati come `tiro1` e 3 `tiro1` classificati come `tiro0`.
+
+La valutazione end-to-end corrispondente, `exp_41`, conferma lo stesso andamento. La gerarchia ottiene Accuracy = 0.8741, Macro F1 = 0.6779 e Weighted F1 = 0.8741 sulle 8 classi, risultando inferiore a `exp_40` soprattutto sulla Macro F1. La valutazione collassata senza esito resta identica a `exp_38` e `exp_40` (Accuracy = 0.8907, Macro F1 = 0.8153), quindi il peggioramento deriva dalla classificazione dell'esito del tiro nello Stadio 3, non dal riconoscimento del tipo di azione.
+
+Nel complesso, questi risultati mostrano che le informazioni esplicite sulla relazione spaziale e temporale tra palla e canestro riducono in modo significativo il principale collo di bottiglia della gerarchia precedente. Il nuovo riferimento migliore resta quindi `exp_l3_tracking_temporal_v1` per lo Stadio 3 e `exp_40` per la gerarchia end-to-end; `exp_l3_tracking_temporal_clip_complete_v1` ed `exp_41` vengono mantenuti come esperimenti negativi/intermedi. Eventuali miglioramenti successivi dovrebbero concentrarsi su analisi degli errori residui, tuning della soglia decisionale di `tiro1` o regolarizzazione/early stopping del modello temporale, dato che dopo circa 50 epoche il training continua a migliorare ma la validation si stabilizza.

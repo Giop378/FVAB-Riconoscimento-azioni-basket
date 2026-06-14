@@ -455,6 +455,222 @@ def load_checkpoint_model(checkpoint_path: str, device: torch.device, label_mode
     return model, idx_to_label, checkpoint, config
 
 
+
+def get_checkpoint_tracking_requirements(checkpoint, config):
+    """
+    Ricava dal checkpoint se il modello di uno stadio richiede feature tracking.
+
+    I checkpoint salvati da train.py contengono:
+    - model_config["tracking_input_dim"] > 0 quando il modello è stato addestrato con tracking;
+    - tracking_config con tipo, nomi feature e statistiche di normalizzazione.
+    """
+    tracking_config = checkpoint.get("tracking_config") or config.get("tracking_config")
+    tracking_input_dim = int(config.get("tracking_input_dim", 0))
+
+    if tracking_config:
+        tracking_type = tracking_config.get("type", "aggregate")
+    elif tracking_input_dim > 0:
+        # Fallback per checkpoint vecchi che avevano tracking_input_dim ma non tracking_config.
+        tracking_type = "aggregate"
+    else:
+        tracking_type = "none"
+
+    return tracking_config, tracking_type, tracking_input_dim
+
+
+def load_tracking_store_for_level(
+    level_name: str,
+    checkpoint,
+    config,
+    tracking_features_csv: str = None,
+    tracking_sequences_npz: str = None,
+    tracking_sequence_index: str = None,
+    missing_policy: str = "zeros",
+):
+    """
+    Carica lo store tracking richiesto da uno specifico livello della gerarchia.
+
+    Se il checkpoint non è stato addestrato con tracking, restituisce ("none", None).
+    Se il checkpoint richiede tracking, usa prima i path passati da riga di comando;
+    se non presenti, prova i path salvati nel checkpoint.
+    """
+    if tracking_features_csv is not None and tracking_sequences_npz is not None:
+        raise ValueError(
+            f"Usare una sola sorgente tracking per {level_name}: "
+            f"feature aggregate oppure sequenze temporali, non entrambe."
+        )
+
+    tracking_config, tracking_type, tracking_input_dim = get_checkpoint_tracking_requirements(
+        checkpoint=checkpoint,
+        config=config,
+    )
+
+    if tracking_type == "none" or tracking_input_dim <= 0:
+        print(f"\n# Feature tracking per {level_name}")
+        print("Non richieste dal checkpoint.")
+        return "none", None
+
+    if tracking_type == "aggregate":
+        csv_path = tracking_features_csv
+        if csv_path is None and tracking_config:
+            csv_path = tracking_config.get("csv_path")
+
+        if csv_path is None:
+            raise ValueError(
+                f"Il checkpoint {level_name} richiede feature tracking aggregate, "
+                f"ma non è stato passato il relativo CSV."
+            )
+
+        feature_names = tracking_config.get("feature_names") if tracking_config else None
+        mean = tracking_config.get("mean") if tracking_config else None
+        std = tracking_config.get("std") if tracking_config else None
+        normalized = bool(tracking_config.get("normalized", False)) if tracking_config else False
+
+        store = TrackingFeatureStore(
+            csv_path,
+            feature_names=feature_names,
+            mean=mean,
+            std=std,
+            normalized=normalized,
+        )
+
+        print(f"\n# Feature tracking aggregate per {level_name}")
+        print(f"CSV tracking: {csv_path}")
+        print(f"Numero feature tracking: {store.num_features}")
+        print(f"Normalizzate con statistiche del checkpoint {level_name}: {normalized}")
+        print(f"Missing policy: {missing_policy}")
+        return "aggregate", store
+
+    if tracking_type == "temporal_sequence":
+        npz_path = tracking_sequences_npz
+        index_path = tracking_sequence_index
+
+        if tracking_config:
+            npz_path = npz_path or tracking_config.get("npz_path")
+            index_path = index_path or tracking_config.get("index_path")
+
+        if npz_path is None:
+            raise ValueError(
+                f"Il checkpoint {level_name} richiede sequenze tracking temporali, "
+                f"ma non è stato passato il file NPZ."
+            )
+
+        feature_names = tracking_config.get("feature_names") if tracking_config else None
+        mean = tracking_config.get("mean") if tracking_config else None
+        std = tracking_config.get("std") if tracking_config else None
+        normalized = bool(tracking_config.get("normalized", False)) if tracking_config else False
+
+        store = TrackingSequenceFeatureStore(
+            npz_path,
+            index_path=index_path,
+            feature_names=feature_names,
+            mean=mean,
+            std=std,
+            normalized=normalized,
+        )
+
+        print(f"\n# Feature tracking temporali per {level_name}")
+        print(f"NPZ tracking: {npz_path}")
+        print(f"Indice tracking: {store.index_path}")
+        print(f"Numero feature tracking per frame: {store.num_features}")
+        print(f"Normalizzate con statistiche del checkpoint {level_name}: {normalized}")
+        print(f"Missing policy: {missing_policy}")
+        return "temporal_sequence", store
+
+    raise ValueError(f"Tipo tracking non supportato per {level_name}: {tracking_type}.")
+
+
+def build_tracking_batch(
+    tracking_type: str,
+    tracking_store,
+    dataset,
+    sample_offset: int,
+    labels,
+    features: torch.Tensor,
+    lengths: torch.Tensor,
+    missing_policy: str,
+    device: torch.device,
+):
+    """
+    Costruisce i tensori tracking per un batch.
+
+    Restituisce:
+    - tracking_features: [B, K] per feature aggregate oppure None;
+    - tracking_sequences: [B, T, K] per sequenze temporali oppure None;
+    - tracking_available: lista booleana, una per campione.
+    """
+    batch_size = len(labels)
+    tracking_available = [False] * batch_size
+
+    if tracking_store is None or tracking_type == "none":
+        return None, None, tracking_available
+
+    if tracking_type == "aggregate":
+        tracking_vectors = []
+        for i in range(batch_size):
+            global_idx = sample_offset + i
+            sample_path = get_sample_path(dataset, global_idx)
+            tracking_available[i] = tracking_store.has(sample_path)
+            tracking_vectors.append(
+                tracking_store.get(
+                    sample_path,
+                    missing_policy=missing_policy,
+                )
+            )
+
+        tracking_features = torch.tensor(
+            np.stack(tracking_vectors, axis=0),
+            dtype=features.dtype,
+            device=device,
+        )
+        return tracking_features, None, tracking_available
+
+    if tracking_type == "temporal_sequence":
+        max_seq_len = features.shape[1]
+        tracking_sequence_vectors = []
+        for i in range(batch_size):
+            global_idx = sample_offset + i
+            sample_path = get_sample_path(dataset, global_idx)
+            tracking_available[i] = tracking_store.has(sample_path)
+            real_len = int(lengths[i].item())
+            sequence = tracking_store.get(
+                sample_path,
+                target_len=real_len,
+                missing_policy=missing_policy,
+            )
+
+            padded = np.zeros((max_seq_len, tracking_store.num_features), dtype=np.float32)
+            padded[:real_len] = sequence[:real_len]
+            tracking_sequence_vectors.append(padded)
+
+        tracking_sequences = torch.tensor(
+            np.stack(tracking_sequence_vectors, axis=0),
+            dtype=features.dtype,
+            device=device,
+        )
+        return None, tracking_sequences, tracking_available
+
+    raise ValueError(f"Tipo tracking non supportato nel batch: {tracking_type}.")
+
+
+def append_level_tracking(
+    features: torch.Tensor,
+    tracking_features: torch.Tensor = None,
+    tracking_sequences: torch.Tensor = None,
+) -> torch.Tensor:
+    """Concatena al tensore video le feature tracking di uno specifico livello."""
+    if tracking_features is not None and tracking_sequences is not None:
+        raise ValueError("tracking_features e tracking_sequences sono mutuamente esclusivi.")
+
+    if tracking_sequences is not None:
+        return append_tracking_sequence_to_features(features, tracking_sequences)
+
+    if tracking_features is not None:
+        return append_tracking_to_features(features, tracking_features)
+
+    return features
+
+
 @torch.no_grad()
 def predict_hierarchical_batch(
     features,
@@ -465,10 +681,20 @@ def predict_hierarchical_batch(
     idx_to_label_l1,
     idx_to_label_l2,
     idx_to_label_l3,
-    tracking_features=None,
-    tracking_sequences=None,
+    l1_tracking_features=None,
+    l1_tracking_sequences=None,
+    l2_tracking_features=None,
+    l2_tracking_sequences=None,
+    l3_tracking_features=None,
+    l3_tracking_sequences=None,
 ):
-    logits_l1 = model_l1(features, lengths)
+    features_l1 = append_level_tracking(
+        features,
+        tracking_features=l1_tracking_features,
+        tracking_sequences=l1_tracking_sequences,
+    )
+
+    logits_l1 = model_l1(features_l1, lengths)
     probs_l1 = torch.softmax(logits_l1, dim=1)
     preds_l1 = probs_l1.argmax(dim=1)
 
@@ -500,18 +726,35 @@ def predict_hierarchical_batch(
         shot_features = features.index_select(0, shot_indices_tensor)
         shot_lengths = lengths.index_select(0, shot_indices_tensor)
 
-        logits_l2 = model_l2(shot_features, shot_lengths)
+        shot_l2_tracking_features = None
+        shot_l2_tracking_sequences = None
+        if l2_tracking_features is not None:
+            shot_l2_tracking_features = l2_tracking_features.index_select(0, shot_indices_tensor)
+        if l2_tracking_sequences is not None:
+            shot_l2_tracking_sequences = l2_tracking_sequences.index_select(0, shot_indices_tensor)
+
+        shot_features_l2 = append_level_tracking(
+            shot_features,
+            tracking_features=shot_l2_tracking_features,
+            tracking_sequences=shot_l2_tracking_sequences,
+        )
+
+        logits_l2 = model_l2(shot_features_l2, shot_lengths)
         probs_l2 = torch.softmax(logits_l2, dim=1)
         preds_l2 = probs_l2.argmax(dim=1)
 
-        if tracking_sequences is not None:
-            shot_tracking_sequences = tracking_sequences.index_select(0, shot_indices_tensor)
-            shot_features_l3 = append_tracking_sequence_to_features(shot_features, shot_tracking_sequences)
-        elif tracking_features is not None:
-            shot_tracking_features = tracking_features.index_select(0, shot_indices_tensor)
-            shot_features_l3 = append_tracking_to_features(shot_features, shot_tracking_features)
-        else:
-            shot_features_l3 = shot_features
+        shot_l3_tracking_features = None
+        shot_l3_tracking_sequences = None
+        if l3_tracking_features is not None:
+            shot_l3_tracking_features = l3_tracking_features.index_select(0, shot_indices_tensor)
+        if l3_tracking_sequences is not None:
+            shot_l3_tracking_sequences = l3_tracking_sequences.index_select(0, shot_indices_tensor)
+
+        shot_features_l3 = append_level_tracking(
+            shot_features,
+            tracking_features=shot_l3_tracking_features,
+            tracking_sequences=shot_l3_tracking_sequences,
+        )
 
         logits_l3 = model_l3(shot_features_l3, shot_lengths)
         probs_l3 = torch.softmax(logits_l3, dim=1)
@@ -541,7 +784,6 @@ def predict_hierarchical_batch(
             p_l3[global_idx] = p_l3_shots[local_idx]
 
     return final_preds, pred_l1_labels, pred_l2_labels, pred_l3_labels, p_l1, p_l2, p_l3
-
 
 def print_report(title: str, y_true, y_pred, labels):
     print(f"\n{title}")
@@ -609,96 +851,37 @@ def run_evaluation(args):
     print(f"L3 checkpoint: {args.l3_checkpoint}")
     print(f"L3 idx_to_label: {idx_to_label_l3}")
 
-    tracking_store = None
-    tracking_sequence_store = None
-    tracking_missing_policy = args.tracking_missing_policy
-    l3_tracking_config = ckpt_l3.get("tracking_config") or config_l3.get("tracking_config")
-    l3_tracking_type = "none"
+    l3_tracking_features_csv = args.l3_tracking_features_csv or args.tracking_features_csv
+    l3_tracking_sequences_npz = args.l3_tracking_sequences_npz or args.tracking_sequences_npz
+    l3_tracking_sequence_index = args.l3_tracking_sequence_index or args.tracking_sequence_index
 
-    if l3_tracking_config:
-        l3_tracking_type = l3_tracking_config.get("type", "aggregate")
-    elif int(config_l3.get("tracking_input_dim", 0)) > 0:
-        # Checkpoint vecchi con tracking, prima dell'introduzione del campo type.
-        l3_tracking_type = "aggregate"
-
-    if args.tracking_features_csv is not None and args.tracking_sequences_npz is not None:
-        raise ValueError(
-            "Usare una sola sorgente tracking in valutazione: --tracking-features-csv "
-            "oppure --tracking-sequences-npz, non entrambe."
-        )
-
-    if l3_tracking_type == "aggregate" and int(config_l3.get("tracking_input_dim", 0)) > 0:
-        if args.tracking_features_csv is None:
-            raise ValueError(
-                "Il checkpoint L3 richiede feature tracking aggregate, ma non è stato passato "
-                "--tracking-features-csv."
-            )
-
-        feature_names = None
-        mean = None
-        std = None
-        normalized = False
-
-        if l3_tracking_config:
-            feature_names = l3_tracking_config.get("feature_names")
-            mean = l3_tracking_config.get("mean")
-            std = l3_tracking_config.get("std")
-            normalized = bool(l3_tracking_config.get("normalized", False))
-            tracking_missing_policy = args.tracking_missing_policy or l3_tracking_config.get("missing_policy", "zeros")
-
-        tracking_store = TrackingFeatureStore(
-            args.tracking_features_csv,
-            feature_names=feature_names,
-            mean=mean,
-            std=std,
-            normalized=normalized,
-        )
-
-        print("\n# Feature tracking aggregate per L3")
-        print(f"CSV tracking: {args.tracking_features_csv}")
-        print(f"Numero feature tracking: {tracking_store.num_features}")
-        print(f"Normalizzate con statistiche del checkpoint L3: {normalized}")
-        print(f"Missing policy: {tracking_missing_policy}")
-
-    elif l3_tracking_type == "temporal_sequence":
-        npz_path = args.tracking_sequences_npz
-        index_path = args.tracking_sequence_index
-
-        if l3_tracking_config:
-            npz_path = npz_path or l3_tracking_config.get("npz_path")
-            index_path = index_path or l3_tracking_config.get("index_path")
-
-        if npz_path is None:
-            raise ValueError(
-                "Il checkpoint L3 richiede sequenze tracking temporali, ma non è stato passato "
-                "--tracking-sequences-npz e il path non è disponibile nel checkpoint."
-            )
-
-        feature_names = l3_tracking_config.get("feature_names") if l3_tracking_config else None
-        mean = l3_tracking_config.get("mean") if l3_tracking_config else None
-        std = l3_tracking_config.get("std") if l3_tracking_config else None
-        normalized = bool(l3_tracking_config.get("normalized", False)) if l3_tracking_config else False
-
-        tracking_sequence_store = TrackingSequenceFeatureStore(
-            npz_path,
-            index_path=index_path,
-            feature_names=feature_names,
-            mean=mean,
-            std=std,
-            normalized=normalized,
-        )
-
-        print("\n# Feature tracking temporali per L3")
-        print(f"NPZ tracking: {npz_path}")
-        print(f"Indice tracking: {tracking_sequence_store.index_path}")
-        print(f"Numero feature tracking per frame: {tracking_sequence_store.num_features}")
-        print(f"Normalizzate con statistiche del checkpoint L3: {normalized}")
-        print(f"Missing policy: {tracking_missing_policy}")
-
-    elif int(config_l3.get("tracking_input_dim", 0)) > 0:
-        raise ValueError(
-            f"Tipo tracking L3 non supportato o non configurato: {l3_tracking_type}."
-        )
+    l1_tracking_type, l1_tracking_store = load_tracking_store_for_level(
+        level_name="L1",
+        checkpoint=ckpt_l1,
+        config=config_l1,
+        tracking_features_csv=args.l1_tracking_features_csv,
+        tracking_sequences_npz=args.l1_tracking_sequences_npz,
+        tracking_sequence_index=args.l1_tracking_sequence_index,
+        missing_policy=args.tracking_missing_policy,
+    )
+    l2_tracking_type, l2_tracking_store = load_tracking_store_for_level(
+        level_name="L2",
+        checkpoint=ckpt_l2,
+        config=config_l2,
+        tracking_features_csv=args.l2_tracking_features_csv,
+        tracking_sequences_npz=args.l2_tracking_sequences_npz,
+        tracking_sequence_index=args.l2_tracking_sequence_index,
+        missing_policy=args.tracking_missing_policy,
+    )
+    l3_tracking_type, l3_tracking_store = load_tracking_store_for_level(
+        level_name="L3",
+        checkpoint=ckpt_l3,
+        config=config_l3,
+        tracking_features_csv=l3_tracking_features_csv,
+        tracking_sequences_npz=l3_tracking_sequences_npz,
+        tracking_sequence_index=l3_tracking_sequence_index,
+        missing_policy=args.tracking_missing_policy,
+    )
 
     original_mapping = original_idx_to_label()
 
@@ -713,52 +896,51 @@ def run_evaluation(args):
         lengths = batch["lengths"].to(device)
         labels = batch["labels"].cpu().tolist()
 
-        tracking_features = None
-        tracking_sequences = None
-        tracking_available = [False] * len(labels)
-
-        if tracking_store is not None:
-            tracking_vectors = []
-            for i in range(len(labels)):
-                global_idx = sample_offset + i
-                sample_path = get_sample_path(dataset, global_idx)
-                tracking_available[i] = tracking_store.has(sample_path)
-                tracking_vectors.append(
-                    tracking_store.get(
-                        sample_path,
-                        missing_policy=tracking_missing_policy,
-                    )
-                )
-
-            tracking_features = torch.tensor(
-                np.stack(tracking_vectors, axis=0),
-                dtype=features.dtype,
-                device=device,
-            )
-
-        if tracking_sequence_store is not None:
-            max_seq_len = features.shape[1]
-            tracking_sequence_vectors = []
-            for i in range(len(labels)):
-                global_idx = sample_offset + i
-                sample_path = get_sample_path(dataset, global_idx)
-                tracking_available[i] = tracking_sequence_store.has(sample_path)
-                real_len = int(lengths[i].item())
-                sequence = tracking_sequence_store.get(
-                    sample_path,
-                    target_len=real_len,
-                    missing_policy=tracking_missing_policy,
-                )
-
-                padded = np.zeros((max_seq_len, tracking_sequence_store.num_features), dtype=np.float32)
-                padded[:real_len] = sequence[:real_len]
-                tracking_sequence_vectors.append(padded)
-
-            tracking_sequences = torch.tensor(
-                np.stack(tracking_sequence_vectors, axis=0),
-                dtype=features.dtype,
-                device=device,
-            )
+        (
+            l1_tracking_features,
+            l1_tracking_sequences,
+            l1_tracking_available,
+        ) = build_tracking_batch(
+            tracking_type=l1_tracking_type,
+            tracking_store=l1_tracking_store,
+            dataset=dataset,
+            sample_offset=sample_offset,
+            labels=labels,
+            features=features,
+            lengths=lengths,
+            missing_policy=args.tracking_missing_policy,
+            device=device,
+        )
+        (
+            l2_tracking_features,
+            l2_tracking_sequences,
+            l2_tracking_available,
+        ) = build_tracking_batch(
+            tracking_type=l2_tracking_type,
+            tracking_store=l2_tracking_store,
+            dataset=dataset,
+            sample_offset=sample_offset,
+            labels=labels,
+            features=features,
+            lengths=lengths,
+            missing_policy=args.tracking_missing_policy,
+            device=device,
+        )
+        (
+            l3_tracking_features,
+            l3_tracking_sequences,
+            l3_tracking_available,
+        ) = build_tracking_batch(
+            tracking_type=l3_tracking_type,
+            tracking_store=l3_tracking_store,
+            dataset=dataset,
+            sample_offset=sample_offset,
+            labels=labels,
+            features=features,
+            lengths=lengths,
+            missing_policy=args.tracking_missing_policy,
+            device=device,
+        )
 
         (
             final_preds,
@@ -777,8 +959,12 @@ def run_evaluation(args):
             idx_to_label_l1=idx_to_label_l1,
             idx_to_label_l2=idx_to_label_l2,
             idx_to_label_l3=idx_to_label_l3,
-            tracking_features=tracking_features,
-            tracking_sequences=tracking_sequences,
+            l1_tracking_features=l1_tracking_features,
+            l1_tracking_sequences=l1_tracking_sequences,
+            l2_tracking_features=l2_tracking_features,
+            l2_tracking_sequences=l2_tracking_sequences,
+            l3_tracking_features=l3_tracking_features,
+            l3_tracking_sequences=l3_tracking_sequences,
         )
 
         for i, original_idx in enumerate(labels):
@@ -803,8 +989,12 @@ def run_evaluation(args):
                     "p_l1": f"{p_l1[i]:.6f}",
                     "p_l2": "" if p_l2[i] is None else f"{p_l2[i]:.6f}",
                     "p_l3": "" if p_l3[i] is None else f"{p_l3[i]:.6f}",
-                    "tracking_used": int(tracking_store is not None or tracking_sequence_store is not None),
-                    "tracking_available": int(tracking_available[i]),
+                    "tracking_used_l1": int(l1_tracking_store is not None),
+                    "tracking_available_l1": int(l1_tracking_available[i]),
+                    "tracking_used_l2": int(l2_tracking_store is not None),
+                    "tracking_available_l2": int(l2_tracking_available[i]),
+                    "tracking_used_l3": int(l3_tracking_store is not None),
+                    "tracking_available_l3": int(l3_tracking_available[i]),
                     "correct": int(true_final == pred_final),
                 }
             )
@@ -879,13 +1069,14 @@ def parse_args():
     parser.add_argument("--l2-checkpoint", type=str, required=True)
     parser.add_argument("--l3-checkpoint", type=str, required=True)
 
+    # Argomenti legacy: mantenuti per retro-compatibilità e usati come fallback per L3.
     parser.add_argument(
         "--tracking-features-csv",
         type=str,
         default=None,
         help=(
-            "CSV prodotto da extract_ball_rim_tracking_features.py. "
-            "Necessario se il checkpoint L3 è stato addestrato con feature tracking aggregate."
+            "[Legacy/L3] CSV prodotto da extract_ball_rim_tracking_features.py. "
+            "Usato come fallback per L3 se --l3-tracking-features-csv non è specificato."
         ),
     )
     parser.add_argument(
@@ -893,8 +1084,8 @@ def parse_args():
         type=str,
         default=None,
         help=(
-            "File NPZ con sequenze temporali di tracking palla/canestro. "
-            "Necessario se il checkpoint L3 è stato addestrato con tracking temporale."
+            "[Legacy/L3] File NPZ con sequenze temporali di tracking palla/canestro. "
+            "Usato come fallback per L3 se --l3-tracking-sequences-npz non è specificato."
         ),
     )
     parser.add_argument(
@@ -902,10 +1093,40 @@ def parse_args():
         type=str,
         default=None,
         help=(
-            "JSON indice associato a --tracking-sequences-npz. "
-            "Default: tracking_sequence_index.json nella stessa cartella del file NPZ."
+            "[Legacy/L3] JSON indice associato a --tracking-sequences-npz. "
+            "Usato come fallback per L3 se --l3-tracking-sequence-index non è specificato."
         ),
     )
+
+    for level in ["l1", "l2", "l3"]:
+        parser.add_argument(
+            f"--{level}-tracking-features-csv",
+            type=str,
+            default=None,
+            help=(
+                f"CSV con feature tracking aggregate da usare per {level.upper()} "
+                "se il checkpoint di quel livello è stato addestrato con tracking aggregato."
+            ),
+        )
+        parser.add_argument(
+            f"--{level}-tracking-sequences-npz",
+            type=str,
+            default=None,
+            help=(
+                f"NPZ con sequenze tracking temporali da usare per {level.upper()} "
+                "se il checkpoint di quel livello è stato addestrato con tracking temporale."
+            ),
+        )
+        parser.add_argument(
+            f"--{level}-tracking-sequence-index",
+            type=str,
+            default=None,
+            help=(
+                f"JSON indice associato al file NPZ tracking temporale per {level.upper()}. "
+                "Default: tracking_sequence_index.json nella stessa cartella del file NPZ."
+            ),
+        )
+
     parser.add_argument(
         "--tracking-missing-policy",
         type=str,

@@ -20,7 +20,7 @@ DEFAULT_EPOCHS = 150
 DEFAULT_BATCH = 8
 DEFAULT_DEVICE = "0"
 DEFAULT_WORKERS = 8
-DEFAULT_PROJECT = "runs/detect/outputs/ball_rim_detector"
+DEFAULT_PROJECT = "outputs/ball_rim_detector"
 DEFAULT_NAME = "yolo11m_1280_v2"
 DEFAULT_SEED = 42
 DEFAULT_PATIENCE = 30
@@ -313,9 +313,11 @@ def main() -> None:
         close_mosaic=15,
     )
 
-    best_weights = Path(args.project) / args.name / "weights" / "best.pt"
+    save_dir = Path(model.trainer.save_dir)
+    best_weights = save_dir / "weights" / "best.pt"
 
     print("\n[DONE] Training completato.")
+    print(f"[INFO] Save dir:      {save_dir}")
     print(f"[INFO] Best weights: {best_weights}")
 
     if best_weights.exists():
