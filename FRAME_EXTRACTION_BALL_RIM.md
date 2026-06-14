@@ -243,8 +243,166 @@ Se vengono usate predizioni del detector precedente come pre-annotazioni, queste
 
 La pre-annotazione serve solo a velocizzare il lavoro, ma il dataset esportato da CVAT deve essere considerato valido solo dopo revisione manuale.
 
+
+## Preparazione del dataset YOLO dopo l'annotazione CVAT
+
+Dopo la revisione manuale delle annotazioni in CVAT, i quattro export YOLO sono stati unificati in un unico dataset per l'addestramento del detector palla/canestro tramite lo script:
+
+```bash
+python src/annotations/prepare_ball_rim_yolo_dataset.py
+```
+
+Gli export CVAT utilizzati sono stati:
+
+| Export CVAT | Split finale | Immagini | Note |
+|---|---|---:|---|
+| `train_part_01_cvat_yolo.zip` | train | 592 | Tiri train, parte 1 |
+| `train_part_02_cvat_yolo.zip` | train | 591 | Tiri train, parte 2 |
+| `train_context_cvat_yolo.zip` | train | 480 | Passaggio, idle e non-gioco train |
+| `val_cvat_yolo.zip` | val | 320 | Validation con tutte le classi |
+
+Durante la preparazione del dataset è stato controllato che l'ordine delle classi fosse coerente in tutti gli export:
+
+```text
+0 = ball
+1 = rim
+```
+
+Il dataset finale è stato salvato in:
+
+```text
+data/datasets/ball_rim_yolo
+```
+
+con la seguente struttura:
+
+```text
+data/datasets/ball_rim_yolo/
+├── images/
+│   ├── train/
+│   └── val/
+├── labels/
+│   ├── train/
+│   └── val/
+├── data.yaml
+├── dataset_summary.txt
+└── dataset_summary.csv
+```
+
+### Conteggi finali del dataset YOLO
+
+| Split | Immagini totali | Immagini con box | Immagini senza box |
+|---|---:|---:|---:|
+| train | 1663 | 1655 | 8 |
+| val | 320 | 305 | 15 |
+
+Le immagini senza box sono state mantenute nel dataset, perché rappresentano esempi negativi utili per ridurre falsi positivi, soprattutto nei frame di `idle` e `non-gioco` in cui palla e/o canestro non sono visibili.
+
+## Addestramento del detector YOLO11m v2
+
+Il nuovo detector è stato addestrato sul dataset YOLO unificato, partendo dal modello pre-addestrato standard `yolo11m.pt` e non dal detector precedente. Questa scelta rende l'esperimento più pulito: il modello apprende dal nuovo dataset completo, che include sia i frame di tiro già utilizzati in precedenza sia i nuovi contesti di passaggio, idle e non-gioco.
+
+Il training è stato avviato con:
+
+```bash
+python src/training/train_ball_rim_yolo.py
+```
+
+### Configurazione di training
+
+| Parametro | Valore |
+|---|---|
+| Modello iniziale | `yolo11m.pt` |
+| Dataset | `data/datasets/ball_rim_yolo/data.yaml` |
+| Risoluzione | `1280` |
+| Epoche massime | `150` |
+| Batch size | `8` |
+| Device | `0` |
+| Workers | `8` |
+| Seed | `42` |
+| Patience early stopping | `30` |
+| Cache | `False` |
+| Project | `runs/detect/outputs/ball_rim_detector` |
+| Nome esperimento | `yolo11m_1280_v2` |
+
+Le principali augmentation mantenute sono state:
+
+| Parametro | Valore |
+|---|---:|
+| `hsv_h` | 0.015 |
+| `hsv_s` | 0.5 |
+| `hsv_v` | 0.3 |
+| `translate` | 0.05 |
+| `scale` | 0.30 |
+| `fliplr` | 0.5 |
+| `mosaic` | 0.5 |
+| `close_mosaic` | 15 |
+
+Il training è stato eseguito su GPU NVIDIA RTX 5000 Ada Generation. YOLO ha caricato il modello `yolo11m.pt`, adattando il numero di classi da 80 a 2 e trasferendo 643/649 pesi dal modello pre-addestrato.
+
+### Risultati del training
+
+L'addestramento si è fermato automaticamente dopo 67 epoche per early stopping. Il miglior risultato è stato osservato all'epoca 37, e il modello migliore è stato salvato come `best.pt`.
+
+```text
+EarlyStopping: Training stopped early as no improvement observed in last 30 epochs.
+Best results observed at epoch 37, best model saved as best.pt.
+```
+
+La validazione finale del `best.pt` ha prodotto i seguenti risultati:
+
+| Classe | Images | Instances | Precision | Recall | mAP50 | mAP50-95 |
+|---|---:|---:|---:|---:|---:|---:|
+| all | 320 | 567 | 0.974 | 0.942 | 0.965 | 0.564 |
+| ball | 271 | 271 | 0.961 | 0.908 | 0.943 | 0.561 |
+| rim | 296 | 296 | 0.987 | 0.976 | 0.987 | 0.568 |
+
+Il tempo medio riportato in validazione è stato:
+
+| Fase | Tempo per immagine |
+|---|---:|
+| Preprocess | 0.2 ms |
+| Inference | 5.9 ms |
+| Postprocess | 0.5 ms |
+
+### Considerazioni sull'early stopping
+
+L'early stopping non sembra aver penalizzato in modo rilevante le prestazioni del detector. Il modello migliore è stato individuato all'epoca 37, con mAP50-95 pari a circa 0.567 durante il training. Le epoche successive hanno mostrato ancora valori molto buoni, in alcuni casi con mAP50 leggermente superiore, ma senza migliorare stabilmente la metrica più severa mAP50-95. La validazione finale del `best.pt` ha infatti confermato un valore mAP50-95 pari a 0.564.
+
+Questo indica che proseguire fino a 150 epoche avrebbe probabilmente aumentato il tempo di training senza un miglioramento chiaro della qualità delle box. La scelta di `patience=30` appare quindi ragionevole per questo esperimento.
+
+### Confronto con il detector precedente
+
+Il confronto con il detector precedente deve essere interpretato con cautela, perché il modello precedente veniva validato su frame estratti dalle clip di training. Di conseguenza le sue metriche di validation erano più ottimistiche e non direttamente confrontabili con quelle del nuovo modello.
+
+Il nuovo detector, invece, è stato validato su 320 frame provenienti dallo split `val`, con clip diverse da quelle di training e con tutte le 9 classi rappresentate dove disponibili. Le metriche ottenute sono quindi più affidabili come stima della generalizzazione, anche se il validation set resta relativamente piccolo e alcune classi rare hanno pochi esempi.
+
+Dal punto di vista pratico, il risultato è positivo: il detector mantiene metriche alte sia sulla palla sia sul canestro, con una recall della palla pari a 0.908 e una recall del rim pari a 0.976. La palla rimane l'oggetto più difficile, come atteso, perché è piccola, spesso in movimento, parzialmente occlusa o lontana dal canestro.
+
+### Nota sul path di salvataggio
+
+Nel log di training il modello viene salvato da Ultralytics nel path effettivo:
+
+```text
+runs/detect/runs/detect/outputs/ball_rim_detector/yolo11m_1280_v2/weights/best.pt
+```
+
+mentre lo script stampa e controlla il path:
+
+```text
+runs/detect/outputs/ball_rim_detector/yolo11m_1280_v2/weights/best.pt
+```
+
+Per questo motivo, al termine del training compare il warning:
+
+```text
+[WARN] best.pt non trovato. Controllare la cartella dell'esperimento.
+```
+
+Il training è comunque completato correttamente e il `best.pt` è stato salvato; il warning dipende solo dalla discrepanza tra il path atteso dallo script e il path effettivo generato da Ultralytics.
+
 ## Utilizzo previsto
 
-Dopo l'annotazione e l'esportazione da CVAT in formato YOLO, i frame di training saranno usati per addestrare il nuovo detector YOLO11m palla/canestro. I frame di validation saranno usati come validation set durante l'addestramento, così da monitorare il comportamento del detector sia sui tiri sia sui contesti di passaggio, idle e non-gioco.
+Il detector YOLO11m v2 addestrato su questo dataset verrà utilizzato per estrarre feature di tracking palla/canestro sulle clip del dataset. Le feature potranno essere impiegate nei modelli di action recognition, sia per i livelli che distinguono le azioni generali sia per il livello relativo all'esito del tiro.
 
-Il nuovo detector potrà poi essere confrontato con il detector precedente, in particolare per verificare che l'aggiunta dei nuovi contesti migliori la robustezza generale senza peggiorare la qualità del tracking sui tiri, che rimane fondamentale per il livello 3 della pipeline gerarchica.
+Il modello precedente resta utile come baseline storica, ma il nuovo detector è più adatto agli esperimenti successivi perché è stato addestrato anche su passaggio, idle e non-gioco ed è stato validato su frame provenienti dallo split `val`, quindi su clip diverse da quelle di training.
