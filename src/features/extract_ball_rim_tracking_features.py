@@ -40,6 +40,7 @@ DEFAULT_OUTPUT_DIR = "data/features/ball_rim_tracking_features_clip_complete"
 
 
 TRACKING_FEATURE_NAMES = [
+    # Detection quality / visibility.
     "ball_detect_rate",
     "rim_detect_rate",
     "both_detect_rate",
@@ -51,6 +52,8 @@ TRACKING_FEATURE_NAMES = [
     "ball_area_max",
     "rim_area_mean",
     "rim_area_max",
+
+    # Ball-rim geometry.
     "ball_rim_dist_min",
     "ball_rim_dist_mean",
     "ball_rim_dist_std",
@@ -70,19 +73,59 @@ TRACKING_FEATURE_NAMES = [
     "dy_last",
     "abs_dx_min",
     "abs_dy_min",
+
+    # Absolute ball motion.
     "ball_velocity_mean",
     "ball_velocity_max",
     "ball_velocity_last_third_mean",
     "ball_vx_mean",
     "ball_vy_mean",
     "ball_vy_last_third_mean",
+    "ball_abs_vx_mean",
+    "ball_abs_vy_mean",
+    "ball_horizontal_motion_ratio",
+    "ball_vertical_motion_ratio",
+    "ball_motion_path_length",
+    "ball_motion_net_displacement",
+    "ball_motion_straightness",
+    "ball_displacement_x",
+    "ball_displacement_y",
+
+    # Rim stability / camera motion proxy.
     "rim_center_std",
     "rim_area_std",
+
+    # Rim interaction proxies for shot outcome.
     "ball_crosses_rim_y",
+    "ball_crosses_rim_y_downward",
+    "ball_crosses_rim_y_upward",
+    "ball_center_inside_rim_rate",
+    "ball_center_inside_rim_last_third_rate",
+    "ball_center_inside_rim_any",
+    "ball_center_inside_rim_last",
+    "ball_center_inside_expanded_rim_rate",
+    "ball_center_inside_expanded_rim_last_third_rate",
+    "ball_center_inside_expanded_rim_any",
+    "ball_center_inside_expanded_rim_last",
+    "ball_rim_iou_mean",
+    "ball_rim_iou_max",
+    "ball_rim_iou_last_third_max",
+    "ball_passes_close_to_rim_rate",
+
+    # Relative ball-rim motion, more robust when the camera moves.
+    "ball_relative_speed_mean",
+    "ball_relative_speed_max",
+    "ball_relative_vx_mean",
+    "ball_relative_vy_mean",
+    "ball_rim_approach_speed_mean",
+    "ball_rim_approach_speed_max",
+    "ball_rim_departure_speed_mean",
+    "ball_rim_departure_speed_max",
 ]
 
 
 TEMPORAL_TRACKING_FEATURE_NAMES = [
+    # Detection quality / visibility.
     "t_rel",
     "ball_detected",
     "rim_detected",
@@ -99,19 +142,39 @@ TEMPORAL_TRACKING_FEATURE_NAMES = [
     "rim_w",
     "rim_h",
     "rim_area",
+
+    # Ball-rim geometry.
     "dx",
     "dy",
     "ball_rim_dist",
     "ball_near_rim",
     "ball_above_rim",
     "ball_below_rim",
+    "ball_center_inside_rim",
+    "ball_center_inside_expanded_rim",
+    "ball_rim_iou",
+    "ball_passes_close_to_rim",
+
+    # Absolute ball motion.
     "ball_vx",
     "ball_vy",
     "ball_speed",
     "ball_ax",
     "ball_ay",
     "ball_acceleration",
+    "ball_motion_horizontal_ratio",
+    "ball_motion_vertical_ratio",
+
+    # Relative ball-rim motion and rim crossing events.
     "ball_rim_dist_delta",
+    "ball_relative_vx",
+    "ball_relative_vy",
+    "ball_relative_speed",
+    "ball_rim_approach_speed",
+    "ball_rim_departure_speed",
+    "ball_crosses_rim_y_frame",
+    "ball_crosses_rim_y_downward_frame",
+    "ball_crosses_rim_y_upward_frame",
 ]
 
 
@@ -388,6 +451,59 @@ def empty_detection():
     }
 
 
+def detection_bbox(det, margin: float = 0.0):
+    """
+    Restituisce il bbox normalizzato [x1, y1, x2, y2].
+
+    margin espande il bbox di margin * w e margin * h per lato. Questo è utile
+    perché il bbox del rim non coincide perfettamente con il cilindro del ferro,
+    quindi una piccola espansione rende il proxy di ingresso palla-canestro meno
+    fragile rispetto a detection leggermente rumorose.
+    """
+    xc = float(det.get("xc", 0.0))
+    yc = float(det.get("yc", 0.0))
+    w = float(det.get("w", 0.0))
+    h = float(det.get("h", 0.0))
+
+    half_w = w * (0.5 + margin)
+    half_h = h * (0.5 + margin)
+
+    x1 = max(0.0, xc - half_w)
+    y1 = max(0.0, yc - half_h)
+    x2 = min(1.0, xc + half_w)
+    y2 = min(1.0, yc + half_h)
+
+    return x1, y1, x2, y2
+
+
+def point_inside_bbox(x: float, y: float, bbox) -> int:
+    x1, y1, x2, y2 = bbox
+    return int(x1 <= float(x) <= x2 and y1 <= float(y) <= y2)
+
+
+def detection_iou(det_a, det_b) -> float:
+    ax1, ay1, ax2, ay2 = detection_bbox(det_a, margin=0.0)
+    bx1, by1, bx2, by2 = detection_bbox(det_b, margin=0.0)
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter_area
+
+    if union <= 1e-12:
+        return 0.0
+
+    return float(inter_area / union)
+
+
 def parse_yolo_result(result, ball_class_id, rim_class_id, frame_width, frame_height):
     best = {
         "ball": None,
@@ -420,7 +536,7 @@ def parse_yolo_result(result, ball_class_id, rim_class_id, frame_width, frame_he
     return ball, rim
 
 
-def compute_pair_features(ball, rim, near_threshold):
+def compute_pair_features(ball, rim, near_threshold, rim_inside_margin=0.15):
     both_detected = int(ball["detected"] == 1 and rim["detected"] == 1)
 
     if not both_detected:
@@ -432,11 +548,27 @@ def compute_pair_features(ball, rim, near_threshold):
             "ball_above_rim": 0,
             "ball_below_rim": 0,
             "ball_near_rim": 0,
+            "ball_center_inside_rim": 0,
+            "ball_center_inside_expanded_rim": 0,
+            "ball_rim_iou": 0.0,
+            "ball_passes_close_to_rim": 0,
         }
 
     dx = ball["xc"] - rim["xc"]
     dy = ball["yc"] - rim["yc"]
     dist = math.sqrt(dx * dx + dy * dy)
+
+    rim_bbox = detection_bbox(rim, margin=0.0)
+    expanded_rim_bbox = detection_bbox(rim, margin=rim_inside_margin)
+
+    center_inside_rim = point_inside_bbox(ball["xc"], ball["yc"], rim_bbox)
+    center_inside_expanded_rim = point_inside_bbox(ball["xc"], ball["yc"], expanded_rim_bbox)
+    ball_rim_iou = detection_iou(ball, rim)
+
+    # Proxy leggero per frame in cui la palla passa davvero nella zona del ferro:
+    # vicino al rim e orizzontalmente compatibile con la larghezza del bbox del rim.
+    horizontal_gate = max(float(rim.get("w", 0.0)), near_threshold * 0.50, 1e-6)
+    ball_passes_close_to_rim = int(dist <= near_threshold and abs(dx) <= horizontal_gate)
 
     return {
         "both_detected": 1,
@@ -446,6 +578,10 @@ def compute_pair_features(ball, rim, near_threshold):
         "ball_above_rim": int(ball["yc"] < rim["yc"]),
         "ball_below_rim": int(ball["yc"] > rim["yc"]),
         "ball_near_rim": int(dist <= near_threshold),
+        "ball_center_inside_rim": center_inside_rim,
+        "ball_center_inside_expanded_rim": center_inside_expanded_rim,
+        "ball_rim_iou": ball_rim_iou,
+        "ball_passes_close_to_rim": ball_passes_close_to_rim,
     }
 
 
@@ -467,13 +603,28 @@ def compute_velocities(frame_rows, fps):
             continue
 
         dt = delta_frames / fps if fps > 0 else float(delta_frames)
+        if dt <= 0:
+            continue
 
-        dx = float(curr["ball_xc"]) - float(prev["ball_xc"])
-        dy = float(curr["ball_yc"]) - float(prev["ball_yc"])
+        step_dx = float(curr["ball_xc"]) - float(prev["ball_xc"])
+        step_dy = float(curr["ball_yc"]) - float(prev["ball_yc"])
 
-        vx = dx / dt
-        vy = dy / dt
+        vx = step_dx / dt
+        vy = step_dy / dt
         v = math.sqrt(vx * vx + vy * vy)
+
+        rel_vx = 0.0
+        rel_vy = 0.0
+        rel_speed = 0.0
+        dist_delta = 0.0
+        rel_valid = False
+
+        if int(curr.get("both_detected", 0)) == 1 and int(prev.get("both_detected", 0)) == 1:
+            rel_vx = (float(curr["dx"]) - float(prev["dx"])) / dt
+            rel_vy = (float(curr["dy"]) - float(prev["dy"])) / dt
+            rel_speed = math.sqrt(rel_vx * rel_vx + rel_vy * rel_vy)
+            dist_delta = (float(curr["ball_rim_dist"]) - float(prev["ball_rim_dist"])) / dt
+            rel_valid = True
 
         velocities.append(
             {
@@ -481,6 +632,16 @@ def compute_velocities(frame_rows, fps):
                 "v": v,
                 "vx": vx,
                 "vy": vy,
+                "step_dx": step_dx,
+                "step_dy": step_dy,
+                "step_dist": math.sqrt(step_dx * step_dx + step_dy * step_dy),
+                "rel_valid": rel_valid,
+                "rel_vx": rel_vx,
+                "rel_vy": rel_vy,
+                "rel_speed": rel_speed,
+                "dist_delta": dist_delta,
+                "approach_speed": max(0.0, -dist_delta) if rel_valid else 0.0,
+                "departure_speed": max(0.0, dist_delta) if rel_valid else 0.0,
             }
         )
 
@@ -522,6 +683,14 @@ def aggregate_clip_features(frame_rows, fps, near_threshold):
     above_values = [int(r["ball_above_rim"]) for r in both_rows]
     below_values = [int(r["ball_below_rim"]) for r in both_rows]
 
+    center_inside_values = [int(r.get("ball_center_inside_rim", 0)) for r in both_rows]
+    center_inside_last_values = [int(r.get("ball_center_inside_rim", 0)) for r in both_last_rows]
+    center_inside_expanded_values = [int(r.get("ball_center_inside_expanded_rim", 0)) for r in both_rows]
+    center_inside_expanded_last_values = [int(r.get("ball_center_inside_expanded_rim", 0)) for r in both_last_rows]
+    iou_values = [float(r.get("ball_rim_iou", 0.0)) for r in both_rows]
+    iou_last_values = [float(r.get("ball_rim_iou", 0.0)) for r in both_last_rows]
+    close_values = [int(r.get("ball_passes_close_to_rim", 0)) for r in both_rows]
+
     rim_x = [float(r["rim_xc"]) for r in rim_rows]
     rim_y = [float(r["rim_yc"]) for r in rim_rows]
     rim_center_std = math.sqrt(
@@ -534,15 +703,58 @@ def aggregate_clip_features(frame_rows, fps, near_threshold):
     v_last_values = [v["v"] for v in velocities if int(v["frame_order"]) >= last_third_start]
     vy_last_values = [v["vy"] for v in velocities if int(v["frame_order"]) >= last_third_start]
 
+    abs_vx_values = [abs(v["vx"]) for v in velocities]
+    abs_vy_values = [abs(v["vy"]) for v in velocities]
+    abs_vx_mean = mean_or_default(abs_vx_values, default=0.0)
+    abs_vy_mean = mean_or_default(abs_vy_values, default=0.0)
+    motion_den = abs_vx_mean + abs_vy_mean
+    horizontal_motion_ratio = abs_vx_mean / motion_den if motion_den > 1e-12 else 0.0
+    vertical_motion_ratio = abs_vy_mean / motion_den if motion_den > 1e-12 else 0.0
+
+    ball_motion_path_length = sum(float(v.get("step_dist", 0.0)) for v in velocities)
+    ball_motion_net_displacement = 0.0
+    ball_displacement_x = 0.0
+    ball_displacement_y = 0.0
+    if len(ball_rows) >= 2:
+        sorted_ball_rows = sorted(ball_rows, key=lambda r: int(r["frame_order"]))
+        first_ball = sorted_ball_rows[0]
+        last_ball = sorted_ball_rows[-1]
+        ball_displacement_x = float(last_ball["ball_xc"]) - float(first_ball["ball_xc"])
+        ball_displacement_y = float(last_ball["ball_yc"]) - float(first_ball["ball_yc"])
+        ball_motion_net_displacement = math.sqrt(
+            ball_displacement_x * ball_displacement_x
+            + ball_displacement_y * ball_displacement_y
+        )
+
+    ball_motion_straightness = (
+        ball_motion_net_displacement / ball_motion_path_length
+        if ball_motion_path_length > 1e-12
+        else 0.0
+    )
+
+    relative_rows = [v for v in velocities if bool(v.get("rel_valid", False))]
+    rel_speed_values = [float(v["rel_speed"]) for v in relative_rows]
+    rel_vx_values = [float(v["rel_vx"]) for v in relative_rows]
+    rel_vy_values = [float(v["rel_vy"]) for v in relative_rows]
+    approach_values = [float(v["approach_speed"]) for v in relative_rows]
+    departure_values = [float(v["departure_speed"]) for v in relative_rows]
+
     # Attraversamento verticale rispetto al rim:
-    # se il segno di dy cambia, la palla è passata da sopra a sotto o viceversa.
+    # dy < 0 significa palla sopra il rim, dy > 0 significa palla sotto il rim
+    # nel sistema di coordinate immagine. Il crossing downward è quindi il caso
+    # sopra -> sotto, più rilevante per l'esito del tiro.
     crosses_rim_y = 0
+    crosses_rim_y_downward = 0
+    crosses_rim_y_upward = 0
     if len(dy_values) >= 2:
         signs = [np.sign(v) for v in dy_values if abs(v) > 1e-6]
         for a, b in zip(signs[:-1], signs[1:]):
             if a != b:
                 crosses_rim_y = 1
-                break
+            if a < 0 and b > 0:
+                crosses_rim_y_downward = 1
+            elif a > 0 and b < 0:
+                crosses_rim_y_upward = 1
 
     features = {
         "ball_detect_rate": len(ball_rows) / n,
@@ -590,23 +802,55 @@ def aggregate_clip_features(frame_rows, fps, near_threshold):
         "ball_vx_mean": mean_or_default(vx_values, default=0.0),
         "ball_vy_mean": mean_or_default(vy_values, default=0.0),
         "ball_vy_last_third_mean": mean_or_default(vy_last_values, default=0.0),
+        "ball_abs_vx_mean": abs_vx_mean,
+        "ball_abs_vy_mean": abs_vy_mean,
+        "ball_horizontal_motion_ratio": horizontal_motion_ratio,
+        "ball_vertical_motion_ratio": vertical_motion_ratio,
+        "ball_motion_path_length": ball_motion_path_length,
+        "ball_motion_net_displacement": ball_motion_net_displacement,
+        "ball_motion_straightness": ball_motion_straightness,
+        "ball_displacement_x": ball_displacement_x,
+        "ball_displacement_y": ball_displacement_y,
 
         "rim_center_std": rim_center_std,
         "rim_area_std": std_or_default(rim_area, default=0.0),
 
         "ball_crosses_rim_y": float(crosses_rim_y),
+        "ball_crosses_rim_y_downward": float(crosses_rim_y_downward),
+        "ball_crosses_rim_y_upward": float(crosses_rim_y_upward),
+        "ball_center_inside_rim_rate": mean_or_default(center_inside_values, default=0.0),
+        "ball_center_inside_rim_last_third_rate": mean_or_default(center_inside_last_values, default=0.0),
+        "ball_center_inside_rim_any": float(max(center_inside_values) if center_inside_values else 0.0),
+        "ball_center_inside_rim_last": last_or_default(center_inside_values, default=0.0),
+        "ball_center_inside_expanded_rim_rate": mean_or_default(center_inside_expanded_values, default=0.0),
+        "ball_center_inside_expanded_rim_last_third_rate": mean_or_default(center_inside_expanded_last_values, default=0.0),
+        "ball_center_inside_expanded_rim_any": float(max(center_inside_expanded_values) if center_inside_expanded_values else 0.0),
+        "ball_center_inside_expanded_rim_last": last_or_default(center_inside_expanded_values, default=0.0),
+        "ball_rim_iou_mean": mean_or_default(iou_values, default=0.0),
+        "ball_rim_iou_max": max_or_default(iou_values, default=0.0),
+        "ball_rim_iou_last_third_max": max_or_default(iou_last_values, default=0.0),
+        "ball_passes_close_to_rim_rate": mean_or_default(close_values, default=0.0),
+
+        "ball_relative_speed_mean": mean_or_default(rel_speed_values, default=0.0),
+        "ball_relative_speed_max": max_or_default(rel_speed_values, default=0.0),
+        "ball_relative_vx_mean": mean_or_default(rel_vx_values, default=0.0),
+        "ball_relative_vy_mean": mean_or_default(rel_vy_values, default=0.0),
+        "ball_rim_approach_speed_mean": mean_or_default(approach_values, default=0.0),
+        "ball_rim_approach_speed_max": max_or_default(approach_values, default=0.0),
+        "ball_rim_departure_speed_mean": mean_or_default(departure_values, default=0.0),
+        "ball_rim_departure_speed_max": max_or_default(departure_values, default=0.0),
     }
 
     return {name: safe_float(features.get(name, 0.0), default=0.0) for name in TRACKING_FEATURE_NAMES}
-
 
 def compute_temporal_sequence_features(frame_rows, fps):
     """
     Converte le detection per-frame in una sequenza [S, K] di feature temporali.
 
-    A differenza delle 39 feature aggregate per clip, questa rappresentazione
-    conserva l'ordine temporale e include posizione, distanza palla-canestro,
-    velocità e accelerazione della palla.
+    A differenza delle feature aggregate per clip, questa rappresentazione
+    conserva l'ordine temporale. Include feature di visibilità, geometria
+    palla-canestro, velocità assoluta, velocità relativa palla-rim e proxy
+    dell'ingresso della palla nel ferro.
     """
     rows = sorted(frame_rows, key=lambda r: int(r["frame_order"]))
 
@@ -631,6 +875,16 @@ def compute_temporal_sequence_features(frame_rows, fps):
         ball_ay = 0.0
         ball_acceleration = 0.0
         dist_delta = 0.0
+        rel_vx = 0.0
+        rel_vy = 0.0
+        rel_speed = 0.0
+        approach_speed = 0.0
+        departure_speed = 0.0
+        horizontal_ratio = 0.0
+        vertical_ratio = 0.0
+        crosses_rim_y_frame = 0.0
+        crosses_rim_y_downward_frame = 0.0
+        crosses_rim_y_upward_frame = 0.0
         current_velocity_valid = False
 
         if prev_row is not None:
@@ -644,6 +898,9 @@ def compute_temporal_sequence_features(frame_rows, fps):
                 ball_vx = (float(row["ball_xc"]) - float(prev_row["ball_xc"])) / dt
                 ball_vy = (float(row["ball_yc"]) - float(prev_row["ball_yc"])) / dt
                 ball_speed = math.sqrt(ball_vx * ball_vx + ball_vy * ball_vy)
+                den = abs(ball_vx) + abs(ball_vy)
+                horizontal_ratio = abs(ball_vx) / den if den > 1e-12 else 0.0
+                vertical_ratio = abs(ball_vy) / den if den > 1e-12 else 0.0
                 current_velocity_valid = True
 
                 if prev_vx is not None and prev_vy is not None and prev_speed is not None:
@@ -653,6 +910,20 @@ def compute_temporal_sequence_features(frame_rows, fps):
 
             if dt > 0 and both_detected and prev_both_detected:
                 dist_delta = (float(row["ball_rim_dist"]) - float(prev_row["ball_rim_dist"])) / dt
+                rel_vx = (float(row["dx"]) - float(prev_row["dx"])) / dt
+                rel_vy = (float(row["dy"]) - float(prev_row["dy"])) / dt
+                rel_speed = math.sqrt(rel_vx * rel_vx + rel_vy * rel_vy)
+                approach_speed = max(0.0, -dist_delta)
+                departure_speed = max(0.0, dist_delta)
+
+                prev_dy = float(prev_row["dy"])
+                curr_dy = float(row["dy"])
+                if abs(prev_dy) > 1e-6 and abs(curr_dy) > 1e-6 and np.sign(prev_dy) != np.sign(curr_dy):
+                    crosses_rim_y_frame = 1.0
+                    if prev_dy < 0 and curr_dy > 0:
+                        crosses_rim_y_downward_frame = 1.0
+                    elif prev_dy > 0 and curr_dy < 0:
+                        crosses_rim_y_upward_frame = 1.0
 
         feature_values = {
             "t_rel": float(row["t_rel"]),
@@ -677,13 +948,27 @@ def compute_temporal_sequence_features(frame_rows, fps):
             "ball_near_rim": float(row["ball_near_rim"]),
             "ball_above_rim": float(row["ball_above_rim"]),
             "ball_below_rim": float(row["ball_below_rim"]),
+            "ball_center_inside_rim": float(row.get("ball_center_inside_rim", 0.0)),
+            "ball_center_inside_expanded_rim": float(row.get("ball_center_inside_expanded_rim", 0.0)),
+            "ball_rim_iou": float(row.get("ball_rim_iou", 0.0)),
+            "ball_passes_close_to_rim": float(row.get("ball_passes_close_to_rim", 0.0)),
             "ball_vx": ball_vx,
             "ball_vy": ball_vy,
             "ball_speed": ball_speed,
             "ball_ax": ball_ax,
             "ball_ay": ball_ay,
             "ball_acceleration": ball_acceleration,
+            "ball_motion_horizontal_ratio": horizontal_ratio,
+            "ball_motion_vertical_ratio": vertical_ratio,
             "ball_rim_dist_delta": dist_delta,
+            "ball_relative_vx": rel_vx,
+            "ball_relative_vy": rel_vy,
+            "ball_relative_speed": rel_speed,
+            "ball_rim_approach_speed": approach_speed,
+            "ball_rim_departure_speed": departure_speed,
+            "ball_crosses_rim_y_frame": crosses_rim_y_frame,
+            "ball_crosses_rim_y_downward_frame": crosses_rim_y_downward_frame,
+            "ball_crosses_rim_y_upward_frame": crosses_rim_y_upward_frame,
         }
 
         sequence_rows.append([
@@ -699,7 +984,6 @@ def compute_temporal_sequence_features(frame_rows, fps):
         prev_row = row
 
     return np.asarray(sequence_rows, dtype=np.float32)
-
 
 def process_clip(
     row,
@@ -758,6 +1042,7 @@ def process_clip(
                 ball=ball,
                 rim=rim,
                 near_threshold=args.near_threshold,
+                rim_inside_margin=args.rim_inside_margin,
             )
 
             time_sec = frame_idx / fps if fps > 0 else 0.0
@@ -798,6 +1083,10 @@ def process_clip(
                 "ball_above_rim": pair["ball_above_rim"],
                 "ball_below_rim": pair["ball_below_rim"],
                 "ball_near_rim": pair["ball_near_rim"],
+                "ball_center_inside_rim": pair["ball_center_inside_rim"],
+                "ball_center_inside_expanded_rim": pair["ball_center_inside_expanded_rim"],
+                "ball_rim_iou": pair["ball_rim_iou"],
+                "ball_passes_close_to_rim": pair["ball_passes_close_to_rim"],
             }
 
             frame_rows.append(frame_row)
@@ -1047,6 +1336,17 @@ def parse_args():
         help=(
             "Distanza normalizzata sotto cui la palla è considerata vicina al rim. "
             "La distanza è calcolata sui centri normalizzati."
+        ),
+    )
+
+    parser.add_argument(
+        "--rim-inside-margin",
+        type=float,
+        default=0.15,
+        help=(
+            "Margine relativo usato per espandere il bbox del rim quando si calcola "
+            "il proxy ball_center_inside_expanded_rim. 0.15 = espansione del 15% "
+            "della larghezza/altezza del bbox per lato."
         ),
     )
 
@@ -1322,6 +1622,10 @@ def main():
                     "ball_above_rim",
                     "ball_below_rim",
                     "ball_near_rim",
+                    "ball_center_inside_rim",
+                    "ball_center_inside_expanded_rim",
+                    "ball_rim_iou",
+                    "ball_passes_close_to_rim",
                 ]
 
                 write_csv(
