@@ -10,14 +10,15 @@ L2: tiroDaDue / tiroDaTre / tiroLibero        solo se L1 = tiro
 L3: tiro0 / tiro1                             solo se L1 = tiro
 ```
 
-Il tracking viene usato in due forme:
+Il tracking viene usato in tre forme:
 
 ```text
 aggregate39: 39 feature aggregate per clip, replicate su tutti i timestep DINOv3
 temp29:      29 feature temporali per frame, interpolate alla lunghezza della sequenza DINOv3
+temp43:      43 feature temporali per frame, versione estesa delle feature palla/canestro
 ```
 
-Con `aggregate39` l'input effettivo passa da `[T, 1024]` a `[T, 1063]`; con `temp29` passa da `[T, 1024]` a `[T, 1053]`.
+Con `aggregate39` l'input effettivo passa da `[T, 1024]` a `[T, 1063]`; con `temp29` passa da `[T, 1024]` a `[T, 1053]`; con `temp43` passa da `[T, 1024]` a `[T, 1067]`.
 
 ## Nota sulle classi
 
@@ -254,29 +255,34 @@ Questa parte parte dal momento in cui sono state confrontate più versioni del d
 | Feature root corrente | Detector YOLO | Scope | Tipo feature | Uso previsto |
 |---|---|---|---|---|
 |`data/features/ball_rim_tracking_temporal_clip_complete_yolo_v1`|YOLO v1|train/val/test, tutte le clip|`temp29`|riferimento storico e Stadio 3|
-|`data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2`|YOLO v2|train/val/test, tutte le clip|`temp29`|migliore su L1 e L2|
+|`data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2`|YOLO v2|train/val/test, tutte le clip|`temp29`|migliore su L2|
 |`data/features/ball_rim_tracking_temporal_clip_complete_yolo_v3`|YOLO v3|train/val/test, tutte le clip|`temp29`|migliore di YOLO v2 su L3, ma sotto YOLO v1 storico|
+|`data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2_v4`|YOLO v2|train/val/test, tutte le clip|`temp43`|versione estesa, migliore su L1; testata anche su L2|
+|`data/features/ball_rim_tracking_temporal_clip_complete_yolo_v1_v4`|YOLO v1|train/val/test, tutte le clip|`temp43`|versione estesa, migliore su L3|
 
 ## Tabella riassuntiva - singoli livelli nel confronto YOLO
 
 |ID|Livello|Tracking|Label mode|Classi|Epoche|Val Loss|Val Accuracy|Val Macro F1|Val Weighted F1|Output dir|
 |-|-|-|-|-:|-:|-:|-:|-:|-:|-|
 |`exp_l1_yolo_v1_temp29_allclips_d256_mean`|L1|YOLO v1 `temp29`|`action_noaction`|3|100|0.2665|0.9000|0.9113|0.8999|`outputs/exp_l1_yolo_v1_temp29_allclips_d256_mean`|
-|`exp_l1_yolo_v2_temp29_allclips_d256_mean`|L1|YOLO v2 `temp29`|`action_noaction`|3|100|0.2974|**0.9130**|**0.9211**|**0.9128**|`outputs/exp_l1_yolo_v2_temp29_allclips_d256_mean`|
+|`exp_l1_yolo_v2_temp29_allclips_d256_mean`|L1|YOLO v2 `temp29`|`action_noaction`|3|100|0.2974|0.9130|0.9211|0.9128|`outputs/exp_l1_yolo_v2_temp29_allclips_d256_mean`|
 |`exp_l1_yolo_v3_temp29_allclips_d256_mean`|L1|YOLO v3 `temp29`|`action_noaction`|3|100|0.2833|0.9000|0.9078|0.9000|`outputs/exp_l1_yolo_v3_temp29_allclips_d256_mean`|
+|`exp_l1_yolo_v2_temp43_allclips_d256_mean`|L1|YOLO v2 `temp43`|`action_noaction`|3|100|0.3198|**0.9222**|**0.9264**|**0.9222**|`outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean`|
 |`exp_l2_yolo_v1_temp29_allclips_d256_mean`|L2|YOLO v1 `temp29`|`shot_type_only`|3|100|0.6552|0.8462|0.8401|0.8450|`outputs/exp_l2_yolo_v1_temp29_allclips_d256_mean`|
 |`exp_l2_yolo_v2_temp29_allclips_d256_mean`|L2|YOLO v2 `temp29`|`shot_type_only`|3|100|0.4127|**0.9077**|**0.9095**|**0.9077**|`outputs/exp_l2_yolo_v2_temp29_allclips_d256_mean`|
 |`exp_l2_yolo_v3_temp29_allclips_d256_mean`|L2|YOLO v3 `temp29`|`shot_type_only`|3|100|0.6945|0.8923|0.8915|0.8921|`outputs/exp_l2_yolo_v3_temp29_allclips_d256_mean`|
-|`exp_l3_yolo_v1_temp29_shots_d256_mean`|L3|YOLO v1 `temp29`|`shot_outcome_only`|2|100|0.4576|**0.8769**|**0.8733**|**0.8782**|`outputs/exp_l3_yolo_v1_temp29_shots_d256_mean`|
+|`exp_l2_yolo_v2_temp43_allclips_d256_mean`|L2|YOLO v2 `temp43`|`shot_type_only`|3|100|0.4614|0.8923|0.8921|0.8930|`outputs/exp_l2_yolo_v2_temp43_allclips_d256_mean`|
+|`exp_l3_yolo_v1_temp29_shots_d256_mean`|L3|YOLO v1 `temp29`|`shot_outcome_only`|2|100|0.4576|0.8769|0.8733|0.8782|`outputs/exp_l3_yolo_v1_temp29_shots_d256_mean`|
 |`exp_l3_yolo_v2_temp29_allclips_d256_mean`|L3|YOLO v2 `temp29`|`shot_outcome_only`|2|100|0.4430|0.8462|0.8397|0.8471|`outputs/exp_l3_yolo_v2_temp29_allclips_d256_mean`|
 |`exp_l3_yolo_v3_temp29_allclips_d256_mean`|L3|YOLO v3 `temp29`|`shot_outcome_only`|2|100|0.4764|0.8615|0.8594|0.8634|`outputs/exp_l3_yolo_v3_temp29_allclips_d256_mean`|
+|`exp_l3_yolo_v1_temp43_shots_d256_mean`|L3|YOLO v1 `temp43`|`shot_outcome_only`|2|100|0.2162|**0.9385**|**0.9366**|**0.9391**|`outputs/exp_l3_yolo_v1_temp43_shots_d256_mean`|
 
 Scelte migliori per livello:
 
 ```text
-L1: YOLO v2 temp29
+L1: YOLO v2 temp43
 L2: YOLO v2 temp29
-L3: YOLO v1 temp29 storico
+L3: YOLO v1 temp43
 ```
 
 ## Risultati aggregati per livello
@@ -287,8 +293,9 @@ L3: YOLO v1 temp29 storico
 |-|-|-:|-:|-:|-:|-:|-:|-:|
 |`exp_28_dinov3_vitl16_transformer_mean_action_noaction`|no|0.9074|0.91|0.91|0.9073|0.91|0.91|0.9072|
 |`exp_l1_yolo_v1_temp29_allclips_d256_mean`|YOLO v1 `temp29`|0.9000|0.91|0.92|0.9113|0.91|0.90|0.8999|
-|`exp_l1_yolo_v2_temp29_allclips_d256_mean`|YOLO v2 `temp29`|**0.9130**|**0.92**|**0.93**|**0.9211**|**0.92**|**0.91**|**0.9128**|
+|`exp_l1_yolo_v2_temp29_allclips_d256_mean`|YOLO v2 `temp29`|0.9130|0.92|0.93|0.9211|0.92|0.91|0.9128|
 |`exp_l1_yolo_v3_temp29_allclips_d256_mean`|YOLO v3 `temp29`|0.9000|0.90|0.92|0.9078|0.91|0.90|0.9000|
+|`exp_l1_yolo_v2_temp43_allclips_d256_mean`|YOLO v2 `temp43`|**0.9222**|**0.92**|**0.93**|**0.9264**|**0.92**|**0.92**|**0.9222**|
 
 ### Stadio 2
 
@@ -298,14 +305,16 @@ L3: YOLO v1 temp29 storico
 |`exp_l2_yolo_v1_temp29_allclips_d256_mean`|YOLO v1 `temp29`|0.8462|0.88|0.82|0.8401|0.86|0.85|0.8450|
 |`exp_l2_yolo_v2_temp29_allclips_d256_mean`|YOLO v2 `temp29`|**0.9077**|**0.91**|**0.91**|**0.9095**|**0.91**|**0.91**|**0.9077**|
 |`exp_l2_yolo_v3_temp29_allclips_d256_mean`|YOLO v3 `temp29`|0.8923|0.91|0.88|0.8915|0.90|0.89|0.8921|
+|`exp_l2_yolo_v2_temp43_allclips_d256_mean`|YOLO v2 `temp43`|0.8923|0.90|0.89|0.8921|0.90|0.89|0.8930|
 
 ### Stadio 3
 
 |ID|Tracking|Accuracy|Macro Precision|Macro Recall|Macro F1|Weighted Precision|Weighted Recall|Weighted F1|
 |-|-|-:|-:|-:|-:|-:|-:|-:|
-|`exp_l3_yolo_v1_temp29_shots_d256_mean`|YOLO v1 `temp29`|**0.8769**|**0.87**|**0.89**|**0.8733**|**0.89**|**0.88**|**0.8782**|
+|`exp_l3_yolo_v1_temp29_shots_d256_mean`|YOLO v1 `temp29`|0.8769|0.87|0.89|0.8733|0.89|0.88|0.8782|
 |`exp_l3_yolo_v2_temp29_allclips_d256_mean`|YOLO v2 `temp29`|0.8462|0.84|0.84|0.8397|0.85|0.85|0.8471|
 |`exp_l3_yolo_v3_temp29_allclips_d256_mean`|YOLO v3 `temp29`|0.8615|0.86|0.88|0.8594|0.89|0.86|0.8634|
+|`exp_l3_yolo_v1_temp43_shots_d256_mean`|YOLO v1 `temp43`|**0.9385**|**0.93**|**0.95**|**0.9366**|**0.95**|**0.94**|**0.9391**|
 
 ## Risultati per classe - singoli livelli del confronto YOLO
 
@@ -357,6 +366,27 @@ Confusion matrix:
  [ 36   3 224]]
 ```
 
+
+### L1 - `exp_l1_yolo_v2_temp43_allclips_d256_mean`
+
+Questo esperimento usa il detector YOLO v2, ma con la versione estesa delle feature temporali palla/canestro a 43 dimensioni per frame. Il miglior modello è stato salvato alla epoch 49.
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|passaggio|0.89|0.95|0.92|212|
+|tiro|0.93|0.95|0.94|65|
+|no-action|0.95|0.89|0.92|263|
+
+Confusion matrix:
+
+```text
+[[202   1   9]
+ [  0  62   3]
+ [ 25   4 234]]
+```
+
+Rispetto a `exp_l1_yolo_v2_temp29_allclips_d256_mean`, la versione `temp43` migliora L1 da Accuracy 0.9130 / Macro F1 0.9211 a Accuracy 0.9222 / Macro F1 0.9264.
+
 ### L2 - `exp_l2_yolo_v1_temp29_allclips_d256_mean`
 
 |Classe|Precision|Recall|F1-score|Support|
@@ -405,6 +435,27 @@ Confusion matrix:
  [ 3  0 15]]
 ```
 
+
+### L2 - `exp_l2_yolo_v2_temp43_allclips_d256_mean`
+
+Questo esperimento testa YOLO v2 con feature temporali estese `temp43` anche sullo Stadio 2. Il miglior modello è stato salvato alla epoch 34.
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|tiroDaDue|0.88|0.91|0.89|32|
+|tiroDaTre|0.82|0.93|0.88|15|
+|tiroLibero|1.00|0.83|0.91|18|
+
+Confusion matrix:
+
+```text
+[[29  3  0]
+ [ 1 14  0]
+ [ 3  0 15]]
+```
+
+Su L2, `temp43` non migliora la configurazione migliore precedente: `exp_l2_yolo_v2_temp29_allclips_d256_mean` resta superiore con Accuracy 0.9077 e Macro F1 0.9095, contro Accuracy 0.8923 e Macro F1 0.8921 della versione `temp43`.
+
 ### L3 - `exp_l3_yolo_v1_temp29_shots_d256_mean` / `exp_l3_tracking_temporal_v1`
 
 Il risultato storico `exp_l3_tracking_temporal_v1` è il riferimento YOLO v1 temporale usato come miglior L3. Nel confronto tra detector viene mantenuto come baseline YOLO v1 per lo Stadio 3.
@@ -449,17 +500,37 @@ Confusion matrix:
  [ 1 24]]
 ```
 
+
+### L3 - `exp_l3_yolo_v1_temp43_shots_d256_mean`
+
+Questo esperimento usa YOLO v1 con feature temporali estese `temp43` per lo Stadio 3, cioè la distinzione tra tiro sbagliato e tiro segnato. Il miglior modello è stato salvato alla epoch 29.
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|tiro0|1.00|0.90|0.95|40|
+|tiro1|0.86|1.00|0.93|25|
+
+Confusion matrix:
+
+```text
+[[36  4]
+ [ 0 25]]
+```
+
+Rispetto al precedente miglior L3 YOLO v1 `temp29`, la versione `temp43` migliora in modo netto: Accuracy da 0.8769 a 0.9385 e Macro F1 da 0.8733 a 0.9366.
+
 ## Tabella riassuntiva - end-to-end dopo il confronto YOLO
 
 |ID|Configurazione|Accuracy 8 classi|Macro F1 8 classi|Weighted F1 8 classi|Micro F1 7 azioni|Macro F1 7 azioni|Weighted F1 7 azioni|Macro F1 collassato senza esito|Output dir|
 |-|-|-:|-:|-:|-:|-:|-:|-:|-|
-|`exp_41_hier_dinov3_l3_yolo_v3_temp29_allclips`|L1 `exp_28`, L2 `exp_29`, L3 YOLO v3|0.8778|0.6979|0.8774|0.86|0.67|0.85|0.8153|`outputs/exp_41_hier_dinov3_l3_yolo_v3_temp29_allclips`|
-|`exp_42_hier_dinov3_l2_yolo_v2_l3_yolo_v3_temp29_allclips`|L1 `exp_28`, L2 YOLO v2, L3 YOLO v3|0.8852|0.7438|0.8849|0.87|0.72|0.87|0.8456|`outputs/exp_42_hier_dinov3_l2_yolo_v2_l3_yolo_v3_temp29_allclips`|
-|`exp_43_hier_dinov3_l1_yolo_v2_l2_yolo_v2_l3_yolo_v3_temp29_allclips`|L1 YOLO v2, L2 YOLO v2, L3 YOLO v3|0.8889|0.7607|0.8894|0.87|0.74|0.87|0.8724|`outputs/exp_43_hier_dinov3_l1_yolo_v2_l2_yolo_v2_l3_yolo_v3_temp29_allclips`|
-|`exp_44_hier_dinov3_l1_yolo_v2_l2_yolo_v2_l3_yolo_v1_temp29_allclips`|L1 YOLO v2, L2 YOLO v2, L3 YOLO v1|**0.8907**|**0.7762**|**0.8908**|**0.88**|**0.76**|**0.88**|0.8724|`outputs/exp_44_hier_dinov3_l1_yolo_v2_l2_yolo_v2_l3_yolo_v1_temp29_allclips`|
-|`exp_45_hier_l1_yolo_v2_passaggio_threshold_sweep`|`exp_44` + soglia L1 su `passaggio`|0.8926|0.7767|0.8927|0.88|0.76|0.88|**0.8733**|`outputs/exp_45_hier_l1_yolo_v2_passaggio_threshold_sweep`|
+|`exp_41_hier_dinov3_l3_yolo_v3_temp29_allclips`|L1 `exp_28`, L2 `exp_29`, L3 YOLO v3 `temp29`|0.8778|0.6979|0.8774|0.86|0.67|0.85|0.8153|`outputs/exp_41_hier_dinov3_l3_yolo_v3_temp29_allclips`|
+|`exp_42_hier_dinov3_l2_yolo_v2_l3_yolo_v3_temp29_allclips`|L1 `exp_28`, L2 YOLO v2 `temp29`, L3 YOLO v3 `temp29`|0.8852|0.7438|0.8849|0.87|0.72|0.87|0.8456|`outputs/exp_42_hier_dinov3_l2_yolo_v2_l3_yolo_v3_temp29_allclips`|
+|`exp_43_hier_dinov3_l1_yolo_v2_l2_yolo_v2_l3_yolo_v3_temp29_allclips`|L1 YOLO v2 `temp29`, L2 YOLO v2 `temp29`, L3 YOLO v3 `temp29`|0.8889|0.7607|0.8894|0.87|0.74|0.87|0.8724|`outputs/exp_43_hier_dinov3_l1_yolo_v2_l2_yolo_v2_l3_yolo_v3_temp29_allclips`|
+|`exp_44_hier_dinov3_l1_yolo_v2_l2_yolo_v2_l3_yolo_v1_temp29_allclips`|L1 YOLO v2 `temp29`, L2 YOLO v2 `temp29`, L3 YOLO v1 `temp29`|0.8907|0.7762|0.8908|0.88|0.76|0.88|0.8724|`outputs/exp_44_hier_dinov3_l1_yolo_v2_l2_yolo_v2_l3_yolo_v1_temp29_allclips`|
+|`exp_45_hier_l1_yolo_v2_passaggio_threshold_sweep`|`exp_44` + soglia L1 su `passaggio`|0.8926|0.7767|0.8927|0.88|0.76|0.88|0.8733|`outputs/exp_45_hier_l1_yolo_v2_passaggio_threshold_sweep`|
+|`exp_46_hier_best_per_level_l1temp43_l2temp29_l3temp43`|L1 YOLO v2 `temp43`, L2 YOLO v2 `temp29`, L3 YOLO v1 `temp43`|**0.9056**|**0.8079**|**0.9062**|**0.89**|**0.79**|**0.89**|**0.8744**|`outputs/exp_46_hier_best_per_level_l1temp43_l2temp29_l3temp43`|
 
-`exp_44` resta il miglior risultato operativo consigliato. `exp_45` ha valori numericamente appena superiori, ma introduce una soglia scelta su validation; il guadagno è trascurabile rispetto al rischio di rendere la pipeline più fragile.
+`exp_46` diventa il miglior risultato operativo consigliato: usa la migliore configurazione osservata per ciascun livello, cioè L1 `temp43`, L2 `temp29` e L3 `temp43`. `exp_45` resta una semplice ablation di post-processing perché migliora pochissimo `exp_44` e usa una soglia scelta su validation.
 
 ## Risultati per classe - end-to-end dopo il confronto YOLO
 
@@ -656,6 +727,102 @@ Tabella dello sweep soglia L1 per `passaggio`:
 
 Il miglioramento rispetto a `exp_44` è minimo: Macro F1 8 classi da 0.7762 a 0.7767. Inoltre la soglia riduce il recall di `passaggio` da 0.9811 a 0.9670 e viene scelta direttamente su validation. Per questo `exp_45` viene mantenuto come ablation, ma non scelto come modello principale.
 
+
+### `exp_46_hier_best_per_level_l1temp43_l2temp29_l3temp43` - 8 classi finali
+
+Configurazione:
+
+```text
+L1: outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/best_model.pt
+    tracking: data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2_v4, temp43
+
+L2: outputs/exp_l2_yolo_v2_temp29_allclips_d256_mean/best_model.pt
+    tracking: data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2, temp29
+
+L3: outputs/exp_l3_yolo_v1_temp43_shots_d256_mean/best_model.pt
+    tracking: data/features/ball_rim_tracking_temporal_clip_complete_yolo_v1_v4, temp43
+```
+
+Metriche end-to-end:
+
+```text
+Accuracy 8 classi:    0.9056
+Macro F1 8 classi:    0.8079
+Weighted F1 8 classi: 0.9062
+```
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|passaggio|0.89|0.95|0.92|212|
+|tiroDaDue0|0.90|0.86|0.88|21|
+|tiroDaDue1|0.60|0.82|0.69|11|
+|tiroDaTre0|0.91|0.83|0.87|12|
+|tiroDaTre1|0.50|0.67|0.57|3|
+|tiroLibero0|0.78|1.00|0.88|7|
+|tiroLibero1|0.88|0.64|0.74|11|
+|no-action|0.95|0.89|0.92|263|
+
+Confusion matrix - 8 classi finali con no-action:
+
+```text
+[[202   0   0   1   0   0   0   9]
+ [  0  18   2   0   0   1   0   0]
+ [  0   0   9   0   1   0   1   0]
+ [  0   0   0  10   1   0   0   1]
+ [  0   0   1   0   2   0   0   0]
+ [  0   0   0   0   0   7   0   0]
+ [  0   0   2   0   0   0   7   2]
+ [ 25   2   1   0   0   1   0 234]]
+```
+
+Valutazione solo sulle 7 azioni reali:
+
+```text
+micro avg F1:    0.89
+macro avg F1:    0.79
+weighted avg F1: 0.89
+```
+
+Confusion matrix - solo 7 azioni finali:
+
+```text
+[[202   0   0   1   0   0   0]
+ [  0  18   2   0   0   1   0]
+ [  0   0   9   0   1   0   1]
+ [  0   0   0  10   1   0   0]
+ [  0   0   1   0   2   0   0]
+ [  0   0   0   0   0   7   0]
+ [  0   0   2   0   0   0   7]]
+```
+
+Valutazione collassata senza esito del tiro:
+
+```text
+Accuracy tipo azione:    0.9111
+Macro F1 tipo azione:    0.8744
+Weighted F1 tipo azione: 0.9111
+```
+
+|Classe|Precision|Recall|F1-score|Support|
+|-|-:|-:|-:|-:|
+|passaggio|0.89|0.95|0.92|212|
+|tiroDaDue|0.83|0.91|0.87|32|
+|tiroDaTre|0.87|0.87|0.87|15|
+|tiroLibero|0.82|0.78|0.80|18|
+|no-action|0.95|0.89|0.92|263|
+
+Confusion matrix - tipo azione senza esito:
+
+```text
+[[202   0   1   0   9]
+ [  0  29   1   2   0]
+ [  0   1  13   0   1]
+ [  0   2   0  14   2]
+ [ 25   3   0   1 234]]
+```
+
+Rispetto a `exp_44`, `exp_46` migliora sensibilmente le metriche end-to-end: Accuracy 8 classi da 0.8907 a 0.9056, Macro F1 8 classi da 0.7762 a 0.8079 e Weighted F1 8 classi da 0.8908 a 0.9062. Il miglioramento è dovuto soprattutto alla sostituzione di L1 con `temp43` e di L3 con `temp43`, mentre L2 resta sulla versione `temp29` perché più forte della variante `temp43`.
+
 ## Comandi principali
 
 ### Estrazione feature temporali complete con YOLO v1/v2/v3
@@ -812,54 +979,97 @@ python -m src.evaluation.evaluate_hierarchical \
   --threshold-select-metric macro_f1_8
 ```
 
+
+### Valutazione exp_46
+
+```bash
+python -m src.evaluation.evaluate_hierarchical \
+  --features-root data/features/dinov3_vitl16_336 \
+  --split val \
+  --batch-size 64 \
+  --num-workers 2 \
+  --output-dir outputs/exp_46_hier_best_per_level_l1temp43_l2temp29_l3temp43 \
+  --l1-checkpoint outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/best_model.pt \
+  --l2-checkpoint outputs/exp_l2_yolo_v2_temp29_allclips_d256_mean/best_model.pt \
+  --l3-checkpoint outputs/exp_l3_yolo_v1_temp43_shots_d256_mean/best_model.pt \
+  --l1-tracking-sequences-npz data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2_v4/tracking_sequences.npz \
+  --l1-tracking-sequence-index data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2_v4/tracking_sequence_index.json \
+  --l2-tracking-sequences-npz data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2/tracking_sequences.npz \
+  --l2-tracking-sequence-index data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2/tracking_sequence_index.json \
+  --l3-tracking-sequences-npz data/features/ball_rim_tracking_temporal_clip_complete_yolo_v1_v4/tracking_sequences.npz \
+  --l3-tracking-sequence-index data/features/ball_rim_tracking_temporal_clip_complete_yolo_v1_v4/tracking_sequence_index.json \
+  --tracking-missing-policy error
+```
+
 ## Nota finale
 
 Il tracking palla/canestro produce un miglioramento progressivo soprattutto quando viene integrato nei singoli stadi più adatti:
 
 ```text
-exp_38: L1 vecchio, L2 vecchio, L3 YOLO v1 aggregate39 -> Macro F1 8 classi = 0.6996
-exp_40: L1 vecchio, L2 vecchio, L3 YOLO v1 temp29      -> Macro F1 8 classi = 0.7223
-exp_42: L1 vecchio, L2 YOLO v2, L3 YOLO v3             -> Macro F1 8 classi = 0.7438
-exp_43: L1 YOLO v2, L2 YOLO v2, L3 YOLO v3             -> Macro F1 8 classi = 0.7607
-exp_44: L1 YOLO v2, L2 YOLO v2, L3 YOLO v1             -> Macro F1 8 classi = 0.7762
-exp_45: exp_44 + soglia L1 passaggio                   -> Macro F1 8 classi = 0.7767
+exp_38: L1 vecchio, L2 vecchio, L3 YOLO v1 aggregate39             -> Macro F1 8 classi = 0.6996
+exp_40: L1 vecchio, L2 vecchio, L3 YOLO v1 temp29                  -> Macro F1 8 classi = 0.7223
+exp_42: L1 vecchio, L2 YOLO v2 temp29, L3 YOLO v3 temp29           -> Macro F1 8 classi = 0.7438
+exp_43: L1 YOLO v2 temp29, L2 YOLO v2 temp29, L3 YOLO v3 temp29    -> Macro F1 8 classi = 0.7607
+exp_44: L1 YOLO v2 temp29, L2 YOLO v2 temp29, L3 YOLO v1 temp29    -> Macro F1 8 classi = 0.7762
+exp_45: exp_44 + soglia L1 passaggio                              -> Macro F1 8 classi = 0.7767
+exp_46: L1 YOLO v2 temp43, L2 YOLO v2 temp29, L3 YOLO v1 temp43    -> Macro F1 8 classi = 0.8079
 ```
 
-La configurazione consigliata resta:
+La configurazione consigliata diventa:
 
 ```text
-L1: outputs/exp_l1_yolo_v2_temp29_allclips_d256_mean/best_model.pt
+L1: outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/best_model.pt
 L2: outputs/exp_l2_yolo_v2_temp29_allclips_d256_mean/best_model.pt
-L3: outputs/exp_l3_yolo_v1_temp29_shots_d256_mean/best_model.pt
+L3: outputs/exp_l3_yolo_v1_temp43_shots_d256_mean/best_model.pt
 ```
 
 Il miglior output operativo da usare come riferimento è:
 
 ```text
-outputs/exp_44_hier_dinov3_l1_yolo_v2_l2_yolo_v2_l3_yolo_v1_temp29_allclips
+outputs/exp_46_hier_best_per_level_l1temp43_l2temp29_l3temp43
 ```
 
-`exp_45` resta documentato come ablation di post-processing, ma non viene scelto come modello finale perché il vantaggio numerico è quasi nullo e dipende da una soglia selezionata su validation.
+`exp_46` è preferibile a `exp_45` perché ottiene un miglioramento molto più consistente senza introdurre soglie selezionate su validation. `exp_45` resta documentato come ablation di post-processing, ma non viene scelto come modello finale.
 
 ## Cosa manca ancora
 
-Non servono più i `results.txt` di `exp_28` e `exp_29` dentro questo file, perché sono già tracciati in un altro markdown.
+Con i file forniti sono stati aggiunti anche:
 
-Dal punto di vista delle **metriche**, con i file forniti ora sono stati aggiunti:
+- risultati completi di `exp_l1_yolo_v2_temp43_allclips_d256_mean`;
+- risultati completi di `exp_l2_yolo_v2_temp43_allclips_d256_mean`;
+- risultati completi di `exp_l3_yolo_v1_temp43_shots_d256_mean`;
+- valutazione end-to-end completa di `exp_46_hier_best_per_level_l1temp43_l2temp29_l3temp43`.
 
-- report per classe, confusion matrix, best epoch e comando di `exp_l3_tracking_temporal_v1`;
-- report per classe e confusion matrix di `exp_l2_yolo_v2_temp29_allclips_d256_mean`;
-- report per classe e confusion matrix di `exp_l2_yolo_v3_temp29_allclips_d256_mean`;
-- report per classe e confusion matrix di `exp_38`;
-- report per classe e confusion matrix di `exp_39`;
-- confusion matrix end-to-end di `exp_40`, `exp_41`, `exp_42`, `exp_43`, `exp_44`;
-- sweep completo e risultato finale di `exp_45`.
+Dal punto di vista delle metriche principali, il confronto ora è abbastanza completo per giustificare la scelta operativa:
 
-Resta eventualmente utile, solo per completezza della sezione comandi/training, il comando esatto o il `results.txt` completo di:
+```text
+L1 migliore: YOLO v2 temp43
+L2 migliore: YOLO v2 temp29
+L3 migliore: YOLO v1 temp43
+End-to-end migliore: exp_46
+```
+
+Restano eventualmente utili, ma non bloccanti:
+
+1. **Ablation end-to-end parziali con `temp43`**, per isolare il contributo di ogni livello:
+   - L1 `temp43`, L2 `temp29`, L3 `temp29`;
+   - L1 `temp29`, L2 `temp29`, L3 `temp43`;
+   - L1 `temp29`, L2 `temp43`, L3 `temp29`.
+
+   Questo chiarirebbe quanto del guadagno di `exp_46` arriva da L1 e quanto da L3. Non è indispensabile perché i singoli livelli indicano già chiaramente che L1 e L3 migliorano, mentre L2 peggiora con `temp43`.
+
+2. **Confronto `temp43` su altri detector**, solo se si vuole completare in modo molto rigoroso il confronto tra YOLO:
+   - L1 YOLO v1/v3 con `temp43`;
+   - L2 YOLO v1/v3 con `temp43`;
+   - L3 YOLO v2/v3 con `temp43`.
+
+   Anche questi non sono bloccanti: per ora ha senso concentrarsi sui detector già migliori per livello.
+
+3. **Comando esatto o `results.txt` completo di due esperimenti storici**, utile solo per completezza della sezione comandi/training:
 
 ```text
 exp_l1_yolo_v1_temp29_allclips_d256_mean
 exp_l2_yolo_v1_temp29_allclips_d256_mean
 ```
 
-Le metriche aggregate e i report per classe di questi due esperimenti sono già presenti, quindi non sono bloccanti.
+Le metriche aggregate e i report per classe di questi due esperimenti sono già presenti, quindi non sono necessari per scegliere il modello finale.

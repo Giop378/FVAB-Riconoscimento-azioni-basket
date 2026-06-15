@@ -56,6 +56,7 @@ def get_reconstructed_command() -> str:
     return " ".join(shlex.quote(str(part)) for part in parts)
 
 
+
 TRACKING_METADATA_COLUMNS = {
     "clip_id",
     "split",
@@ -196,15 +197,7 @@ def interpolate_sequence_array(sequence: np.ndarray, target_len: int) -> np.ndar
 
 
 class TrackingSequenceFeatureStore:
-    def __init__(
-        self,
-        npz_path: str,
-        index_path: str = None,
-        feature_names=None,
-        mean=None,
-        std=None,
-        normalized=False,
-    ):
+    def __init__(self, npz_path: str, index_path: str = None, feature_names=None, mean=None, std=None, normalized=False):
         self.npz_path = Path(npz_path)
 
         if not self.npz_path.exists():
@@ -290,6 +283,9 @@ class TrackingSequenceFeatureStore:
 
 
 def append_tracking_to_features(features: torch.Tensor, tracking_features: torch.Tensor) -> torch.Tensor:
+    """
+    Concatena un vettore tracking [B, K] a ogni timestep delle feature video [B, T, D].
+    """
     if tracking_features is None:
         return features
 
@@ -312,6 +308,9 @@ def append_tracking_to_features(features: torch.Tensor, tracking_features: torch
 
 
 def append_tracking_sequence_to_features(features: torch.Tensor, tracking_sequences: torch.Tensor) -> torch.Tensor:
+    """
+    Concatena una sequenza tracking [B, T, K] alle feature video [B, T, D].
+    """
     if tracking_sequences is None:
         return features
 
@@ -328,24 +327,6 @@ def append_tracking_sequence_to_features(features: torch.Tensor, tracking_sequen
         )
 
     return torch.cat([features, tracking_sequences.to(features.device, dtype=features.dtype)], dim=2)
-
-
-def append_level_tracking(
-    features: torch.Tensor,
-    tracking_features: torch.Tensor = None,
-    tracking_sequences: torch.Tensor = None,
-) -> torch.Tensor:
-    if tracking_features is not None and tracking_sequences is not None:
-        raise ValueError("tracking_features e tracking_sequences sono mutuamente esclusivi.")
-
-    if tracking_sequences is not None:
-        return append_tracking_sequence_to_features(features, tracking_sequences)
-
-    if tracking_features is not None:
-        return append_tracking_to_features(features, tracking_features)
-
-    return features
-
 
 def normalize_idx_to_label(idx_to_label):
     if isinstance(idx_to_label, dict):
@@ -372,10 +353,6 @@ def fallback_idx_to_label(label_mode: str):
         "shot_outcome_only": {
             0: "tiro0",
             1: "tiro1",
-        },
-        "passaggio_noaction_only": {
-            0: "passaggio",
-            1: "no-action",
         },
     }
 
@@ -444,14 +421,17 @@ def load_checkpoint_model(checkpoint_path: str, device: torch.device, label_mode
         )
 
     config = checkpoint["model_config"]
-    num_classes = int(config["num_classes"])
 
+    num_classes = int(config["num_classes"])
     idx_to_label = checkpoint.get("idx_to_label")
+
     if idx_to_label is None:
         idx_to_label = fallback_idx_to_label(label_mode)
     else:
         idx_to_label = normalize_idx_to_label(idx_to_label)
 
+    # Alcuni checkpoint vecchi potrebbero avere idx_to_label non coerente.
+    # In quel caso usiamo il mapping atteso per quello specifico livello.
     if len(idx_to_label) != num_classes:
         idx_to_label = fallback_idx_to_label(label_mode)
 
@@ -475,13 +455,22 @@ def load_checkpoint_model(checkpoint_path: str, device: torch.device, label_mode
     return model, idx_to_label, checkpoint, config
 
 
+
 def get_checkpoint_tracking_requirements(checkpoint, config):
+    """
+    Ricava dal checkpoint se il modello di uno stadio richiede feature tracking.
+
+    I checkpoint salvati da train.py contengono:
+    - model_config["tracking_input_dim"] > 0 quando il modello è stato addestrato con tracking;
+    - tracking_config con tipo, nomi feature e statistiche di normalizzazione.
+    """
     tracking_config = checkpoint.get("tracking_config") or config.get("tracking_config")
     tracking_input_dim = int(config.get("tracking_input_dim", 0))
 
     if tracking_config:
         tracking_type = tracking_config.get("type", "aggregate")
     elif tracking_input_dim > 0:
+        # Fallback per checkpoint vecchi che avevano tracking_input_dim ma non tracking_config.
         tracking_type = "aggregate"
     else:
         tracking_type = "none"
@@ -498,6 +487,13 @@ def load_tracking_store_for_level(
     tracking_sequence_index: str = None,
     missing_policy: str = "zeros",
 ):
+    """
+    Carica lo store tracking richiesto da uno specifico livello della gerarchia.
+
+    Se il checkpoint non è stato addestrato con tracking, restituisce ("none", None).
+    Se il checkpoint richiede tracking, usa prima i path passati da riga di comando;
+    se non presenti, prova i path salvati nel checkpoint.
+    """
     if tracking_features_csv is not None and tracking_sequences_npz is not None:
         raise ValueError(
             f"Usare una sola sorgente tracking per {level_name}: "
@@ -595,6 +591,14 @@ def build_tracking_batch(
     missing_policy: str,
     device: torch.device,
 ):
+    """
+    Costruisce i tensori tracking per un batch.
+
+    Restituisce:
+    - tracking_features: [B, K] per feature aggregate oppure None;
+    - tracking_sequences: [B, T, K] per sequenze temporali oppure None;
+    - tracking_available: lista booleana, una per campione.
+    """
     batch_size = len(labels)
     tracking_available = [False] * batch_size
 
@@ -603,7 +607,6 @@ def build_tracking_batch(
 
     if tracking_type == "aggregate":
         tracking_vectors = []
-
         for i in range(batch_size):
             global_idx = sample_offset + i
             sample_path = get_sample_path(dataset, global_idx)
@@ -625,12 +628,10 @@ def build_tracking_batch(
     if tracking_type == "temporal_sequence":
         max_seq_len = features.shape[1]
         tracking_sequence_vectors = []
-
         for i in range(batch_size):
             global_idx = sample_offset + i
             sample_path = get_sample_path(dataset, global_idx)
             tracking_available[i] = tracking_store.has(sample_path)
-
             real_len = int(lengths[i].item())
             sequence = tracking_store.get(
                 sample_path,
@@ -652,6 +653,24 @@ def build_tracking_batch(
     raise ValueError(f"Tipo tracking non supportato nel batch: {tracking_type}.")
 
 
+def append_level_tracking(
+    features: torch.Tensor,
+    tracking_features: torch.Tensor = None,
+    tracking_sequences: torch.Tensor = None,
+) -> torch.Tensor:
+    """Concatena al tensore video le feature tracking di uno specifico livello."""
+    if tracking_features is not None and tracking_sequences is not None:
+        raise ValueError("tracking_features e tracking_sequences sono mutuamente esclusivi.")
+
+    if tracking_sequences is not None:
+        return append_tracking_sequence_to_features(features, tracking_sequences)
+
+    if tracking_features is not None:
+        return append_tracking_to_features(features, tracking_features)
+
+    return features
+
+
 @torch.no_grad()
 def predict_hierarchical_batch(
     features,
@@ -668,10 +687,6 @@ def predict_hierarchical_batch(
     l2_tracking_sequences=None,
     l3_tracking_features=None,
     l3_tracking_sequences=None,
-    model_l1_binary_corrector=None,
-    idx_to_label_l1_binary_corrector=None,
-    l1_binary_corrector_tracking_features=None,
-    l1_binary_corrector_tracking_sequences=None,
 ):
     features_l1 = append_level_tracking(
         features,
@@ -685,111 +700,34 @@ def predict_hierarchical_batch(
 
     batch_size = features.size(0)
 
-    pred_l1_base_labels = [idx_to_label_l1[int(idx)] for idx in preds_l1.cpu().tolist()]
-    pred_l1_labels = list(pred_l1_base_labels)
-    pred_l1_corrector_labels = [""] * batch_size
-    corrector_used = [False] * batch_size
-
+    pred_l1_labels = [idx_to_label_l1[int(idx)] for idx in preds_l1.cpu().tolist()]
     pred_l2_labels = [""] * batch_size
     pred_l3_labels = [""] * batch_size
     final_preds = [""] * batch_size
 
     p_l1 = probs_l1.max(dim=1).values.detach().cpu().tolist()
-    p_l1_corrector = [None] * batch_size
     p_l2 = [None] * batch_size
     p_l3 = [None] * batch_size
 
-    non_shot_indices = [
-        idx for idx, label in enumerate(pred_l1_base_labels)
-        if label in {"passaggio", "no-action"}
-    ]
-
-    if model_l1_binary_corrector is not None and non_shot_indices:
-        if idx_to_label_l1_binary_corrector is None:
-            raise ValueError("idx_to_label_l1_binary_corrector mancante.")
-
-        non_shot_indices_tensor = torch.tensor(
-            non_shot_indices,
-            dtype=torch.long,
-            device=features.device,
-        )
-
-        corrector_features = features.index_select(0, non_shot_indices_tensor)
-        corrector_lengths = lengths.index_select(0, non_shot_indices_tensor)
-
-        corrector_tracking_features = None
-        corrector_tracking_sequences = None
-
-        if l1_binary_corrector_tracking_features is not None:
-            corrector_tracking_features = l1_binary_corrector_tracking_features.index_select(
-                0,
-                non_shot_indices_tensor,
-            )
-
-        if l1_binary_corrector_tracking_sequences is not None:
-            corrector_tracking_sequences = l1_binary_corrector_tracking_sequences.index_select(
-                0,
-                non_shot_indices_tensor,
-            )
-
-        corrector_features = append_level_tracking(
-            corrector_features,
-            tracking_features=corrector_tracking_features,
-            tracking_sequences=corrector_tracking_sequences,
-        )
-
-        logits_corrector = model_l1_binary_corrector(corrector_features, corrector_lengths)
-        probs_corrector = torch.softmax(logits_corrector, dim=1)
-        preds_corrector = probs_corrector.argmax(dim=1)
-
-        corrector_labels = [
-            idx_to_label_l1_binary_corrector[int(idx)]
-            for idx in preds_corrector.cpu().tolist()
-        ]
-        corrector_probs = probs_corrector.max(dim=1).values.detach().cpu().tolist()
-
-        for local_idx, global_idx in enumerate(non_shot_indices):
-            corrected_label = corrector_labels[local_idx]
-
-            if corrected_label not in {"passaggio", "no-action"}:
-                raise ValueError(
-                    f"Il correttore binario deve predire solo passaggio/no-action, "
-                    f"ma ha predetto: {corrected_label}"
-                )
-
-            pred_l1_labels[global_idx] = corrected_label
-            pred_l1_corrector_labels[global_idx] = corrected_label
-            p_l1_corrector[global_idx] = corrector_probs[local_idx]
-            corrector_used[global_idx] = True
-
-    shot_indices = [
-        idx for idx, label in enumerate(pred_l1_base_labels)
-        if label == "tiro"
-    ]
+    shot_indices = [idx for idx, label in enumerate(pred_l1_labels) if label == "tiro"]
 
     for idx, label_l1 in enumerate(pred_l1_labels):
         if label_l1 == "passaggio":
             final_preds[idx] = "passaggio"
         elif label_l1 == "no-action":
             final_preds[idx] = "no-action"
-        elif pred_l1_base_labels[idx] == "tiro":
+        elif label_l1 == "tiro":
             final_preds[idx] = "__pending_shot__"
         else:
             raise ValueError(f"Predizione L1 non riconosciuta: {label_l1}")
 
     if shot_indices:
-        shot_indices_tensor = torch.tensor(
-            shot_indices,
-            dtype=torch.long,
-            device=features.device,
-        )
-
+        shot_indices_tensor = torch.tensor(shot_indices, dtype=torch.long, device=features.device)
         shot_features = features.index_select(0, shot_indices_tensor)
         shot_lengths = lengths.index_select(0, shot_indices_tensor)
 
         shot_l2_tracking_features = None
         shot_l2_tracking_sequences = None
-
         if l2_tracking_features is not None:
             shot_l2_tracking_features = l2_tracking_features.index_select(0, shot_indices_tensor)
         if l2_tracking_sequences is not None:
@@ -807,7 +745,6 @@ def predict_hierarchical_batch(
 
         shot_l3_tracking_features = None
         shot_l3_tracking_sequences = None
-
         if l3_tracking_features is not None:
             shot_l3_tracking_features = l3_tracking_features.index_select(0, shot_indices_tensor)
         if l3_tracking_sequences is not None:
@@ -846,20 +783,7 @@ def predict_hierarchical_batch(
             p_l2[global_idx] = p_l2_shots[local_idx]
             p_l3[global_idx] = p_l3_shots[local_idx]
 
-    return (
-        final_preds,
-        pred_l1_labels,
-        pred_l1_base_labels,
-        pred_l1_corrector_labels,
-        corrector_used,
-        pred_l2_labels,
-        pred_l3_labels,
-        p_l1,
-        p_l1_corrector,
-        p_l2,
-        p_l3,
-    )
-
+    return final_preds, pred_l1_labels, pred_l2_labels, pred_l3_labels, p_l1, p_l2, p_l3
 
 def print_report(title: str, y_true, y_pred, labels):
     print(f"\n{title}")
@@ -919,23 +843,6 @@ def run_evaluation(args):
         label_mode="shot_outcome_only",
     )
 
-    model_l1_binary_corrector = None
-    idx_to_label_l1_binary_corrector = None
-    ckpt_l1_binary_corrector = None
-    config_l1_binary_corrector = None
-
-    if args.l1_binary_corrector_checkpoint is not None:
-        (
-            model_l1_binary_corrector,
-            idx_to_label_l1_binary_corrector,
-            ckpt_l1_binary_corrector,
-            config_l1_binary_corrector,
-        ) = load_checkpoint_model(
-            args.l1_binary_corrector_checkpoint,
-            device,
-            label_mode="passaggio_noaction_only",
-        )
-
     print("\n# Modelli caricati")
     print(f"L1 checkpoint: {args.l1_checkpoint}")
     print(f"L1 idx_to_label: {idx_to_label_l1}")
@@ -943,12 +850,6 @@ def run_evaluation(args):
     print(f"L2 idx_to_label: {idx_to_label_l2}")
     print(f"L3 checkpoint: {args.l3_checkpoint}")
     print(f"L3 idx_to_label: {idx_to_label_l3}")
-
-    if model_l1_binary_corrector is not None:
-        print(f"L1 binary corrector checkpoint: {args.l1_binary_corrector_checkpoint}")
-        print(f"L1 binary corrector idx_to_label: {idx_to_label_l1_binary_corrector}")
-    else:
-        print("L1 binary corrector: non usato")
 
     l3_tracking_features_csv = args.l3_tracking_features_csv or args.tracking_features_csv
     l3_tracking_sequences_npz = args.l3_tracking_sequences_npz or args.tracking_sequences_npz
@@ -982,30 +883,11 @@ def run_evaluation(args):
         missing_policy=args.tracking_missing_policy,
     )
 
-    l1_binary_corrector_tracking_type = "none"
-    l1_binary_corrector_tracking_store = None
-
-    if model_l1_binary_corrector is not None:
-        l1_binary_corrector_tracking_type, l1_binary_corrector_tracking_store = load_tracking_store_for_level(
-            level_name="L1 binary corrector",
-            checkpoint=ckpt_l1_binary_corrector,
-            config=config_l1_binary_corrector,
-            tracking_features_csv=args.l1_binary_corrector_tracking_features_csv,
-            tracking_sequences_npz=args.l1_binary_corrector_tracking_sequences_npz,
-            tracking_sequence_index=args.l1_binary_corrector_tracking_sequence_index,
-            missing_policy=args.tracking_missing_policy,
-        )
-
     original_mapping = original_idx_to_label()
 
     y_true_final = []
     y_pred_final = []
     rows = []
-
-    corrector_total_used = 0
-    corrector_changed = 0
-    corrector_passaggio_to_noaction = 0
-    corrector_noaction_to_passaggio = 0
 
     sample_offset = 0
 
@@ -1029,7 +911,6 @@ def run_evaluation(args):
             missing_policy=args.tracking_missing_policy,
             device=device,
         )
-
         (
             l2_tracking_features,
             l2_tracking_sequences,
@@ -1045,7 +926,6 @@ def run_evaluation(args):
             missing_policy=args.tracking_missing_policy,
             device=device,
         )
-
         (
             l3_tracking_features,
             l3_tracking_sequences,
@@ -1063,31 +943,11 @@ def run_evaluation(args):
         )
 
         (
-            l1_binary_corrector_tracking_features,
-            l1_binary_corrector_tracking_sequences,
-            l1_binary_corrector_tracking_available,
-        ) = build_tracking_batch(
-            tracking_type=l1_binary_corrector_tracking_type,
-            tracking_store=l1_binary_corrector_tracking_store,
-            dataset=dataset,
-            sample_offset=sample_offset,
-            labels=labels,
-            features=features,
-            lengths=lengths,
-            missing_policy=args.tracking_missing_policy,
-            device=device,
-        )
-
-        (
             final_preds,
             pred_l1_labels,
-            pred_l1_base_labels,
-            pred_l1_corrector_labels,
-            batch_corrector_used,
             pred_l2_labels,
             pred_l3_labels,
             p_l1,
-            p_l1_corrector,
             p_l2,
             p_l3,
         ) = predict_hierarchical_batch(
@@ -1105,10 +965,6 @@ def run_evaluation(args):
             l2_tracking_sequences=l2_tracking_sequences,
             l3_tracking_features=l3_tracking_features,
             l3_tracking_sequences=l3_tracking_sequences,
-            model_l1_binary_corrector=model_l1_binary_corrector,
-            idx_to_label_l1_binary_corrector=idx_to_label_l1_binary_corrector,
-            l1_binary_corrector_tracking_features=l1_binary_corrector_tracking_features,
-            l1_binary_corrector_tracking_sequences=l1_binary_corrector_tracking_sequences,
         )
 
         for i, original_idx in enumerate(labels):
@@ -1116,17 +972,6 @@ def run_evaluation(args):
             original_label = original_mapping[int(original_idx)]
             true_final = original_to_final_label(original_label)
             pred_final = final_preds[i]
-
-            if batch_corrector_used[i]:
-                corrector_total_used += 1
-
-                if pred_l1_base_labels[i] != pred_l1_labels[i]:
-                    corrector_changed += 1
-
-                    if pred_l1_base_labels[i] == "passaggio" and pred_l1_labels[i] == "no-action":
-                        corrector_passaggio_to_noaction += 1
-                    elif pred_l1_base_labels[i] == "no-action" and pred_l1_labels[i] == "passaggio":
-                        corrector_noaction_to_passaggio += 1
 
             y_true_final.append(true_final)
             y_pred_final.append(pred_final)
@@ -1138,21 +983,14 @@ def run_evaluation(args):
                     "original_label": original_label,
                     "true_final": true_final,
                     "pred_l1": pred_l1_labels[i],
-                    "pred_l1_base": pred_l1_base_labels[i],
-                    "pred_l1_corrector": pred_l1_corrector_labels[i],
-                    "pred_l1_after_corrector": pred_l1_labels[i],
-                    "corrector_used": int(batch_corrector_used[i]),
                     "pred_l2": pred_l2_labels[i],
                     "pred_l3": pred_l3_labels[i],
                     "pred_final": pred_final,
                     "p_l1": f"{p_l1[i]:.6f}",
-                    "p_l1_corrector": "" if p_l1_corrector[i] is None else f"{p_l1_corrector[i]:.6f}",
                     "p_l2": "" if p_l2[i] is None else f"{p_l2[i]:.6f}",
                     "p_l3": "" if p_l3[i] is None else f"{p_l3[i]:.6f}",
                     "tracking_used_l1": int(l1_tracking_store is not None),
                     "tracking_available_l1": int(l1_tracking_available[i]),
-                    "tracking_used_l1_binary_corrector": int(l1_binary_corrector_tracking_store is not None),
-                    "tracking_available_l1_binary_corrector": int(l1_binary_corrector_tracking_available[i]),
                     "tracking_used_l2": int(l2_tracking_store is not None),
                     "tracking_available_l2": int(l2_tracking_available[i]),
                     "tracking_used_l3": int(l3_tracking_store is not None),
@@ -1163,29 +1001,9 @@ def run_evaluation(args):
 
         sample_offset += len(labels)
 
-    if model_l1_binary_corrector is not None:
-        print("\n" + "=" * 80)
-        print("\n# Correttore binario L1 passaggio/no-action")
-        print(f"Campioni passati al correttore: {corrector_total_used}")
-        print(f"Predizioni modificate dal correttore: {corrector_changed}")
-        print(f"Conversioni passaggio -> no-action: {corrector_passaggio_to_noaction}")
-        print(f"Conversioni no-action -> passaggio: {corrector_noaction_to_passaggio}")
-
     acc = accuracy_score(y_true_final, y_pred_final)
-    macro_f1 = f1_score(
-        y_true_final,
-        y_pred_final,
-        labels=FINAL_LABELS,
-        average="macro",
-        zero_division=0,
-    )
-    weighted_f1 = f1_score(
-        y_true_final,
-        y_pred_final,
-        labels=FINAL_LABELS,
-        average="weighted",
-        zero_division=0,
-    )
+    macro_f1 = f1_score(y_true_final, y_pred_final, labels=FINAL_LABELS, average="macro", zero_division=0)
+    weighted_f1 = f1_score(y_true_final, y_pred_final, labels=FINAL_LABELS, average="weighted", zero_division=0)
 
     print("\n" + "=" * 80)
     print("\n# Valutazione gerarchica end-to-end")
@@ -1211,20 +1029,8 @@ def run_evaluation(args):
     y_pred_type = [final_to_type_label(label) for label in y_pred_final]
 
     type_acc = accuracy_score(y_true_type, y_pred_type)
-    type_macro_f1 = f1_score(
-        y_true_type,
-        y_pred_type,
-        labels=FINAL_TYPE_LABELS,
-        average="macro",
-        zero_division=0,
-    )
-    type_weighted_f1 = f1_score(
-        y_true_type,
-        y_pred_type,
-        labels=FINAL_TYPE_LABELS,
-        average="weighted",
-        zero_division=0,
-    )
+    type_macro_f1 = f1_score(y_true_type, y_pred_type, labels=FINAL_TYPE_LABELS, average="macro", zero_division=0)
+    type_weighted_f1 = f1_score(y_true_type, y_pred_type, labels=FINAL_TYPE_LABELS, average="weighted", zero_division=0)
 
     print("\n" + "=" * 80)
     print("\n# Valutazione collassata senza esito del tiro")
@@ -1263,6 +1069,7 @@ def parse_args():
     parser.add_argument("--l2-checkpoint", type=str, required=True)
     parser.add_argument("--l3-checkpoint", type=str, required=True)
 
+    # Argomenti legacy: mantenuti per retro-compatibilità e usati come fallback per L3.
     parser.add_argument(
         "--tracking-features-csv",
         type=str,
@@ -1319,44 +1126,6 @@ def parse_args():
                 "Default: tracking_sequence_index.json nella stessa cartella del file NPZ."
             ),
         )
-
-    parser.add_argument(
-        "--l1-binary-corrector-checkpoint",
-        type=str,
-        default=None,
-        help=(
-            "Checkpoint opzionale del correttore binario L1 passaggio/no-action. "
-            "Se specificato, viene applicato solo ai campioni che L1 predice come "
-            "passaggio o no-action; i campioni predetti come tiro non vengono modificati."
-        ),
-    )
-    parser.add_argument(
-        "--l1-binary-corrector-tracking-features-csv",
-        type=str,
-        default=None,
-        help=(
-            "CSV con feature tracking aggregate per il correttore binario L1, "
-            "se il checkpoint è stato addestrato con tracking aggregato."
-        ),
-    )
-    parser.add_argument(
-        "--l1-binary-corrector-tracking-sequences-npz",
-        type=str,
-        default=None,
-        help=(
-            "NPZ con sequenze tracking temporali per il correttore binario L1, "
-            "se il checkpoint è stato addestrato con tracking temporale."
-        ),
-    )
-    parser.add_argument(
-        "--l1-binary-corrector-tracking-sequence-index",
-        type=str,
-        default=None,
-        help=(
-            "JSON indice associato al file NPZ del correttore binario L1. "
-            "Default: tracking_sequence_index.json nella stessa cartella del file NPZ."
-        ),
-    )
 
     parser.add_argument(
         "--tracking-missing-policy",
