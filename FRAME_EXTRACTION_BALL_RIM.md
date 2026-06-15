@@ -299,6 +299,39 @@ data/datasets/ball_rim_yolo/
 Le immagini senza box sono state mantenute nel dataset, perché rappresentano esempi negativi utili per ridurre falsi positivi, soprattutto nei frame di `idle` e `non-gioco` in cui palla e/o canestro non sono visibili.
 
 
+### Dataset YOLO shot-only v3 con split corretti
+
+Per confrontare in modo più pulito il detector precedente basato solo sui tiri, è stato preparato anche un dataset YOLO `v3` limitato alle clip di tiro, ma con split di validation coerente con il dataset di action recognition.
+
+A differenza del detector `v1`, in cui la validation YOLO era ottenuta dal 10% dei 1183 frame provenienti dalle clip di train, il dataset `v3` usa:
+
+- tutti i **1183 frame di tiro train** come training set;
+- i **200 frame di tiro validation** provenienti da clip dello split `val` come validation set.
+
+Gli export CVAT usati per il dataset `v3` sono quindi:
+
+| Export CVAT | Split finale | Immagini | Note |
+|---|---|---:|---|
+| `train_part_01_cvat_yolo.zip` | train | 592 | Tiri train, parte 1 |
+| `train_part_02_cvat_yolo.zip` | train | 591 | Tiri train, parte 2 |
+| `val_cvat_yolo.zip` | val | 200 | Solo frame di tiro validation, filtrati tramite mapping |
+
+Il dataset è stato salvato in:
+
+```text
+data/datasets/ball_rim_yolo_shot_only_v3
+```
+
+con classi mantenute nello stesso ordine:
+
+```text
+0 = ball
+1 = rim
+```
+
+Questo dataset non sostituisce il dataset completo `v2`, ma serve come confronto specifico per gli esperimenti in cui il tracking palla/canestro viene usato soprattutto per distinguere l'esito del tiro nello Stadio 3. Il vantaggio rispetto al `v1` è che la validation non proviene più dalle stesse clip usate per il training, mentre il limite rispetto al `v2` è che non contiene esempi di `passaggio`, `idle` e `non-gioco`.
+
+
 ## Detector YOLO11m v1 precedente
 
 Prima dell'ampliamento del dataset palla/canestro è stato addestrato un primo detector YOLO11m, indicato come versione `v1`, usando esclusivamente frame estratti da clip di tiro del training set. Questo modello è stato utilizzato come primo generatore di feature tracking per gli esperimenti iniziali sullo Stadio 3 della gerarchia.
@@ -440,8 +473,292 @@ Per questo motivo, al termine del training compare il warning:
 
 Il training è comunque completato correttamente e il `best.pt` è stato salvato; il warning dipende solo dalla discrepanza tra il path atteso dallo script e il path effettivo generato da Ultralytics.
 
+
+## Addestramento del detector YOLO11m v3
+
+Dopo il detector completo `v2`, è stato addestrato anche un detector YOLO11m `v3` usando il dataset **shot-only con split corretti**. L'obiettivo di questo esperimento è confrontare il modello precedente basato sui soli tiri con una versione più corretta dal punto di vista della validation: tutti i 1183 frame di tiro del training vengono usati per l'addestramento, mentre la validation viene effettuata sui 200 frame di tiro provenienti da clip dello split `val`.
+
+Il training è stato avviato usando il dataset:
+
+```text
+data/datasets/ball_rim_yolo_shot_only_v3/data.yaml
+```
+
+e il modello è stato salvato in:
+
+```text
+runs/detect/outputs/ball_rim_detector/yolo11m_1280_v3/weights/best.pt
+```
+
+### Configurazione di training
+
+| Parametro | Valore |
+|---|---|
+| Modello iniziale | `yolo11m.pt` |
+| Dataset | `data/datasets/ball_rim_yolo_shot_only_v3/data.yaml` |
+| Risoluzione | `1280` |
+| Epoche massime | `150` |
+| Batch size | `8` |
+| Device | `0` |
+| Workers | `8` |
+| Seed | `42` |
+| Patience early stopping | `80` |
+| Cache | `False` |
+| Project | `runs/detect/outputs/ball_rim_detector` |
+| Nome esperimento | `yolo11m_1280_v3` |
+
+Le augmentation sono rimaste coerenti con il training del detector `v2`, mantenendo quindi la stessa configurazione di base del training YOLO.
+
+### Risultati del training
+
+L'addestramento si è fermato automaticamente dopo **109 epoche**, perché non sono stati osservati miglioramenti nelle ultime 80 epoche. Il miglior risultato è stato osservato all'**epoca 29**, e il modello migliore è stato salvato come `best.pt`.
+
+```text
+EarlyStopping: Training stopped early as no improvement observed in last 80 epochs.
+Best results observed at epoch 29, best model saved as best.pt.
+109 epochs completed in 1.555 hours.
+```
+
+La validazione finale del `best.pt` sui 200 frame di tiro dello split `val` ha prodotto i seguenti risultati:
+
+| Classe | Images | Instances | Precision | Recall | mAP50 | mAP50-95 |
+|---|---:|---:|---:|---:|---:|---:|
+| all | 200 | 393 | 0.970 | 0.967 | 0.982 | 0.597 |
+| ball | 193 | 193 | 0.952 | 0.969 | 0.978 | 0.598 |
+| rim | 200 | 200 | 0.989 | 0.965 | 0.987 | 0.596 |
+
+Il tempo medio riportato nella validazione finale è stato:
+
+| Fase | Tempo per immagine |
+|---|---:|
+| Preprocess | 1.5 ms |
+| Inference | 10.5 ms |
+| Postprocess | 0.3 ms |
+
+### Considerazioni sul detector v3
+
+Il detector `v3` ottiene metriche molto alte sui frame di tiro, con mAP50 pari a `0.982` e mAP50-95 pari a `0.597`. Rispetto al detector `v1`, il confronto è più corretto perché la validation è composta da frame provenienti da clip dello split `val`, non da una porzione delle clip di training. Rispetto al detector `v2`, invece, il confronto diretto delle metriche è meno immediato: `v3` viene validato solo sui tiri, mentre `v2` viene validato su un insieme più eterogeneo che comprende anche `passaggio`, `idle` e `non-gioco`.
+
+Dal punto di vista pratico, `v3` è un buon candidato per riestrarre feature di tracking da usare nello Stadio 3, dove il problema principale è distinguere `tiro0` da `tiro1`. Per Stadio 1 e Stadio 2 resta invece utile confrontarlo con `v2`: il `v2` è più adatto in teoria ai contesti generali perché è stato addestrato anche su frame non di tiro, mentre il `v3` permette di verificare se un detector specializzato sui tiri produce comunque feature utili anche quando viene applicato a tutte le clip.
+
+## Estrazione delle feature tracking con i detector YOLO11m v2 e v3
+
+Dopo l'addestramento dei detector `v2` e `v3`, le feature tracking palla/canestro vengono estratte su **tutte le clip del dataset di action recognition**, quindi sugli split `train`, `val` e `test` e su tutte le 9 classi. Questa scelta consente di riutilizzare lo stesso output non solo per lo Stadio 3, ma anche per lo Stadio 1 e lo Stadio 2 della gerarchia.
+
+Per ogni clip vengono campionati 48 frame in modo uniforme lungo l'intera durata della clip. Il detector YOLO produce le detection di `ball` e `rim`, dalle quali lo script salva sia feature aggregate per clip sia sequenze temporali per-frame. Le sequenze temporali sono quelle usate negli esperimenti più recenti, perché permettono di concatenare le informazioni di tracking alle feature DINOv3 lungo la dimensione temporale.
+
+### Estrazione feature con YOLO11m v2
+
+Il detector `v2` è quello addestrato sul dataset completo con tiri, passaggi, idle e non-gioco. È quindi il candidato più naturale per gli esperimenti su Stadio 1 e Stadio 2.
+
+```bash
+python -m src.features.extract_ball_rim_tracking_features \
+  --dataset-root data/datasets/dataset_basket_v1 \
+  --manifest data/datasets/dataset_basket_v1/manifest.csv \
+  --yolo-weights runs/detect/outputs/ball_rim_detector/yolo11m_1280_v2/weights/best.pt \
+  --output-dir data/features/ball_rim_tracking_temporal_all_yolo_v2 \
+  --splits train val test \
+  --num-frames 48 \
+  --sample-mode uniform \
+  --imgsz 1280 \
+  --conf 0.10 \
+  --iou 0.50 \
+  --device 0 \
+  --batch-size 16 \
+  --save-temporal-sequences \
+  --overwrite
+```
+
+### Estrazione feature con YOLO11m v3
+
+Il detector `v3` è quello addestrato sul dataset shot-only con split corretti. Pur essendo specializzato sui tiri, viene applicato a tutte le clip per poter confrontare in modo sistematico il suo contributo anche negli Stadi 1 e 2.
+
+```bash
+python -m src.features.extract_ball_rim_tracking_features \
+  --dataset-root data/datasets/dataset_basket_v1 \
+  --manifest data/datasets/dataset_basket_v1/manifest.csv \
+  --yolo-weights runs/detect/outputs/ball_rim_detector/yolo11m_1280_v3/weights/best.pt \
+  --output-dir data/features/ball_rim_tracking_temporal_all_yolo_v3 \
+  --splits train val test \
+  --num-frames 48 \
+  --sample-mode uniform \
+  --imgsz 1280 \
+  --conf 0.10 \
+  --iou 0.50 \
+  --device 0 \
+  --batch-size 16 \
+  --save-temporal-sequences \
+  --overwrite
+```
+
+Gli output principali generati da ciascuna estrazione sono:
+
+```text
+tracking_features.csv
+tracking_feature_names.json
+tracking_sequences.npz
+tracking_sequence_index.json
+tracking_sequence_feature_names.json
+extract_tracking_results.txt
+```
+
+In particolare, `tracking_sequences.npz` e `tracking_sequence_index.json` sono i file da usare nel training dei livelli gerarchici con tracking temporale. La soglia di confidenza YOLO è mantenuta bassa (`conf=0.10`) per ridurre il rischio di perdere la palla, che è l'oggetto più piccolo e più difficile da rilevare.
+
+
+## Estrazione feature tracking v4 con feature temporali estese
+
+Dopo l'estensione dello script `src/features/extract_ball_rim_tracking_features.py`, è stata definita una nuova estrazione di feature tracking, indicata come **v4**. La versione `v4` non corrisponde a un nuovo detector YOLO, ma a un nuovo schema di feature palla/canestro estratte a partire dalle detection del detector.
+
+Rispetto alla precedente rappresentazione temporale `temp29`, la nuova rappresentazione salva **43 feature temporali per frame**. Le nuove feature mantengono tutte le informazioni già presenti in `temp29` e aggiungono segnali più espliciti su:
+
+- possibile ingresso della palla nel rim;
+- sovrapposizione geometrica tra bounding box di palla e rim;
+- movimento assoluto della palla;
+- movimento relativo palla-rim;
+- componente orizzontale e verticale della traiettoria;
+- attraversamento verticale del livello del rim.
+
+Le feature aggregate per clip passano invece da 39 a **70 feature aggregate**. Anche se negli esperimenti più recenti viene usata soprattutto la rappresentazione temporale, il CSV aggregato viene comunque salvato per completezza e per eventuali confronti successivi.
+
+### Coerenza tra livelli gerarchici
+
+La stessa lista di feature temporali viene estratta per tutti gli stadi della gerarchia. Non esiste quindi una feature extraction diversa per L1, L2 e L3: cambia solo il detector YOLO usato e la cartella di output.
+
+La configurazione prevista, coerente con il miglior esperimento gerarchico attuale, è:
+
+| Uso previsto | Detector YOLO | Feature root | Tipo feature |
+|---|---|---|---|
+| Stadio 1 - `passaggio / tiro / no-action` | YOLO v2 | `data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2_v4` | `temp43` |
+| Stadio 2 - `tiroDaDue / tiroDaTre / tiroLibero` | YOLO v2 | `data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2_v4` | `temp43` |
+| Stadio 3 - `tiro0 / tiro1` | YOLO v1 | `data/features/ball_rim_tracking_temporal_clip_complete_yolo_v1_v4` | `temp43` |
+
+La scelta di usare YOLO v2 per L1 e L2 deriva dal fatto che il detector `v2` è stato addestrato anche su frame di contesto (`passaggio`, `idle`, `non-gioco`), quindi è più adatto ai livelli che operano anche fuori dai soli tiri. Per L3 si mantiene invece il confronto con YOLO v1, perché negli esperimenti precedenti il miglior Stadio 3 puro e il miglior end-to-end `exp_44` usavano proprio L3 con YOLO v1 temporale.
+
+### Parametri di estrazione
+
+I parametri principali vengono mantenuti coerenti con le estrazioni temporali precedenti:
+
+| Parametro | Valore |
+|---|---|
+| Split processati | `train val test` |
+| Classi processate | tutte le 9 classi del dataset |
+| Frame per clip | `48` |
+| Campionamento | `uniform` |
+| Risoluzione YOLO | `1280` |
+| Confidenza YOLO | `0.10` |
+| IoU NMS | `0.50` |
+| Batch size YOLO | `16` |
+| Salvataggio sequenze temporali | attivo |
+| Missing policy nei training successivi | `error` |
+
+L'unico parametro aggiuntivo introdotto dalla nuova estrazione è:
+
+| Parametro | Valore | Significato |
+|---|---:|---|
+| `--rim-inside-margin` | `0.15` | Espande il bbox del rim del 15% per lato per calcolare il proxy `ball_center_inside_expanded_rim` |
+
+Il valore `0.15` non modifica le detection YOLO, ma solo il calcolo delle feature geometriche derivate. Serve a rendere meno rigido il proxy di ingresso della palla nel canestro, perché il bounding box del rim non coincide sempre perfettamente con il cilindro reale del ferro.
+
+### Nuove feature temporali principali
+
+Le nuove feature temporali aggiunte rispetto a `temp29` sono:
+
+```text
+ball_center_inside_rim
+ball_center_inside_expanded_rim
+ball_rim_iou
+abs_ball_vx
+abs_ball_vy
+ball_motion_horizontal_ratio
+ball_motion_vertical_ratio
+ball_relative_vx
+ball_relative_vy
+ball_relative_speed
+ball_rim_approach_speed
+ball_rim_departure_speed
+ball_crosses_rim_y_downward
+ball_crosses_rim_y_upward
+```
+
+Queste feature hanno due obiettivi principali. Per L3 dovrebbero aiutare a distinguere meglio `tiro0` e `tiro1`, perché descrivono in modo più diretto l'interazione tra palla e canestro. Per L1 dovrebbero aiutare la distinzione tra `passaggio` e `no-action`, perché descrivono velocità, direzione e regolarità del moto della palla.
+
+### Estrazione feature v4 con YOLO11m v2 per L1/L2
+
+```bash
+python -m src.features.extract_ball_rim_tracking_features \
+  --dataset-root data/datasets/dataset_basket_v1 \
+  --manifest data/datasets/dataset_basket_v1/manifest.csv \
+  --yolo-weights runs/detect/outputs/ball_rim_detector/yolo11m_1280_v2/weights/best.pt \
+  --output-dir data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2_v4 \
+  --splits train val test \
+  --num-frames 48 \
+  --sample-mode uniform \
+  --imgsz 1280 \
+  --conf 0.10 \
+  --iou 0.50 \
+  --device 0 \
+  --batch-size 16 \
+  --rim-inside-margin 0.15 \
+  --save-temporal-sequences \
+  --overwrite
+```
+
+### Estrazione feature v4 con YOLO11m v1 per L3
+
+```bash
+python -m src.features.extract_ball_rim_tracking_features \
+  --dataset-root data/datasets/dataset_basket_v1 \
+  --manifest data/datasets/dataset_basket_v1/manifest.csv \
+  --yolo-weights runs/detect/outputs/ball_rim_detector/yolo11m_1280_v1/weights/best.pt \
+  --output-dir data/features/ball_rim_tracking_temporal_clip_complete_yolo_v1_v4 \
+  --splits train val test \
+  --num-frames 48 \
+  --sample-mode uniform \
+  --imgsz 1280 \
+  --conf 0.10 \
+  --iou 0.50 \
+  --device 0 \
+  --batch-size 16 \
+  --rim-inside-margin 0.15 \
+  --save-temporal-sequences \
+  --overwrite
+```
+
+Gli output generati restano gli stessi delle estrazioni precedenti:
+
+```text
+tracking_features.csv
+tracking_feature_names.json
+tracking_sequences.npz
+tracking_sequence_index.json
+tracking_sequence_feature_names.json
+extract_tracking_results.txt
+```
+
+Per i training con feature temporali devono essere usati soprattutto:
+
+```text
+tracking_sequences.npz
+tracking_sequence_index.json
+```
+
+### Utilizzo nei prossimi esperimenti
+
+Le nuove feature `temp43` non sono compatibili con i checkpoint già addestrati con `temp29`, perché cambia la dimensione dell'input tracking. Dopo l'estrazione v4 bisogna quindi riaddestrare i livelli interessati.
+
+La sequenza consigliata è:
+
+1. riaddestrare L3 con `data/features/ball_rim_tracking_temporal_clip_complete_yolo_v1_v4`;
+2. confrontare il nuovo L3 con `exp_l3_yolo_v1_temp29_shots_d256_mean`;
+3. riaddestrare L1 con `data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2_v4`;
+4. solo se L1/L3 migliorano, ricostruire l'end-to-end partendo dalla configurazione di `exp_44`.
+
+In questo modo `exp_44` resta il riferimento principale, mentre le nuove feature vengono valutate come ablation controllata e non come sostituzione automatica del miglior modello attuale.
+
 ## Utilizzo previsto
 
-Il detector YOLO11m v2 addestrato su questo dataset verrà utilizzato per estrarre feature di tracking palla/canestro sulle clip del dataset. Le feature potranno essere impiegate nei modelli di action recognition, sia per i livelli che distinguono le azioni generali sia per il livello relativo all'esito del tiro.
+I detector YOLO11m addestrati verranno utilizzati per estrarre feature di tracking palla/canestro sulle clip del dataset. Le feature potranno essere impiegate nei modelli di action recognition, sia nei livelli che distinguono le azioni generali sia nel livello relativo all'esito del tiro.
 
-Il modello precedente resta utile come baseline storica, ma il nuovo detector è più adatto agli esperimenti successivi perché è stato addestrato anche su passaggio, idle e non-gioco ed è stato validato su frame provenienti dallo split `val`, quindi su clip diverse da quelle di training.
+Il detector `v1` resta una baseline storica: è utile per interpretare i primi esperimenti sullo Stadio 3, ma la sua validation era interna alle clip di train. Il detector `v2` è il modello più indicato per gli esperimenti su Stadio 1 e Stadio 2, perché è stato addestrato anche su `passaggio`, `idle` e `non-gioco`. Il detector `v3` è invece il confronto più pulito per gli esperimenti shot-only, perché usa tutti i frame di tiro train per l'addestramento e i frame di tiro dello split `val` per la validation.
+
+Per i prossimi esperimenti rimangono disponibili le estrazioni storiche `temp29`, ma la nuova linea di lavoro è basata sulle feature `temp43` della versione `v4`. In particolare, la configurazione da confrontare con `exp_44` usa YOLO v2 per L1/L2 e YOLO v1 per L3, mantenendo gli stessi parametri di campionamento e inferenza YOLO delle estrazioni precedenti.

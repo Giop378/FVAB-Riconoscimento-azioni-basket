@@ -75,6 +75,8 @@ def build_label_mapping(label_mode: str):
     - action_group: passaggio / tiro / idle / non-gioco.
     - shot_type_only: solo clip di tiro, classificate per tipo.
     - shot_outcome_only: solo clip di tiro, classificate per esito.
+    - passaggio_noaction_only: solo clip passaggio/idle/non-gioco,
+      con idle e non-gioco collassati in no-action.
     """
     original_idx_to_label = get_original_idx_to_label()
 
@@ -187,6 +189,17 @@ def build_label_mapping(label_mode: str):
             "tiroDaDue1": "tiro1",
             "tiroDaTre1": "tiro1",
             "tiroLibero1": "tiro1",
+        }
+
+    elif label_mode == "passaggio_noaction_only":
+        idx_to_label = {
+            0: "passaggio",
+            1: "no-action",
+        }
+        label_mapping = {
+            "passaggio": "passaggio",
+            "idle": "no-action",
+            "non-gioco": "no-action",
         }
 
     else:
@@ -983,10 +996,12 @@ def parse_args():
             "action_group",
             "shot_type_only",
             "shot_outcome_only",
+            "passaggio_noaction_only",
         ],
         help=(
             "Modalità di etichettatura. "
-            "Per la gerarchia usare: action_noaction, shot_type_only, shot_outcome_only."
+            "Per la gerarchia usare: action_noaction, shot_type_only, shot_outcome_only. "
+            "Per il correttore binario L1 usare: passaggio_noaction_only."
         ),
     )
 
