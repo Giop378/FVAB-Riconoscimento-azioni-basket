@@ -1031,16 +1031,7 @@ outputs/exp_46_hier_best_per_level_l1temp43_l2temp29_l3temp43
 
 `exp_46` è preferibile a `exp_45` perché ottiene un miglioramento molto più consistente senza introdurre soglie selezionate su validation. `exp_45` resta documentato come ablation di post-processing, ma non viene scelto come modello finale.
 
-## Cosa manca ancora
-
-Con i file forniti sono stati aggiunti anche:
-
-- risultati completi di `exp_l1_yolo_v2_temp43_allclips_d256_mean`;
-- risultati completi di `exp_l2_yolo_v2_temp43_allclips_d256_mean`;
-- risultati completi di `exp_l3_yolo_v1_temp43_shots_d256_mean`;
-- valutazione end-to-end completa di `exp_46_hier_best_per_level_l1temp43_l2temp29_l3temp43`.
-
-Dal punto di vista delle metriche principali, il confronto ora è abbastanza completo per giustificare la scelta operativa:
+Il miglior esperimento effettuato fino ad ora è quindi strutturato così:
 
 ```text
 L1 migliore: YOLO v2 temp43
@@ -1049,27 +1040,4 @@ L3 migliore: YOLO v1 temp43
 End-to-end migliore: exp_46
 ```
 
-Restano eventualmente utili, ma non bloccanti:
 
-1. **Ablation end-to-end parziali con `temp43`**, per isolare il contributo di ogni livello:
-   - L1 `temp43`, L2 `temp29`, L3 `temp29`;
-   - L1 `temp29`, L2 `temp29`, L3 `temp43`;
-   - L1 `temp29`, L2 `temp43`, L3 `temp29`.
-
-   Questo chiarirebbe quanto del guadagno di `exp_46` arriva da L1 e quanto da L3. Non è indispensabile perché i singoli livelli indicano già chiaramente che L1 e L3 migliorano, mentre L2 peggiora con `temp43`.
-
-2. **Confronto `temp43` su altri detector**, solo se si vuole completare in modo molto rigoroso il confronto tra YOLO:
-   - L1 YOLO v1/v3 con `temp43`;
-   - L2 YOLO v1/v3 con `temp43`;
-   - L3 YOLO v2/v3 con `temp43`.
-
-   Anche questi non sono bloccanti: per ora ha senso concentrarsi sui detector già migliori per livello.
-
-3. **Comando esatto o `results.txt` completo di due esperimenti storici**, utile solo per completezza della sezione comandi/training:
-
-```text
-exp_l1_yolo_v1_temp29_allclips_d256_mean
-exp_l2_yolo_v1_temp29_allclips_d256_mean
-```
-
-Le metriche aggregate e i report per classe di questi due esperimenti sono già presenti, quindi non sono necessari per scegliere il modello finale.
