@@ -178,6 +178,49 @@ TEMPORAL_TRACKING_FEATURE_NAMES = [
 ]
 
 
+# Set storico a 29 feature usato dai checkpoint temporali "temp29".
+# L'ordine deve restare identico a quello salvato nei checkpoint.
+TEMPORAL_TRACKING_FEATURE_NAMES_TEMP29 = [
+    "t_rel",
+    "ball_detected",
+    "rim_detected",
+    "both_detected",
+    "ball_conf",
+    "rim_conf",
+    "ball_xc",
+    "ball_yc",
+    "ball_w",
+    "ball_h",
+    "ball_area",
+    "rim_xc",
+    "rim_yc",
+    "rim_w",
+    "rim_h",
+    "rim_area",
+    "dx",
+    "dy",
+    "ball_rim_dist",
+    "ball_near_rim",
+    "ball_above_rim",
+    "ball_below_rim",
+    "ball_vx",
+    "ball_vy",
+    "ball_speed",
+    "ball_ax",
+    "ball_ay",
+    "ball_acceleration",
+    "ball_rim_dist_delta",
+]
+
+# Set esteso a 43 feature usato dai checkpoint "temp43".
+TEMPORAL_TRACKING_FEATURE_NAMES_TEMP43 = TEMPORAL_TRACKING_FEATURE_NAMES
+
+TEMPORAL_TRACKING_FEATURE_SETS = {
+    "temp29": TEMPORAL_TRACKING_FEATURE_NAMES_TEMP29,
+    "temp43": TEMPORAL_TRACKING_FEATURE_NAMES_TEMP43,
+}
+
+
 class Tee:
     def __init__(self, *streams):
         self.streams = streams
@@ -843,7 +886,7 @@ def aggregate_clip_features(frame_rows, fps, near_threshold):
 
     return {name: safe_float(features.get(name, 0.0), default=0.0) for name in TRACKING_FEATURE_NAMES}
 
-def compute_temporal_sequence_features(frame_rows, fps):
+def compute_temporal_sequence_features(frame_rows, fps, temporal_feature_names=None):
     """
     Converte le detection per-frame in una sequenza [S, K] di feature temporali.
 
@@ -852,10 +895,13 @@ def compute_temporal_sequence_features(frame_rows, fps):
     palla-canestro, velocità assoluta, velocità relativa palla-rim e proxy
     dell'ingresso della palla nel ferro.
     """
+    if temporal_feature_names is None:
+        temporal_feature_names = TEMPORAL_TRACKING_FEATURE_NAMES_TEMP43
+
     rows = sorted(frame_rows, key=lambda r: int(r["frame_order"]))
 
     if not rows:
-        return np.zeros((0, len(TEMPORAL_TRACKING_FEATURE_NAMES)), dtype=np.float32)
+        return np.zeros((0, len(temporal_feature_names)), dtype=np.float32)
 
     sequence_rows = []
     prev_row = None
@@ -973,7 +1019,7 @@ def compute_temporal_sequence_features(frame_rows, fps):
 
         sequence_rows.append([
             safe_float(feature_values[name], default=0.0)
-            for name in TEMPORAL_TRACKING_FEATURE_NAMES
+            for name in temporal_feature_names
         ])
 
         if current_velocity_valid:
@@ -1134,10 +1180,13 @@ def write_csv(path: Path, rows, fieldnames):
             writer.writerow(cleaned)
 
 
-def write_temporal_sequences(output_dir: Path, sequence_entries):
+def write_temporal_sequences(output_dir: Path, sequence_entries, temporal_feature_names=None):
     """
     Salva le sequenze tracking in formato NPZ più un indice JSON path -> array.
     """
+    if temporal_feature_names is None:
+        temporal_feature_names = TEMPORAL_TRACKING_FEATURE_NAMES_TEMP43
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     npz_path = output_dir / "tracking_sequences.npz"
@@ -1148,8 +1197,8 @@ def write_temporal_sequences(output_dir: Path, sequence_entries):
     index = {
         "type": "temporal_sequence",
         "npz_path": str(npz_path),
-        "feature_names": TEMPORAL_TRACKING_FEATURE_NAMES,
-        "num_features": len(TEMPORAL_TRACKING_FEATURE_NAMES),
+        "feature_names": temporal_feature_names,
+        "num_features": len(temporal_feature_names),
         "sequences": {},
     }
 
@@ -1175,8 +1224,8 @@ def write_temporal_sequences(output_dir: Path, sequence_entries):
     with open(feature_names_path, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "feature_names": TEMPORAL_TRACKING_FEATURE_NAMES,
-                "num_features": len(TEMPORAL_TRACKING_FEATURE_NAMES),
+                "feature_names": temporal_feature_names,
+                "num_features": len(temporal_feature_names),
             },
             f,
             indent=2,
@@ -1382,6 +1431,18 @@ def parse_args():
     parser.set_defaults(save_temporal_sequences=True)
 
     parser.add_argument(
+        "--temporal-feature-set",
+        type=str,
+        default="temp43",
+        choices=sorted(TEMPORAL_TRACKING_FEATURE_SETS.keys()),
+        help=(
+            "Set di feature temporali da salvare. "
+            "temp29 mantiene la compatibilita' con i checkpoint storici; "
+            "temp43 usa la versione estesa corrente."
+        ),
+    )
+
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Permette di sovrascrivere file già esistenti.",
@@ -1391,6 +1452,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    temporal_feature_names = TEMPORAL_TRACKING_FEATURE_SETS[args.temporal_feature_set]
 
     dataset_root = Path(args.dataset_root)
     manifest_path = Path(args.manifest)
@@ -1430,6 +1492,7 @@ def main():
             print("\n# Configurazione")
             for key, value in vars(args).items():
                 print(f"{key}: {value}")
+            print(f"temporal_feature_count: {len(temporal_feature_names)}")
 
             print("\n# Controllo path")
             print(f"dataset_root: {dataset_root}")
@@ -1528,6 +1591,7 @@ def main():
                         temporal_sequence = compute_temporal_sequence_features(
                             frame_rows=frame_rows,
                             fps=float(clip_row.get("fps", 25.0)),
+                            temporal_feature_names=temporal_feature_names,
                         )
                         temporal_sequence_entries.append(
                             {
@@ -1640,6 +1704,7 @@ def main():
                 npz_path, index_path, sequence_feature_names_path = write_temporal_sequences(
                     output_dir=output_dir,
                     sequence_entries=temporal_sequence_entries,
+                    temporal_feature_names=temporal_feature_names,
                 )
                 print(f"Sequenze tracking temporali salvate in: {npz_path}")
                 print(f"Indice sequenze tracking salvato in: {index_path}")
@@ -1659,7 +1724,8 @@ def main():
             print(f"Clip con errore: {len(errors)}")
             print(f"Numero feature tracking aggregate: {len(TRACKING_FEATURE_NAMES)}")
             if args.save_temporal_sequences:
-                print(f"Numero feature tracking temporali per frame: {len(TEMPORAL_TRACKING_FEATURE_NAMES)}")
+                print(f"Set feature tracking temporali: {args.temporal_feature_set}")
+                print(f"Numero feature tracking temporali per frame: {len(temporal_feature_names)}")
                 print(f"Sequenze temporali salvate: {len(temporal_sequence_entries)}")
 
         except Exception:
