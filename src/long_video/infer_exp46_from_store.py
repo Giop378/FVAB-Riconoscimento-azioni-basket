@@ -909,11 +909,60 @@ def build_available_tracking_features(
     ball_inside_rim_x = ((ball_xc >= rim_x1) & (ball_xc <= rim_x2) & (both_detected > 0.5)).astype(np.float32)
     ball_inside_rim_y = ((ball_yc >= rim_y1) & (ball_yc <= rim_y2) & (both_detected > 0.5)).astype(np.float32)
     ball_inside_rim_bbox = (ball_inside_rim_x * ball_inside_rim_y).astype(np.float32)
+
+    # Feature temp43 richieste dai checkpoint exp_46.
+    # Sono ricostruite a partire dalle primitive salvate nella feature store
+    # long-video, mantenendo una semantica per-frame/finestra coerente con
+    # le sequenze temporali usate in training.
+    expanded_rim_w = rim_w * 1.5
+    expanded_rim_h = rim_h * 1.5
+    expanded_rim_x1 = rim_xc - expanded_rim_w * 0.5
+    expanded_rim_x2 = rim_xc + expanded_rim_w * 0.5
+    expanded_rim_y1 = rim_yc - expanded_rim_h * 0.5
+    expanded_rim_y2 = rim_yc + expanded_rim_h * 0.5
+
+    ball_center_inside_expanded_rim = (
+        (ball_xc >= expanded_rim_x1)
+        & (ball_xc <= expanded_rim_x2)
+        & (ball_yc >= expanded_rim_y1)
+        & (ball_yc <= expanded_rim_y2)
+        & (both_detected > 0.5)
+    ).astype(np.float32)
+
+    inter_x1 = np.maximum(ball_x1, rim_x1)
+    inter_y1 = np.maximum(ball_y1, rim_y1)
+    inter_x2 = np.minimum(ball_x2, rim_x2)
+    inter_y2 = np.minimum(ball_y2, rim_y2)
+    inter_w = np.maximum(0.0, inter_x2 - inter_x1)
+    inter_h = np.maximum(0.0, inter_y2 - inter_y1)
+    inter_area = (inter_w * inter_h).astype(np.float32)
+    union_area = np.maximum(ball_area + rim_area - inter_area, 1e-6)
+    ball_rim_iou = (inter_area / union_area * both_detected).astype(np.float32)
+
     ball_above_rim = ((ball_yc < rim_yc) & (both_detected > 0.5)).astype(np.float32)
     ball_below_rim = ((ball_yc > rim_yc) & (both_detected > 0.5)).astype(np.float32)
     ball_left_of_rim = ((ball_xc < rim_xc) & (both_detected > 0.5)).astype(np.float32)
     ball_right_of_rim = ((ball_xc > rim_xc) & (both_detected > 0.5)).astype(np.float32)
     ball_near_rim = ((rel_dist <= np.maximum(rim_w, rim_h) * 1.5) & (both_detected > 0.5)).astype(np.float32)
+    ball_passes_close_to_rim = np.full((n,), float(ball_near_rim.max() if n > 0 else 0.0), dtype=np.float32)
+
+    motion_den = np.maximum(np.abs(ball_vx) + np.abs(ball_vy), 1e-6)
+    ball_motion_horizontal_ratio = (np.abs(ball_vx) / motion_den).astype(np.float32)
+    ball_motion_vertical_ratio = (np.abs(ball_vy) / motion_den).astype(np.float32)
+
+    ball_rim_dist_delta = (delta_previous(rel_dist) * both_detected).astype(np.float32)
+    ball_relative_vx = (ball_vx - rim_vx).astype(np.float32)
+    ball_relative_vy = (ball_vy - rim_vy).astype(np.float32)
+    ball_relative_speed = np.sqrt(ball_relative_vx * ball_relative_vx + ball_relative_vy * ball_relative_vy).astype(np.float32)
+    ball_rim_approach_speed = np.maximum(-ball_rim_dist_delta, 0.0).astype(np.float32)
+    ball_rim_departure_speed = np.maximum(ball_rim_dist_delta, 0.0).astype(np.float32)
+
+    prev_rel_y = np.concatenate([rel_y[:1], rel_y[:-1]]) if n > 0 else rel_y
+    prev_both = np.concatenate([both_detected[:1], both_detected[:-1]]) if n > 0 else both_detected
+    valid_cross = (both_detected > 0.5) & (prev_both > 0.5)
+    crosses_down = ((prev_rel_y < 0.0) & (rel_y >= 0.0) & valid_cross).astype(np.float32)
+    crosses_up = ((prev_rel_y > 0.0) & (rel_y <= 0.0) & valid_cross).astype(np.float32)
+    crosses_any = np.maximum(crosses_down, crosses_up).astype(np.float32)
 
     # Dizionario canonico.
     available: dict[str, np.ndarray] = {
@@ -959,10 +1008,15 @@ def build_available_tracking_features(
         "rim_area": rim_area,
         "rim_aspect": rim_aspect,
         "rim_aspect_ratio": rim_aspect,
+        "dx": rel_x_masked,
+        "dy": rel_y_masked,
         "ball_rim_dx": rel_x_masked,
         "ball_rim_dy": rel_y_masked,
         "ball_rim_dist": rel_dist_masked,
         "ball_rim_distance": rel_dist_masked,
+        "ball_rim_dist_delta": ball_rim_dist_delta,
+        "ball_rim_delta": ball_rim_dist_delta,
+        "ball_rim_iou": ball_rim_iou,
         "ball_to_rim_dx": rel_x_masked,
         "ball_to_rim_dy": rel_y_masked,
         "ball_to_rim_dist": rel_dist_masked,
@@ -1007,11 +1061,20 @@ def build_available_tracking_features(
         "ball_rim_vx": rel_vx,
         "ball_rim_vy": rel_vy,
         "ball_rim_speed": rel_speed,
+        "ball_relative_vx": ball_relative_vx,
+        "ball_relative_vy": ball_relative_vy,
+        "ball_relative_speed": ball_relative_speed,
+        "ball_rim_approach_speed": ball_rim_approach_speed,
+        "ball_rim_departure_speed": ball_rim_departure_speed,
+        "ball_motion_horizontal_ratio": ball_motion_horizontal_ratio,
+        "ball_motion_vertical_ratio": ball_motion_vertical_ratio,
         "num_ball_detections": get("num_ball_detections"),
         "num_rim_detections": get("num_rim_detections"),
         "ball_inside_rim_x": ball_inside_rim_x,
         "ball_inside_rim_y": ball_inside_rim_y,
         "ball_inside_rim_bbox": ball_inside_rim_bbox,
+        "ball_center_inside_rim": ball_inside_rim_bbox,
+        "ball_center_inside_expanded_rim": ball_center_inside_expanded_rim,
         "ball_in_rim_x": ball_inside_rim_x,
         "ball_in_rim_y": ball_inside_rim_y,
         "ball_in_rim": ball_inside_rim_bbox,
@@ -1020,6 +1083,10 @@ def build_available_tracking_features(
         "ball_left_of_rim": ball_left_of_rim,
         "ball_right_of_rim": ball_right_of_rim,
         "ball_near_rim": ball_near_rim,
+        "ball_passes_close_to_rim": ball_passes_close_to_rim,
+        "ball_crosses_rim_y_frame": crosses_any,
+        "ball_crosses_rim_y_downward_frame": crosses_down,
+        "ball_crosses_rim_y_upward_frame": crosses_up,
     }
 
     # Aggiunge anche tutte le primitive dirette non già normalizzate.
