@@ -48,6 +48,10 @@ SHOT_TYPE_TO_PREFIX = {
 
 # Candidati import del modello. Il primo dovrebbe essere quello del progetto.
 MODEL_CLASS_CANDIDATES = [
+    # Nome reale usato nel progetto. Vedi src/models/temporal_transformer_classifier.py.
+    ("src.models.temporal_transformer_classifier", "TemporalTransformerActionClassifier"),
+
+    # Alias/fallback mantenuti per compatibilità con eventuali versioni precedenti.
     ("src.models.temporal_transformer_classifier", "TemporalTransformerClassifier"),
     ("src.models.temporal_transformer_classifier", "TemporalTransformer"),
     ("src.models.temporal_transformer_classifier", "TransformerClassifier"),
@@ -358,22 +362,99 @@ def strip_state_dict_prefixes(state_dict: dict[str, torch.Tensor]) -> dict[str, 
 
 
 def import_model_class() -> type[nn.Module]:
+    """Importa la classe del modello temporale.
+
+    Nel progetto la classe reale si chiama TemporalTransformerActionClassifier.
+    Manteniamo comunque un fallback automatico per evitare che la pipeline si rompa
+    se in futuro il file viene rinominato o vengono aggiunti alias.
+    """
     errors: list[str] = []
+
     for module_name, class_name in MODEL_CLASS_CANDIDATES:
         try:
             module = importlib.import_module(module_name)
             cls = getattr(module, class_name)
-            if not issubclass(cls, nn.Module):
+            if not inspect.isclass(cls) or not issubclass(cls, nn.Module):
                 errors.append(f"{module_name}.{class_name}: non è una sottoclasse nn.Module")
                 continue
+            print(f"[INFO] Classe modello importata: {module_name}.{class_name}")
             return cls
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{module_name}.{class_name}: {type(exc).__name__}: {exc}")
-    raise ImportError(
-        "Impossibile importare la classe del classificatore temporale. Tentativi:\n"
-        + "\n".join(errors)
-    )
 
+    # Fallback: cerca automaticamente una classe nn.Module definita nel modulo del progetto.
+    module_name = "src.models.temporal_transformer_classifier"
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:  # noqa: BLE001
+        raise ImportError(
+            f"Impossibile importare il modulo {module_name}.\n"
+            f"Errore: {type(exc).__name__}: {exc}\n\n"
+            "Tentativi precedenti:\n" + "\n".join(errors)
+        ) from exc
+
+    candidates: list[tuple[int, str, type[nn.Module], Any]] = []
+
+    for name, obj in vars(module).items():
+        if not inspect.isclass(obj):
+            continue
+        try:
+            if not issubclass(obj, nn.Module):
+                continue
+        except TypeError:
+            continue
+
+        # Evita classi importate da torch o classi ausiliarie definite altrove.
+        if getattr(obj, "__module__", None) != module.__name__:
+            continue
+
+        lower_name = name.lower()
+        if "positional" in lower_name or "encoding" in lower_name:
+            continue
+
+        try:
+            sig = inspect.signature(obj)
+        except Exception:  # noqa: BLE001
+            sig = None
+
+        score = 0
+        for token in ["classifier", "transformer", "temporal", "action", "video"]:
+            if token in lower_name:
+                score += 5
+
+        if sig is not None:
+            params = set(sig.parameters.keys())
+            for token in [
+                "input_dim",
+                "d_model",
+                "num_layers",
+                "num_heads",
+                "dim_feedforward",
+                "ff_dim",
+                "num_classes",
+                "dropout",
+                "pooling",
+                "max_len",
+                "last_mean_ratio",
+            ]:
+                if token in params:
+                    score += 2
+
+        candidates.append((score, name, obj, sig))
+
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        score, name, cls, sig = candidates[0]
+        print(
+            f"[INFO] Classe modello rilevata automaticamente: "
+            f"{module_name}.{name} | score={score} | signature={sig}"
+        )
+        return cls
+
+    raise ImportError(
+        "Impossibile importare la classe del classificatore temporale.\n"
+        "Tentativi espliciti:\n" + "\n".join(errors)
+    )
 
 def get_num_classes_from_state_dict(state_dict: dict[str, torch.Tensor]) -> int | None:
     candidates: list[tuple[str, torch.Tensor]] = []
@@ -391,6 +472,14 @@ def get_num_classes_from_state_dict(state_dict: dict[str, torch.Tensor]) -> int 
 
 def normalize_model_config(model_config: dict[str, Any], num_classes: int) -> dict[str, Any]:
     config = dict(model_config)
+
+    # I checkpoint storici possono salvare la feed-forward dimension come ff_dim,
+    # mentre TemporalTransformerActionClassifier usa dim_feedforward.
+    if "dim_feedforward" not in config and "ff_dim" in config:
+        config["dim_feedforward"] = config["ff_dim"]
+    if "ff_dim" not in config and "dim_feedforward" in config:
+        config["ff_dim"] = config["dim_feedforward"]
+
     config.setdefault("num_classes", num_classes)
     config.setdefault("n_classes", num_classes)
     config.setdefault("num_labels", num_classes)
@@ -594,8 +683,10 @@ def model_forward_logits(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
     padding_mask = torch.zeros((x.shape[0], x.shape[1]), dtype=torch.bool, device=x.device)
 
     attempts: list[Callable[[], Any]] = [
-        lambda: model(x),
+        # TemporalTransformerActionClassifier del progetto richiede features e lengths.
         lambda: model(x, lengths=lengths),
+        lambda: model(x, lengths),
+        lambda: model(x),
         lambda: model(x, padding_mask=padding_mask),
         lambda: model(x, src_key_padding_mask=padding_mask),
         lambda: model(x, mask=padding_mask),
