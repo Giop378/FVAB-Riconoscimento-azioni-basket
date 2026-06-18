@@ -11,6 +11,7 @@ La pipeline è divisa in fasi:
 4. infer_exp46_from_store.py
 5. postprocess_events.py
 6. render_preview.py
+7. evaluate_events_from_manifest.py
 ```
 
 La logica generale è:
@@ -22,6 +23,7 @@ video lungo
   -> inferenza exp_46
   -> post-processing eventi
   -> preview video annotata
+  -> valutazione automatica event-level su manifest.csv
 ```
 
 ---
@@ -101,6 +103,71 @@ L3 -> 43 feature tracking
 ```
 
 Se questo controllo fallisce, non proseguire con la pipeline.
+
+---
+
+## 1B. Valutazione automatica su `manifest.csv`
+
+Dopo aver prodotto `events_postprocessed.csv`, la pipeline può essere valutata automaticamente confrontando gli eventi predetti con le annotazioni presenti in:
+
+```text
+data/datasets/dataset_basket_v1/manifest.csv
+```
+
+La valutazione long-video considera **solo le 7 azioni reali**:
+
+```text
+passaggio
+tiroDaDue0
+tiroDaDue1
+tiroDaTre0
+tiroDaTre1
+tiroLibero0
+tiroLibero1
+```
+
+Le classi `idle`, `non-gioco` e `no-action` non vengono valutate come eventi finali.
+
+Una predizione viene considerata corretta se:
+
+```text
+label predetta = label ground truth
++
+temporal IoU >= soglia
+```
+
+Soglia iniziale consigliata:
+
+```text
+temporal IoU >= 0.30
+```
+
+Output della valutazione:
+
+```text
+evaluation/
+├── gt_events.csv
+├── pred_events_filtered.csv
+├── matched_events.csv
+├── false_positives.csv
+├── false_negatives.csv
+├── per_class_metrics.csv
+├── event_metrics.json
+├── event_metrics.txt
+└── event_metrics.md
+```
+
+Metriche principali da usare per confrontare gli esperimenti:
+
+```text
+macro_f1_active_classes
+f1_micro
+precision_micro
+recall_micro
+mean_iou
+center_mae_sec
+TP / FP / FN
+```
 
 ---
 
@@ -235,6 +302,37 @@ outputs/long_video/primaparte_0215_0245_exp46_debug/
 
 ---
 
+## 7A. Valutazione automatica validation debug
+
+```bash
+python -m src.long_video.evaluate_events_from_manifest \
+  --manifest data/datasets/dataset_basket_v1/manifest.csv \
+  --pred-events-csv outputs/long_video/primaparte_0215_0245_exp46_debug/events_postprocessed.csv \
+  --video-id prima_parte \
+  --start-sec 135 \
+  --end-sec 165 \
+  --output-dir outputs/long_video/primaparte_0215_0245_exp46_debug/evaluation \
+  --iou-threshold 0.30 \
+  --overwrite
+```
+
+Output atteso:
+
+```text
+outputs/long_video/primaparte_0215_0245_exp46_debug/evaluation/
+├── gt_events.csv
+├── pred_events_filtered.csv
+├── matched_events.csv
+├── false_positives.csv
+├── false_negatives.csv
+├── per_class_metrics.csv
+├── event_metrics.json
+├── event_metrics.txt
+└── event_metrics.md
+```
+
+---
+
 # Pipeline validation completa
 
 Lanciare questa pipeline solo dopo che la validation debug funziona.
@@ -315,6 +413,30 @@ python -m src.long_video.render_preview \
   --end-sec 735 \
   --overwrite
 ```
+
+---
+
+## 7B. Valutazione automatica validation completa
+
+```bash
+python -m src.long_video.evaluate_events_from_manifest \
+  --manifest data/datasets/dataset_basket_v1/manifest.csv \
+  --pred-events-csv outputs/long_video/primaparte_0215_1215_exp46/events_postprocessed.csv \
+  --video-id prima_parte \
+  --start-sec 135 \
+  --end-sec 735 \
+  --output-dir outputs/long_video/primaparte_0215_1215_exp46/evaluation \
+  --iou-threshold 0.30 \
+  --overwrite
+```
+
+Output principale da leggere dopo ogni esperimento:
+
+```text
+outputs/long_video/primaparte_0215_1215_exp46/evaluation/event_metrics.md
+```
+
+Questa è la valutazione da usare per scegliere soglie, finestre e post-processing.
 
 ---
 
@@ -401,6 +523,30 @@ python -m src.long_video.render_preview \
 
 ---
 
+## 7C. Valutazione automatica test completo
+
+```bash
+python -m src.long_video.evaluate_events_from_manifest \
+  --manifest data/datasets/dataset_basket_v1/manifest.csv \
+  --pred-events-csv outputs/long_video/psa_converted_0010_1010_exp46/events_postprocessed.csv \
+  --video-id psa_converted \
+  --start-sec 10 \
+  --end-sec 610 \
+  --output-dir outputs/long_video/psa_converted_0010_1010_exp46/evaluation \
+  --iou-threshold 0.30 \
+  --overwrite
+```
+
+Output principale:
+
+```text
+outputs/long_video/psa_converted_0010_1010_exp46/evaluation/event_metrics.md
+```
+
+Questo comando va usato solo alla fine, dopo aver scelto la configurazione migliore sulla validation completa.
+
+---
+
 # Comandi rapidi per rilanciare solo alcune fasi
 
 ## Se cambi solo soglie o parametri di post-processing
@@ -430,6 +576,18 @@ python -m src.long_video.render_preview \
   --overwrite
 ```
 
+```bash
+python -m src.long_video.evaluate_events_from_manifest \
+  --manifest data/datasets/dataset_basket_v1/manifest.csv \
+  --pred-events-csv outputs/long_video/primaparte_0215_1215_exp46/events_postprocessed.csv \
+  --video-id prima_parte \
+  --start-sec 135 \
+  --end-sec 735 \
+  --output-dir outputs/long_video/primaparte_0215_1215_exp46/evaluation \
+  --iou-threshold 0.30 \
+  --overwrite
+```
+
 ## Se cambi `window-sizes` o `stride-sec`
 
 Rilancia da `build_windows_from_store.py` in poi:
@@ -439,6 +597,7 @@ build_windows_from_store.py
 infer_exp46_from_store.py
 postprocess_events.py
 render_preview.py
+evaluate_events_from_manifest.py
 ```
 
 ## Se cambi `feature-fps`, segmento video, DINOv3 o YOLO
@@ -451,11 +610,59 @@ extract_feature_store.py
 
 ---
 
+# Come confrontare gli esperimenti
+
+Per stabilire se una modifica migliora la pipeline, usare come riferimento il primo run completo stabile su validation completa.
+
+Metriche principali da riportare in `EXPERIMENTS_LONG_VIDEO.md`:
+
+```text
+macro_f1_active_classes
+f1_micro
+precision_micro
+recall_micro
+mean_iou
+center_mae_sec
+true_positive
+false_positive
+false_negative
+```
+
+Criterio consigliato:
+
+```text
+Una modifica migliora se aumenta macro_f1_active_classes sulla validation completa
+e non peggiora in modo evidente recall dei tiri, precision dei passaggi e qualità temporale degli eventi.
+```
+
+Per leggere rapidamente il risultato di un run:
+
+```bash
+cat outputs/long_video/primaparte_0215_1215_exp46/evaluation/event_metrics.md
+```
+
+Per controllare gli errori:
+
+```bash
+python - <<'PY'
+import pandas as pd
+base = 'outputs/long_video/primaparte_0215_1215_exp46/evaluation'
+print('False positives:')
+print(pd.read_csv(f'{base}/false_positives.csv').head(20))
+print('False negatives:')
+print(pd.read_csv(f'{base}/false_negatives.csv').head(20))
+PY
+```
+
+---
+
 # Regole operative
 
 1. Usare sempre prima la validation debug.
 2. Passare alla validation completa solo quando la debug non dà errori.
 3. Usare il test completo solo alla fine.
 4. Non rilanciare `extract_feature_store.py` inutilmente: è la fase più pesante.
-5. Per provare soglie diverse basta rilanciare `postprocess_events.py` e `render_preview.py`.
-6. Non modificare il codice di training di `exp_46`: questa pipeline deve restare separata.
+5. Per provare soglie diverse basta rilanciare `postprocess_events.py`, `render_preview.py` ed `evaluate_events_from_manifest.py`.
+6. Per confrontare gli esperimenti usare principalmente `event_metrics.md` prodotto sulla validation completa.
+7. Il test completo va valutato solo una volta scelta la configurazione finale sulla validation completa.
+8. Non modificare il codice di training di `exp_46`: questa pipeline deve restare separata.
