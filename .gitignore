@@ -1,70 +1,126 @@
-# =========================
+# =============================================================================
 # Python
-# =========================
+# =============================================================================
+
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+*.pyd
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.ipynb_checkpoints/
 
-# =========================
 # Virtual environments
-# =========================
 .venv/
 venv/
 env/
-.env
-.env.*
+ENV/
+.fvab-basket/
+conda-meta/
 
-# =========================
+# =============================================================================
 # IDE / OS
-# =========================
-.vscode/*
-!.vscode/settings.json
-!.vscode/extensions.json
+# =============================================================================
+
+.vscode/
 .idea/
+*.swp
+*.swo
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# =========================
-# Dataset: ignorare tutti i dataset
-# =========================
-data/
-!data/datasets/.gitkeep
-!data/datasets/README.md
+# =============================================================================
+# Logs / temporary files
+# =============================================================================
 
-# =========================
-# File pesanti generati
-# =========================
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+# =============================================================================
+# Dataset pesante
+# =============================================================================
+
+# Non versionare clip/video pesanti e annotazioni relative a palla e canestro
+data/datasets/dataset_basket_v1/train/
+data/datasets/dataset_basket_v1/val/
+data/datasets/dataset_basket_v1/test/
+data/datasets/dataset_basket_v1/videos/
+data/datasets/ball_rim_yolo_all_v2
+data/datasets/ball_rim_yolo_shot_only_v3
+data/annotations/ball_rim_cvat_exports
+data/annotations/ball_rim_frames_sample
+
+# Versionare solo manifest e README del dataset
+!data/datasets/
+!data/datasets/dataset_basket_v1/
+!data/datasets/dataset_basket_v1/manifest.csv
+!data/datasets/dataset_basket_v1/README.md
+
+# =============================================================================
+# Feature estratte
+# =============================================================================
+
+data/features/
+data/features_long/
+
+# Feature DINO / tracking / long-video
+*.npy
+*.npz
+
+# =============================================================================
+# Output esperimenti
+# =============================================================================
+
+outputs/
+runs/
+
+# =============================================================================
+# Modelli / checkpoint
+# =============================================================================
+
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.safetensors
+
+# =============================================================================
+# Video / immagini generate
+# =============================================================================
+
 *.mp4
 *.avi
 *.mov
 *.mkv
 *.webm
 
-*.pt
-*.pth
-*.ckpt
-*.onnx
-*.safetensors
+# Preview e render generati
+preview_annotated.mp4
+*.metadata.json
 
-*.npy
-*.npz
-*.pkl
-*.pickle
-*.joblib
+# =============================================================================
+# Third party
+# =============================================================================
 
-# =========================
-# Cache / temporanei
-# =========================
+third_party/dinov3/
+
+# Se usate submodule, non ignorare la cartella third_party intera.
+# Ignora solo contenuti scaricati/pesi/cache se presenti.
+third_party/**/__pycache__/
+third_party/**/*.pt
+third_party/**/*.pth
+
+# =============================================================================
+# Cache modelli
+# =============================================================================
+
 .cache/
-cache/
-tmp/
-temp/
-
-# =========================
-# Log pesanti o strumenti esterni
-# =========================
-wandb/
-runs/
-checkpoints/
+torch_cache/
+hub/

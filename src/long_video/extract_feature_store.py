@@ -133,41 +133,50 @@ def get_video_info(video_path: Path) -> VideoInfo:
     )
 
 
-def make_sample_grid(
+def make_source_frame_grid(
     start_sec: float,
     end_sec: float,
-    feature_fps: float,
     source_fps: float,
     num_video_frames: int,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Crea una griglia usando tutti i frame reali del video sorgente.
+
+    Questa è la modalità train-like per la pipeline long-video: come nelle clip
+    usate per il training, ogni frame reale compreso nel segmento produce una
+    feature DINOv3 e una riga di primitive YOLO palla/canestro.
+
+    La finestra temporale è trattata come [start_sec, end_sec):
+    - il primo frame è il primo con timestamp >= start_sec;
+    - il limite end_sec è escluso.
+    """
     if start_sec < 0:
         raise ValueError(f"start_sec deve essere >= 0, trovato {start_sec}")
     if end_sec <= start_sec:
         raise ValueError(f"end_sec deve essere > start_sec, trovato {start_sec} -> {end_sec}")
-    if feature_fps <= 0:
-        raise ValueError(f"feature_fps deve essere > 0, trovato {feature_fps}")
+    if source_fps <= 0:
+        raise ValueError(f"source_fps deve essere > 0, trovato {source_fps}")
+    if num_video_frames <= 0:
+        raise ValueError(f"num_video_frames deve essere > 0, trovato {num_video_frames}")
 
-    duration = end_sec - start_sec
-    n_samples = int(math.floor(duration * feature_fps))
-    if n_samples <= 0:
-        raise ValueError("Il segmento selezionato non produce frame campionati.")
+    eps = 1e-9
+    start_frame = int(math.ceil(start_sec * float(source_fps) - eps))
+    end_frame_exclusive = int(math.ceil(end_sec * float(source_fps) - eps))
 
-    timestamps = start_sec + np.arange(n_samples, dtype=np.float64) / float(feature_fps)
-    timestamps = np.minimum(timestamps, np.nextafter(end_sec, start_sec))
+    start_frame = max(0, min(start_frame, num_video_frames))
+    end_frame_exclusive = max(0, min(end_frame_exclusive, num_video_frames))
 
-    frame_indices = np.rint(timestamps * float(source_fps)).astype(np.int64)
-    frame_indices = np.clip(frame_indices, 0, num_video_frames - 1)
-
-    if np.any(np.diff(frame_indices) < 0):
-        raise RuntimeError("Gli indici frame campionati non sono monotoni.")
-
-    unique_count = int(np.unique(frame_indices).shape[0])
-    if unique_count < len(frame_indices):
-        print(
-            f"[WARN] Alcuni timestamp puntano allo stesso frame "
-            f"({unique_count}/{len(frame_indices)} frame unici). "
-            f"Può succedere se feature_fps è vicino/superiore agli FPS del video."
+    if end_frame_exclusive <= start_frame:
+        raise ValueError(
+            "Il segmento selezionato non contiene frame reali del video. "
+            f"start_sec={start_sec:.6f}, end_sec={end_sec:.6f}, "
+            f"start_frame={start_frame}, end_frame_exclusive={end_frame_exclusive}."
         )
+
+    frame_indices = np.arange(start_frame, end_frame_exclusive, dtype=np.int64)
+    timestamps = frame_indices.astype(np.float64) / float(source_fps)
+
+    if np.any(np.diff(frame_indices) != 1):
+        raise RuntimeError("La griglia source_frames dovrebbe contenere frame consecutivi.")
 
     return timestamps.astype(np.float64), frame_indices.astype(np.int64)
 
@@ -657,7 +666,10 @@ def write_metadata(
             "segment_duration_sec": args.end_sec - args.start_sec,
         },
         "sampling": {
-            "feature_fps": args.feature_fps,
+            "mode": "source_frames",
+            "policy": "all real source frames in [start_sec, end_sec)",
+            "source_fps": video_info.fps,
+            "feature_fps": video_info.fps,
             "num_samples": int(len(timestamps)),
             "first_timestamp": float(timestamps[0]),
             "last_timestamp": float(timestamps[-1]),
@@ -738,7 +750,6 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-sec", type=float, default=defaults.VAL_END_SEC)
     parser.add_argument("--output-dir", type=Path, default=defaults.VAL_FEATURE_STORE_DIR)
 
-    parser.add_argument("--feature-fps", type=float, default=24.0)
     parser.add_argument("--batch-size-decode", type=int, default=128)
     parser.add_argument("--batch-size-dino", type=int, default=32)
     parser.add_argument("--batch-size-yolo", type=int, default=16)
@@ -807,10 +818,9 @@ def main() -> None:
             f"durata={video_info.duration_sec:.3f}"
         )
 
-    timestamps, frame_indices = make_sample_grid(
+    timestamps, frame_indices = make_source_frame_grid(
         start_sec=args.start_sec,
         end_sec=args.end_sec,
-        feature_fps=args.feature_fps,
         source_fps=video_info.fps,
         num_video_frames=video_info.num_frames,
     )
@@ -822,7 +832,9 @@ def main() -> None:
     print(f"video: {args.input_video}")
     print(f"segmento: {args.start_sec:.3f}s -> {args.end_sec:.3f}s")
     print(f"video fps: {video_info.fps:.3f}")
-    print(f"feature_fps: {args.feature_fps:.3f}")
+    print("sampling: source_frames, tutti i frame reali in [start_sec, end_sec)")
+    print(f"feature_fps effettivo: {video_info.fps:.3f}")
+    print(f"frame iniziale/finale: {int(frame_indices[0])} -> {int(frame_indices[-1])}")
     print(f"num samples: {len(timestamps)}")
     print(f"output_dir: {args.output_dir}")
 

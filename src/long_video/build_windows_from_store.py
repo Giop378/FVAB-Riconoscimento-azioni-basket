@@ -16,6 +16,18 @@ from src.long_video import defaults
 
 
 # =============================================================================
+# Configurazione train-like long-video
+# =============================================================================
+
+# La feature store train-like contiene una riga per ogni frame reale del video.
+# Per ogni finestra, DINOv3 userà tutti i sample della finestra; il tracking
+# palla/canestro verrà invece ricostruito nello step di inferenza usando al
+# massimo 48 frame, come nello script clip-level extract_ball_rim_tracking_features.py.
+TRACKING_MAX_FRAMES_PER_WINDOW = 48
+DEFAULT_WINDOW_SIZES_SEC = [0.5, 0.75, 1.0, 1.5, 2.0]
+
+
+# =============================================================================
 # Utility
 # =============================================================================
 
@@ -92,6 +104,8 @@ class WindowRow:
     store_start_index: int
     store_end_index: int
     num_store_samples: int
+    dino_num_frames: int
+    tracking_raw_num_frames: int
     first_sample_time: float | None
     last_sample_time: float | None
 
@@ -108,6 +122,8 @@ CSV_FIELDNAMES = [
     "store_start_index",
     "store_end_index",
     "num_store_samples",
+    "dino_num_frames",
+    "tracking_raw_num_frames",
     "first_sample_time",
     "last_sample_time",
 ]
@@ -234,6 +250,17 @@ def make_start_times(segment_start: float, segment_end: float, window_sec: float
     return starts.astype(np.float64)
 
 
+def compute_tracking_raw_num_frames(num_store_samples: int) -> int:
+    """Numero di frame ball/rim grezzi da usare per una finestra.
+
+    Replica la logica clip-level: se una clip/finestra ha al massimo 48 frame,
+    il tracking usa tutti i frame; se ne ha di più, nello step di inferenza il
+    tracking viene campionato uniformemente a 48 frame e poi interpolato alla
+    lunghezza DINO.
+    """
+    return int(min(int(num_store_samples), TRACKING_MAX_FRAMES_PER_WINDOW))
+
+
 def build_windows(
     timestamps: np.ndarray,
     segment_start: float,
@@ -262,6 +289,8 @@ def build_windows(
 
             first_sample_time = float(timestamps[store_start_index]) if num_store_samples > 0 else None
             last_sample_time = float(timestamps[store_end_index - 1]) if num_store_samples > 0 else None
+            dino_num_frames = int(num_store_samples)
+            tracking_raw_num_frames = compute_tracking_raw_num_frames(num_store_samples)
 
             rows.append(
                 WindowRow(
@@ -276,6 +305,8 @@ def build_windows(
                     store_start_index=store_start_index,
                     store_end_index=store_end_index,
                     num_store_samples=num_store_samples,
+                    dino_num_frames=dino_num_frames,
+                    tracking_raw_num_frames=tracking_raw_num_frames,
                     first_sample_time=first_sample_time,
                     last_sample_time=last_sample_time,
                 )
@@ -304,6 +335,8 @@ def write_windows_csv(path: Path, rows: list[WindowRow]) -> None:
                     "store_start_index": row.store_start_index,
                     "store_end_index": row.store_end_index,
                     "num_store_samples": row.num_store_samples,
+                    "dino_num_frames": row.dino_num_frames,
+                    "tracking_raw_num_frames": row.tracking_raw_num_frames,
                     "first_sample_time": "" if row.first_sample_time is None else f"{row.first_sample_time:.6f}",
                     "last_sample_time": "" if row.last_sample_time is None else f"{row.last_sample_time:.6f}",
                 }
@@ -318,22 +351,36 @@ def summarize_rows(rows: list[WindowRow]) -> dict[str, Any]:
 
     for scale_sec, scale_rows in sorted(scale_counts.items(), key=lambda kv: kv[0]):
         counts = np.asarray([r.num_store_samples for r in scale_rows], dtype=np.int64)
+        tracking_counts = np.asarray([r.tracking_raw_num_frames for r in scale_rows], dtype=np.int64)
         by_scale[f"{scale_sec:.6f}"] = {
             "scale_sec": float(scale_sec),
             "num_windows": int(len(scale_rows)),
             "min_store_samples": int(counts.min()) if counts.size else 0,
             "max_store_samples": int(counts.max()) if counts.size else 0,
             "mean_store_samples": float(counts.mean()) if counts.size else 0.0,
+            "min_dino_frames": int(counts.min()) if counts.size else 0,
+            "max_dino_frames": int(counts.max()) if counts.size else 0,
+            "mean_dino_frames": float(counts.mean()) if counts.size else 0.0,
+            "min_tracking_raw_frames": int(tracking_counts.min()) if tracking_counts.size else 0,
+            "max_tracking_raw_frames": int(tracking_counts.max()) if tracking_counts.size else 0,
+            "mean_tracking_raw_frames": float(tracking_counts.mean()) if tracking_counts.size else 0.0,
             "first_window_start": float(scale_rows[0].start_time) if scale_rows else None,
             "last_window_end": float(scale_rows[-1].end_time) if scale_rows else None,
         }
 
     counts_all = np.asarray([r.num_store_samples for r in rows], dtype=np.int64)
+    tracking_counts_all = np.asarray([r.tracking_raw_num_frames for r in rows], dtype=np.int64)
     return {
         "num_windows": int(len(rows)),
         "min_store_samples": int(counts_all.min()) if counts_all.size else 0,
         "max_store_samples": int(counts_all.max()) if counts_all.size else 0,
         "mean_store_samples": float(counts_all.mean()) if counts_all.size else 0.0,
+        "min_dino_frames": int(counts_all.min()) if counts_all.size else 0,
+        "max_dino_frames": int(counts_all.max()) if counts_all.size else 0,
+        "mean_dino_frames": float(counts_all.mean()) if counts_all.size else 0.0,
+        "min_tracking_raw_frames": int(tracking_counts_all.min()) if tracking_counts_all.size else 0,
+        "max_tracking_raw_frames": int(tracking_counts_all.max()) if tracking_counts_all.size else 0,
+        "mean_tracking_raw_frames": float(tracking_counts_all.mean()) if tracking_counts_all.size else 0.0,
         "by_scale": by_scale,
     }
 
@@ -368,6 +415,9 @@ def write_windows_metadata(
             "interval_policy": "[start_time, end_time)",
             "partial_windows": False,
             "sort_order": "start_time, scale_sec, end_time",
+            "dino_policy": "usa tutti i sample della feature store contenuti nella finestra",
+            "tracking_policy": "nello step di inferenza usa min(num_store_samples, 48) frame ball/rim campionati uniformemente e poi interpolati alla lunghezza DINO",
+            "tracking_max_frames_per_window": TRACKING_MAX_FRAMES_PER_WINDOW,
         },
         "outputs": {
             "windows_csv": "windows_manifest.csv",
@@ -417,8 +467,11 @@ def make_parser() -> argparse.ArgumentParser:
         "--window-sizes",
         type=float,
         nargs="+",
-        default=[1.0, 1.5, 2.0, 3.0],
-        help="Durate delle finestre in secondi. Esempio: --window-sizes 1.0 1.5 2.0 3.0",
+        default=DEFAULT_WINDOW_SIZES_SEC,
+        help=(
+            "Durate delle finestre in secondi. Default train-like: "
+            "0.5 0.75 1.0 1.5 2.0."
+        ),
     )
     parser.add_argument("--stride-sec", type=float, default=0.25)
     parser.add_argument(
@@ -507,15 +560,20 @@ def main() -> None:
     print(f"segmento:          {segment_start:.3f}s -> {segment_end:.3f}s")
     print(f"window_sizes:      {', '.join(str(float(v)) for v in args.window_sizes)}")
     print(f"stride_sec:        {args.stride_sec:.3f}")
+    print(f"tracking max raw:  {TRACKING_MAX_FRAMES_PER_WINDOW} frame per finestra")
     print(f"num_windows:       {summary['num_windows']}")
     print("\nFinestre per scala:")
     for scale_key, scale_summary in summary["by_scale"].items():
         print(
             f"- {float(scale_key):.3f}s: {scale_summary['num_windows']} finestre, "
-            f"samples min/mean/max = "
-            f"{scale_summary['min_store_samples']}/"
-            f"{scale_summary['mean_store_samples']:.1f}/"
-            f"{scale_summary['max_store_samples']}"
+            f"DINO frame min/mean/max = "
+            f"{scale_summary['min_dino_frames']}/"
+            f"{scale_summary['mean_dino_frames']:.1f}/"
+            f"{scale_summary['max_dino_frames']}, "
+            f"ball-rim raw min/mean/max = "
+            f"{scale_summary['min_tracking_raw_frames']}/"
+            f"{scale_summary['mean_tracking_raw_frames']:.1f}/"
+            f"{scale_summary['max_tracking_raw_frames']}"
         )
 
     print("\nOutput creati:")

@@ -61,6 +61,20 @@ MODEL_CLASS_CANDIDATES = [
 
 
 # =============================================================================
+# Policy temporale long-video train-like
+# =============================================================================
+
+# Nella pipeline long-video vogliamo replicare il più possibile il training su clip:
+# - DINOv3 usa tutte le feature/frame della finestra;
+# - il tracking palla/canestro usa al massimo 48 frame campionati uniformemente;
+# - il tracking viene poi interpolato alla lunghezza DINO e concatenato per timestep;
+# - il modello riceve sequenze a lunghezza variabile con padding e lengths reali.
+TRACKING_MAX_FRAMES_PER_WINDOW = 48
+TRACKING_VELOCITY_MODE = "per_second"
+TEMPORAL_POLICY = "train_like_dino_all_frames_tracking_max_48"
+
+
+# =============================================================================
 # Dataclass
 # =============================================================================
 
@@ -80,6 +94,8 @@ class WindowRow:
     num_store_samples: int
     first_sample_time: float | None
     last_sample_time: float | None
+    dino_num_frames: int | None = None
+    tracking_raw_num_frames: int | None = None
 
 
 @dataclass
@@ -257,6 +273,12 @@ def parse_optional_float(value: str) -> float | None:
     return float(value)
 
 
+def parse_optional_int(value: str | None) -> int | None:
+    if value == "" or value is None:
+        return None
+    return int(value)
+
+
 def read_windows_csv(path: Path, max_windows: int | None = None) -> list[WindowRow]:
     ensure_exists(path, "windows_manifest.csv", must_be_file=True)
     rows: list[WindowRow] = []
@@ -295,6 +317,8 @@ def read_windows_csv(path: Path, max_windows: int | None = None) -> list[WindowR
                     num_store_samples=int(row["num_store_samples"]),
                     first_sample_time=parse_optional_float(row.get("first_sample_time", "")),
                     last_sample_time=parse_optional_float(row.get("last_sample_time", "")),
+                    dino_num_frames=parse_optional_int(row.get("dino_num_frames", "")),
+                    tracking_raw_num_frames=parse_optional_int(row.get("tracking_raw_num_frames", "")),
                 )
             )
             if max_windows is not None and len(rows) >= max_windows:
@@ -676,20 +700,29 @@ def load_level_bundle(
     )
 
 
-def model_forward_logits(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    # I modelli del progetto dovrebbero accettare solo x. I fallback servono se
-    # la firma usa lengths o mask.
-    lengths = torch.full((x.shape[0],), x.shape[1], dtype=torch.long, device=x.device)
-    padding_mask = torch.zeros((x.shape[0], x.shape[1]), dtype=torch.bool, device=x.device)
+def model_forward_logits(
+    model: nn.Module,
+    x: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    # La pipeline train-like usa sequenze a lunghezza variabile, come nel training:
+    # il batch è padded a Tmax, ma lengths contiene la lunghezza reale di ogni finestra.
+    if lengths.ndim != 1 or lengths.shape[0] != x.shape[0]:
+        raise ValueError(
+            f"lengths deve avere shape [B], trovato {tuple(lengths.shape)} per x={tuple(x.shape)}"
+        )
+
+    time_positions = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
+    padding_mask = time_positions >= lengths.unsqueeze(1)
 
     attempts: list[Callable[[], Any]] = [
         # TemporalTransformerActionClassifier del progetto richiede features e lengths.
         lambda: model(x, lengths=lengths),
         lambda: model(x, lengths),
-        lambda: model(x),
         lambda: model(x, padding_mask=padding_mask),
         lambda: model(x, src_key_padding_mask=padding_mask),
         lambda: model(x, mask=padding_mask),
+        lambda: model(x),
     ]
 
     errors: list[str] = []
@@ -701,7 +734,6 @@ def model_forward_logits(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
             errors.append(str(exc))
             continue
     raise RuntimeError("Forward del modello fallito. Errori TypeError:\n" + "\n".join(errors[-3:]))
-
 
 def output_to_logits(output: Any) -> torch.Tensor:
     if isinstance(output, dict):
@@ -804,6 +836,45 @@ def sample_primitives(
             (sampled["ball_detected"] >= 0.5) & (sampled["rim_detected"] >= 0.5)
         ).astype(np.float32)
     return sampled
+
+
+def select_uniform_local_indices(num_items: int, max_items: int) -> np.ndarray:
+    """Replica la logica clip-level: usa tutti i frame se <= max_items, altrimenti 48 uniformi."""
+    if num_items <= 0:
+        return np.empty((0,), dtype=np.int64)
+    if max_items <= 0 or num_items <= max_items:
+        return np.arange(num_items, dtype=np.int64)
+
+    indices = np.linspace(0, num_items - 1, max_items)
+    indices = sorted({int(round(v)) for v in indices})
+    indices = [min(max(0, idx), num_items - 1) for idx in indices]
+    return np.asarray(indices, dtype=np.int64)
+
+
+def interpolate_sequence_array(sequence: np.ndarray, target_len: int) -> np.ndarray:
+    """Ridimensiona una sequenza [S, K] a [target_len, K] con interpolazione lineare."""
+    target_len = int(target_len)
+    sequence = np.asarray(sequence, dtype=np.float32)
+
+    if sequence.ndim != 2:
+        raise ValueError(f"La sequenza tracking deve avere forma [S, K], ricevuta {sequence.shape}.")
+    if target_len <= 0:
+        return np.zeros((0, sequence.shape[1]), dtype=np.float32)
+
+    source_len, num_features = sequence.shape
+    if source_len == 0:
+        return np.zeros((target_len, num_features), dtype=np.float32)
+    if source_len == target_len:
+        return sequence.astype(np.float32)
+    if source_len == 1:
+        return np.repeat(sequence, repeats=target_len, axis=0).astype(np.float32)
+
+    source_x = np.linspace(0.0, 1.0, source_len, dtype=np.float32)
+    target_x = np.linspace(0.0, 1.0, target_len, dtype=np.float32)
+    resized = np.empty((target_len, num_features), dtype=np.float32)
+    for feature_idx in range(num_features):
+        resized[:, feature_idx] = np.interp(target_x, source_x, sequence[:, feature_idx])
+    return resized.astype(np.float32)
 
 
 # =============================================================================
@@ -1148,23 +1219,69 @@ def build_input_for_window(
     row: WindowRow,
     feature_names: list[str],
     primitives: dict[str, np.ndarray],
-    num_frames: int,
-    velocity_mode: str,
 ) -> np.ndarray:
-    query_times = make_query_times(row.start_time, row.end_time, num_frames=num_frames)
-    dino_seq = interpolate_matrix(feature_store.timestamps, feature_store.dino_features, query_times)
-    tracking_seq = build_tracking_sequence(
+    # Train-like:
+    # - DINO usa tutti i sample/frame reali della finestra;
+    # - il tracking palla/canestro viene calcolato su max 48 frame uniformi;
+    # - il tracking viene interpolato alla lunghezza DINO.
+    start_idx = int(row.store_start_index)
+    end_idx = int(row.store_end_index)
+
+    if start_idx < 0 or end_idx > feature_store.timestamps.shape[0] or end_idx <= start_idx:
+        raise ValueError(
+            f"Indici finestra non validi per {row.window_id}: "
+            f"{start_idx}:{end_idx} su N={feature_store.timestamps.shape[0]}"
+        )
+
+    dino_seq = np.asarray(feature_store.dino_features[start_idx:end_idx], dtype=np.float32)
+    dino_times = feature_store.timestamps[start_idx:end_idx].astype(np.float64)
+    dino_len = int(dino_seq.shape[0])
+
+    if dino_len <= 0:
+        raise ValueError(f"Finestra senza feature DINO: {row.window_id}")
+
+    tracking_local_indices = select_uniform_local_indices(
+        num_items=dino_len,
+        max_items=TRACKING_MAX_FRAMES_PER_WINDOW,
+    )
+    if tracking_local_indices.size == 0:
+        raise ValueError(f"Finestra senza frame tracking: {row.window_id}")
+
+    tracking_query_times = dino_times[tracking_local_indices]
+    tracking_raw_seq = build_tracking_sequence(
         store_timestamps=feature_store.timestamps,
         primitives=primitives,
         feature_names=feature_names,
-        query_times=query_times,
+        query_times=tracking_query_times,
         start_time=row.start_time,
         end_time=row.end_time,
-        velocity_mode=velocity_mode,
+        velocity_mode=TRACKING_VELOCITY_MODE,
     )
+    tracking_seq = interpolate_sequence_array(tracking_raw_seq, target_len=dino_len)
+
     if dino_seq.shape[0] != tracking_seq.shape[0]:
         raise RuntimeError(f"T diverso tra DINO e tracking: {dino_seq.shape} vs {tracking_seq.shape}")
+
     return np.concatenate([dino_seq, tracking_seq], axis=1).astype(np.float32)
+
+
+def pad_sequences(sequences: list[np.ndarray], expected_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    if not sequences:
+        raise ValueError("Batch vuoto: nessuna sequenza da paddare")
+
+    lengths = np.asarray([seq.shape[0] for seq in sequences], dtype=np.int64)
+    max_len = int(lengths.max())
+    batch_size = len(sequences)
+    padded = np.zeros((batch_size, max_len, expected_dim), dtype=np.float32)
+
+    for i, seq in enumerate(sequences):
+        if seq.ndim != 2 or seq.shape[1] != expected_dim:
+            raise ValueError(
+                f"Sequenza {i} con shape inattesa: {seq.shape}; attesa [T, {expected_dim}]"
+            )
+        padded[i, : seq.shape[0], :] = seq
+
+    return padded, lengths
 
 
 def build_batch_inputs(
@@ -1173,45 +1290,49 @@ def build_batch_inputs(
     l1: LevelBundle,
     l2: LevelBundle,
     l3: LevelBundle,
-    num_frames: int,
-    velocity_mode: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    b = len(rows)
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     l1_dim = feature_store.dino_dim + len(l1.feature_names)
     l2_dim = feature_store.dino_dim + len(l2.feature_names)
     l3_dim = feature_store.dino_dim + len(l3.feature_names)
 
-    x_l1 = np.empty((b, num_frames, l1_dim), dtype=np.float32)
-    x_l2 = np.empty((b, num_frames, l2_dim), dtype=np.float32)
-    x_l3 = np.empty((b, num_frames, l3_dim), dtype=np.float32)
+    seqs_l1: list[np.ndarray] = []
+    seqs_l2: list[np.ndarray] = []
+    seqs_l3: list[np.ndarray] = []
 
-    for i, row in enumerate(rows):
-        x_l1[i] = build_input_for_window(
-            feature_store=feature_store,
-            row=row,
-            feature_names=l1.feature_names,
-            primitives=feature_store.yolo_v2_primitives,
-            num_frames=num_frames,
-            velocity_mode=velocity_mode,
+    for row in rows:
+        seqs_l1.append(
+            build_input_for_window(
+                feature_store=feature_store,
+                row=row,
+                feature_names=l1.feature_names,
+                primitives=feature_store.yolo_v2_primitives,
+            )
         )
-        x_l2[i] = build_input_for_window(
-            feature_store=feature_store,
-            row=row,
-            feature_names=l2.feature_names,
-            primitives=feature_store.yolo_v2_primitives,
-            num_frames=num_frames,
-            velocity_mode=velocity_mode,
+        seqs_l2.append(
+            build_input_for_window(
+                feature_store=feature_store,
+                row=row,
+                feature_names=l2.feature_names,
+                primitives=feature_store.yolo_v2_primitives,
+            )
         )
-        x_l3[i] = build_input_for_window(
-            feature_store=feature_store,
-            row=row,
-            feature_names=l3.feature_names,
-            primitives=feature_store.yolo_v1_primitives,
-            num_frames=num_frames,
-            velocity_mode=velocity_mode,
+        seqs_l3.append(
+            build_input_for_window(
+                feature_store=feature_store,
+                row=row,
+                feature_names=l3.feature_names,
+                primitives=feature_store.yolo_v1_primitives,
+            )
         )
 
-    return x_l1, x_l2, x_l3
+    x_l1, lengths = pad_sequences(seqs_l1, expected_dim=l1_dim)
+    x_l2, lengths_l2 = pad_sequences(seqs_l2, expected_dim=l2_dim)
+    x_l3, lengths_l3 = pad_sequences(seqs_l3, expected_dim=l3_dim)
+
+    if not (np.array_equal(lengths, lengths_l2) and np.array_equal(lengths, lengths_l3)):
+        raise RuntimeError("Lunghezze diverse tra L1/L2/L3 nello stesso batch")
+
+    return x_l1, x_l2, x_l3, lengths
 
 
 # =============================================================================
@@ -1304,6 +1425,9 @@ def output_fieldnames() -> list[str]:
         "store_start_index",
         "store_end_index",
         "num_store_samples",
+        "dino_num_frames",
+        "tracking_raw_num_frames",
+        "model_input_length",
         "p_l1_passaggio",
         "p_l1_tiro",
         "p_l1_noaction",
@@ -1369,6 +1493,13 @@ def write_prediction_rows(
             "store_start_index": row.store_start_index,
             "store_end_index": row.store_end_index,
             "num_store_samples": row.num_store_samples,
+            "dino_num_frames": row.dino_num_frames if row.dino_num_frames is not None else row.num_store_samples,
+            "tracking_raw_num_frames": (
+                row.tracking_raw_num_frames
+                if row.tracking_raw_num_frames is not None
+                else min(row.num_store_samples, TRACKING_MAX_FRAMES_PER_WINDOW)
+            ),
+            "model_input_length": row.num_store_samples,
             "p_l1_passaggio": f"{float(p_l1_passaggio[i]):.8f}",
             "p_l1_tiro": f"{float(p_l1_tiro[i]):.8f}",
             "p_l1_noaction": f"{float(p_l1_noaction[i]):.8f}",
@@ -1398,20 +1529,21 @@ def write_prediction_rows(
 
 def predict_batch(
     x_np: np.ndarray,
+    lengths_np: np.ndarray,
     model: nn.Module,
     device: torch.device,
     use_amp: bool,
 ) -> np.ndarray:
     x = torch.from_numpy(x_np).to(device, non_blocking=True)
+    lengths = torch.from_numpy(lengths_np.astype(np.int64)).to(device, non_blocking=True)
     amp_enabled = bool(use_amp and device.type == "cuda")
     with torch.inference_mode():
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            logits = model_forward_logits(model, x)
+            logits = model_forward_logits(model, x, lengths=lengths)
         if logits.ndim != 2:
             raise RuntimeError(f"Logits attesi [B, C], trovati {tuple(logits.shape)}")
         probs = torch.softmax(logits.float(), dim=1)
     return probs.detach().cpu().numpy().astype(np.float32)
-
 
 def infer_all_windows(
     feature_store: FeatureStore,
@@ -1421,9 +1553,7 @@ def infer_all_windows(
     l3: LevelBundle,
     output_csv: Path,
     batch_size: int,
-    num_frames: int,
     device: torch.device,
-    velocity_mode: str,
     use_amp: bool,
 ) -> dict[str, Any]:
     if batch_size <= 0:
@@ -1432,6 +1562,8 @@ def infer_all_windows(
     n = len(windows)
     num_batches = math.ceil(n / batch_size)
     label_counts: dict[str, int] = {label: 0 for label in FINAL_LABELS}
+    input_lengths: list[int] = []
+    tracking_raw_lengths: list[int] = []
 
     with output_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=output_fieldnames())
@@ -1440,32 +1572,49 @@ def infer_all_windows(
         progress = tqdm(range(0, n, batch_size), total=num_batches, desc="Inferenza exp_46")
         for start in progress:
             batch_rows = windows[start : start + batch_size]
-            x_l1, x_l2, x_l3 = build_batch_inputs(
+            x_l1, x_l2, x_l3, lengths = build_batch_inputs(
                 feature_store=feature_store,
                 rows=batch_rows,
                 l1=l1,
                 l2=l2,
                 l3=l3,
-                num_frames=num_frames,
-                velocity_mode=velocity_mode,
             )
 
-            p_l1 = predict_batch(x_l1, l1.model, device=device, use_amp=use_amp)
-            p_l2 = predict_batch(x_l2, l2.model, device=device, use_amp=use_amp)
-            p_l3 = predict_batch(x_l3, l3.model, device=device, use_amp=use_amp)
+            p_l1 = predict_batch(x_l1, lengths, l1.model, device=device, use_amp=use_amp)
+            p_l2 = predict_batch(x_l2, lengths, l2.model, device=device, use_amp=use_amp)
+            p_l3 = predict_batch(x_l3, lengths, l3.model, device=device, use_amp=use_amp)
 
             scores = compute_final_scores(p_l1, p_l2, p_l3, l1.labels, l2.labels, l3.labels)
             pred_labels, _ = argmax_labels(scores)
             for label in pred_labels:
                 label_counts[label] = label_counts.get(label, 0) + 1
 
+            input_lengths.extend(int(v) for v in lengths.tolist())
+            tracking_raw_lengths.extend(
+                int(min(int(v), TRACKING_MAX_FRAMES_PER_WINDOW)) for v in lengths.tolist()
+            )
+
             write_prediction_rows(writer, batch_rows, p_l1, p_l2, p_l3, l1, l2, l3)
+
+    input_lengths_arr = np.asarray(input_lengths, dtype=np.int64)
+    tracking_lengths_arr = np.asarray(tracking_raw_lengths, dtype=np.int64)
 
     return {
         "num_windows": int(n),
         "label_counts": label_counts,
+        "temporal_policy": TEMPORAL_POLICY,
+        "tracking_max_frames_per_window": TRACKING_MAX_FRAMES_PER_WINDOW,
+        "input_lengths": {
+            "min": int(input_lengths_arr.min()) if input_lengths_arr.size else 0,
+            "max": int(input_lengths_arr.max()) if input_lengths_arr.size else 0,
+            "mean": float(input_lengths_arr.mean()) if input_lengths_arr.size else 0.0,
+        },
+        "tracking_raw_lengths": {
+            "min": int(tracking_lengths_arr.min()) if tracking_lengths_arr.size else 0,
+            "max": int(tracking_lengths_arr.max()) if tracking_lengths_arr.size else 0,
+            "mean": float(tracking_lengths_arr.mean()) if tracking_lengths_arr.size else 0.0,
+        },
     }
-
 
 def write_inference_metadata(
     path: Path,
@@ -1499,10 +1648,13 @@ def write_inference_metadata(
         "runtime": {
             "device": str(args.device),
             "batch_size": int(args.batch_size),
-            "num_frames": int(args.num_frames),
             "amp": not args.no_amp,
-            "velocity_mode": args.velocity_mode,
             "max_windows": args.max_windows,
+            "temporal_policy": TEMPORAL_POLICY,
+            "dino_policy": "all_store_samples_in_window",
+            "tracking_policy": "uniform_max_48_then_interpolate_to_dino_length",
+            "tracking_max_frames_per_window": TRACKING_MAX_FRAMES_PER_WINDOW,
+            "tracking_velocity_mode": TRACKING_VELOCITY_MODE,
         },
         "levels": {
             "L1": {
@@ -1562,7 +1714,6 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--l2-checkpoint", type=Path, default=defaults.EXP46_L2_CHECKPOINT)
     parser.add_argument("--l3-checkpoint", type=Path, default=defaults.EXP46_L3_CHECKPOINT)
 
-    parser.add_argument("--num-frames", type=int, default=48)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--overwrite", action="store_true")
@@ -1571,16 +1722,6 @@ def make_parser() -> argparse.ArgumentParser:
         "--strict-load",
         action="store_true",
         help="Usa strict=True nel load_state_dict. Default: strict=False per robustezza.",
-    )
-    parser.add_argument(
-        "--velocity-mode",
-        type=str,
-        choices=["delta", "per_second"],
-        default="delta",
-        help=(
-            "Come calcolare le feature di velocità se richieste dal checkpoint. "
-            "delta = differenza tra timestep uniformi; per_second = delta normalizzato sui secondi."
-        ),
     )
     parser.add_argument(
         "--max-windows",
@@ -1610,8 +1751,6 @@ def main() -> None:
     assert args.l2_checkpoint is not None
     assert args.l3_checkpoint is not None
 
-    if args.num_frames < 2:
-        raise ValueError("--num-frames deve essere >= 2")
     if args.batch_size <= 0:
         raise ValueError("--batch-size deve essere > 0")
     if args.max_windows is not None and args.max_windows <= 0:
@@ -1680,8 +1819,10 @@ def main() -> None:
     print(f"output_csv:         {output_csv}")
     print(f"device:             {device}")
     print(f"batch_size:         {args.batch_size}")
-    print(f"num_frames:         {args.num_frames}")
-    print(f"velocity_mode:      {args.velocity_mode}")
+    print(f"temporal_policy:    {TEMPORAL_POLICY}")
+    print(f"DINO policy:        tutti i sample/frame della finestra")
+    print(f"tracking policy:    max {TRACKING_MAX_FRAMES_PER_WINDOW} frame uniformi, poi interpolazione a T DINO")
+    print(f"velocity_mode:      {TRACKING_VELOCITY_MODE}")
 
     summary = infer_all_windows(
         feature_store=feature_store,
@@ -1691,9 +1832,7 @@ def main() -> None:
         l3=l3,
         output_csv=output_csv,
         batch_size=int(args.batch_size),
-        num_frames=int(args.num_frames),
         device=device,
-        velocity_mode=args.velocity_mode,
         use_amp=not args.no_amp,
     )
 

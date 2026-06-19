@@ -2,6 +2,11 @@
 
 Questo file raccoglie i comandi da usare per eseguire la pipeline separata che applica il modello `exp_46` a video lunghi.
 
+> Versione aggiornata per **Windows PowerShell**.
+> In PowerShell la continuazione di riga usa il backtick `` ` `` e non `\`.
+> I comandi vanno lanciati dalla root della repository. I path con `/` sono mantenuti perché Python li gestisce correttamente anche su Windows.
+> Se il PC Windows non ha GPU, non rilanciare `extract_feature_store.py`: parti dalle feature store già esportate.
+
 La pipeline è divisa in fasi:
 
 ```text
@@ -24,6 +29,23 @@ video lungo
   -> post-processing eventi
   -> preview video annotata
   -> valutazione automatica event-level su manifest.csv
+```
+
+La feature store long-video replica il più possibile il comportamento usato nel training sulle clip:
+
+```text
+DINOv3:
+  una feature per ogni frame reale del video nel segmento scelto
+
+Ball/Rim YOLO:
+  primitive estratte per ogni frame reale nel segmento scelto
+
+Inferenza sulle finestre:
+  DINO usa tutti i frame/sample della finestra
+  Ball/Rim usa al massimo 48 frame per finestra
+  se la finestra ha <= 48 frame, Ball/Rim usa tutti i frame
+  se la finestra ha > 48 frame, Ball/Rim campiona 48 frame uniformi
+  il tracking Ball/Rim viene poi interpolato alla lunghezza DINO della finestra
 ```
 
 ---
@@ -90,7 +112,7 @@ output:        outputs/long_video/psa_converted_0010_1010_exp46
 
 Da eseguire prima di tutto.
 
-```bash
+```powershell
 python -m src.long_video.check_setup --check-video-duration --print-features
 ```
 
@@ -164,7 +186,7 @@ macro_f1_active_classes
 f1_micro
 precision_micro
 recall_micro
-mean_iou
+matched_mean_iou
 center_mae_sec
 TP / FP / FN
 ```
@@ -179,17 +201,18 @@ Usare questa pipeline corta prima di lanciare i 10 minuti completi.
 
 ## 2A. Estrazione feature store validation debug
 
-```bash
-python -m src.long_video.extract_feature_store \
-  --input-video data/datasets/dataset_basket_v1/videos/PrimaParte.mp4 \
-  --start-sec 135 \
-  --end-sec 165 \
-  --output-dir data/features_long/primaparte_0215_0245_exp46_debug \
-  --feature-fps 24 \
-  --device 0 \
-  --batch-size-decode 128 \
-  --batch-size-dino 32 \
-  --batch-size-yolo 16 \
+Se stai usando un PC Windows senza GPU e hai già copiato questa feature store, salta questo comando.
+
+```powershell
+python -m src.long_video.extract_feature_store `
+  --input-video data/datasets/dataset_basket_v1/videos/PrimaParte.mp4 `
+  --start-sec 135 `
+  --end-sec 165 `
+  --output-dir data/features_long/primaparte_0215_0245_exp46_debug `
+  --device 0 `
+  --batch-size-decode 128 `
+  --batch-size-dino 32 `
+  --batch-size-yolo 16 `
   --overwrite
 ```
 
@@ -211,12 +234,14 @@ data/features_long/primaparte_0215_0245_exp46_debug/
 
 ## 3A. Creazione finestre validation debug
 
-```bash
-python -m src.long_video.build_windows_from_store \
-  --feature-store-dir data/features_long/primaparte_0215_0245_exp46_debug \
-  --output-dir outputs/long_video/primaparte_0215_0245_exp46_debug \
-  --window-sizes 1.0 1.5 2.0 3.0 \
-  --stride-sec 0.25 \
+Le finestre usate coprono le durate principali osservate nelle clip di training: passaggi brevi e tiri più lunghi.
+
+```powershell
+python -m src.long_video.build_windows_from_store `
+  --feature-store-dir data/features_long/primaparte_0215_0245_exp46_debug `
+  --output-dir outputs/long_video/primaparte_0215_0245_exp46_debug `
+  --window-sizes 0.5 0.75 1.0 1.5 2.0 `
+  --stride-sec 0.25 `
   --overwrite
 ```
 
@@ -232,14 +257,16 @@ outputs/long_video/primaparte_0215_0245_exp46_debug/
 
 ## 4A. Inferenza `exp_46` validation debug
 
-```bash
-python -m src.long_video.infer_exp46_from_store \
-  --feature-store-dir data/features_long/primaparte_0215_0245_exp46_debug \
-  --windows-csv outputs/long_video/primaparte_0215_0245_exp46_debug/windows_manifest.csv \
-  --output-dir outputs/long_video/primaparte_0215_0245_exp46_debug \
-  --device 0 \
-  --batch-size 128 \
-  --num-frames 48 \
+Comando impostato per CPU su Windows (`--device cpu`, `--batch-size 32`, `--no-amp`). Se hai una GPU CUDA funzionante puoi usare `--device 0`, aumentare il batch size e rimuovere `--no-amp`. Non serve più passare `--num-frames`: la lunghezza della sequenza viene ricavata dalla finestra, come nel training sulle clip.
+
+```powershell
+python -m src.long_video.infer_exp46_from_store `
+  --feature-store-dir data/features_long/primaparte_0215_0245_exp46_debug `
+  --windows-csv outputs/long_video/primaparte_0215_0245_exp46_debug/windows_manifest.csv `
+  --output-dir outputs/long_video/primaparte_0215_0245_exp46_debug `
+  --device cpu `
+  --batch-size 32 `
+  --no-amp `
   --overwrite
 ```
 
@@ -255,16 +282,16 @@ outputs/long_video/primaparte_0215_0245_exp46_debug/
 
 ## 5A. Post-processing validation debug
 
-```bash
-python -m src.long_video.postprocess_events \
-  --predictions-csv outputs/long_video/primaparte_0215_0245_exp46_debug/window_predictions_raw.csv \
-  --output-dir outputs/long_video/primaparte_0215_0245_exp46_debug \
-  --smooth-window 3 \
-  --min-event-duration-sec 0.4 \
-  --merge-gap-sec 0.75 \
-  --temporal-nms-iou 0.50 \
-  --min-conf-passaggio 0.55 \
-  --min-conf-tiro 0.40 \
+```powershell
+python -m src.long_video.postprocess_events `
+  --predictions-csv outputs/long_video/primaparte_0215_0245_exp46_debug/window_predictions_raw.csv `
+  --output-dir outputs/long_video/primaparte_0215_0245_exp46_debug `
+  --smooth-window 3 `
+  --min-event-duration-sec 0.4 `
+  --merge-gap-sec 0.75 `
+  --temporal-nms-iou 0.50 `
+  --min-conf-passaggio 0.55 `
+  --min-conf-tiro 0.40 `
   --overwrite
 ```
 
@@ -282,13 +309,13 @@ outputs/long_video/primaparte_0215_0245_exp46_debug/
 
 ## 6A. Preview video validation debug
 
-```bash
-python -m src.long_video.render_preview \
-  --input-video data/datasets/dataset_basket_v1/videos/PrimaParte.mp4 \
-  --events-csv outputs/long_video/primaparte_0215_0245_exp46_debug/events_postprocessed.csv \
-  --output-video outputs/long_video/primaparte_0215_0245_exp46_debug/preview_annotated.mp4 \
-  --start-sec 135 \
-  --end-sec 165 \
+```powershell
+python -m src.long_video.render_preview `
+  --input-video data/datasets/dataset_basket_v1/videos/PrimaParte.mp4 `
+  --events-csv outputs/long_video/primaparte_0215_0245_exp46_debug/events_postprocessed.csv `
+  --output-video outputs/long_video/primaparte_0215_0245_exp46_debug/preview_annotated.mp4 `
+  --start-sec 135 `
+  --end-sec 165 `
   --overwrite
 ```
 
@@ -304,15 +331,15 @@ outputs/long_video/primaparte_0215_0245_exp46_debug/
 
 ## 7A. Valutazione automatica validation debug
 
-```bash
-python -m src.long_video.evaluate_events_from_manifest \
-  --manifest data/datasets/dataset_basket_v1/manifest.csv \
-  --pred-events-csv outputs/long_video/primaparte_0215_0245_exp46_debug/events_postprocessed.csv \
-  --video-id prima_parte \
-  --start-sec 135 \
-  --end-sec 165 \
-  --output-dir outputs/long_video/primaparte_0215_0245_exp46_debug/evaluation \
-  --iou-threshold 0.30 \
+```powershell
+python -m src.long_video.evaluate_events_from_manifest `
+  --manifest data/datasets/dataset_basket_v1/manifest.csv `
+  --pred-events-csv outputs/long_video/primaparte_0215_0245_exp46_debug/events_postprocessed.csv `
+  --video-id prima_parte `
+  --start-sec 135 `
+  --end-sec 165 `
+  --output-dir outputs/long_video/primaparte_0215_0245_exp46_debug/evaluation `
+  --iou-threshold 0.30 `
   --overwrite
 ```
 
@@ -341,17 +368,18 @@ Lanciare questa pipeline solo dopo che la validation debug funziona.
 
 ## 2B. Estrazione feature store validation completa
 
-```bash
-python -m src.long_video.extract_feature_store \
-  --input-video data/datasets/dataset_basket_v1/videos/PrimaParte.mp4 \
-  --start-sec 135 \
-  --end-sec 735 \
-  --output-dir data/features_long/primaparte_0215_1215_exp46 \
-  --feature-fps 24 \
-  --device 0 \
-  --batch-size-decode 128 \
-  --batch-size-dino 32 \
-  --batch-size-yolo 16 \
+Se stai usando un PC Windows senza GPU e hai già copiato questa feature store, salta questo comando.
+
+```powershell
+python -m src.long_video.extract_feature_store `
+  --input-video data/datasets/dataset_basket_v1/videos/PrimaParte.mp4 `
+  --start-sec 135 `
+  --end-sec 735 `
+  --output-dir data/features_long/primaparte_0215_1215_exp46 `
+  --device 0 `
+  --batch-size-decode 128 `
+  --batch-size-dino 32 `
+  --batch-size-yolo 16 `
   --overwrite
 ```
 
@@ -359,12 +387,12 @@ python -m src.long_video.extract_feature_store \
 
 ## 3B. Creazione finestre validation completa
 
-```bash
-python -m src.long_video.build_windows_from_store \
-  --feature-store-dir data/features_long/primaparte_0215_1215_exp46 \
-  --output-dir outputs/long_video/primaparte_0215_1215_exp46 \
-  --window-sizes 1.0 1.5 2.0 3.0 \
-  --stride-sec 0.25 \
+```powershell
+python -m src.long_video.build_windows_from_store `
+  --feature-store-dir data/features_long/primaparte_0215_1215_exp46 `
+  --output-dir outputs/long_video/primaparte_0215_1215_exp46 `
+  --window-sizes 0.5 0.75 1.0 1.5 2.0 `
+  --stride-sec 0.25 `
   --overwrite
 ```
 
@@ -372,14 +400,16 @@ python -m src.long_video.build_windows_from_store \
 
 ## 4B. Inferenza `exp_46` validation completa
 
-```bash
-python -m src.long_video.infer_exp46_from_store \
-  --feature-store-dir data/features_long/primaparte_0215_1215_exp46 \
-  --windows-csv outputs/long_video/primaparte_0215_1215_exp46/windows_manifest.csv \
-  --output-dir outputs/long_video/primaparte_0215_1215_exp46 \
-  --device 0 \
-  --batch-size 128 \
-  --num-frames 48 \
+Comando impostato per CPU su Windows. Non serve più passare `--num-frames`: la lunghezza della sequenza viene ricavata dalla finestra, come nel training sulle clip.
+
+```powershell
+python -m src.long_video.infer_exp46_from_store `
+  --feature-store-dir data/features_long/primaparte_0215_1215_exp46 `
+  --windows-csv outputs/long_video/primaparte_0215_1215_exp46/windows_manifest.csv `
+  --output-dir outputs/long_video/primaparte_0215_1215_exp46 `
+  --device cpu `
+  --batch-size 32 `
+  --no-amp `
   --overwrite
 ```
 
@@ -387,16 +417,16 @@ python -m src.long_video.infer_exp46_from_store \
 
 ## 5B. Post-processing validation completa
 
-```bash
-python -m src.long_video.postprocess_events \
-  --predictions-csv outputs/long_video/primaparte_0215_1215_exp46/window_predictions_raw.csv \
-  --output-dir outputs/long_video/primaparte_0215_1215_exp46 \
-  --smooth-window 3 \
-  --min-event-duration-sec 0.4 \
-  --merge-gap-sec 0.75 \
-  --temporal-nms-iou 0.50 \
-  --min-conf-passaggio 0.55 \
-  --min-conf-tiro 0.40 \
+```powershell
+python -m src.long_video.postprocess_events `
+  --predictions-csv outputs/long_video/primaparte_0215_1215_exp46/window_predictions_raw.csv `
+  --output-dir outputs/long_video/primaparte_0215_1215_exp46 `
+  --smooth-window 3 `
+  --min-event-duration-sec 0.4 `
+  --merge-gap-sec 0.75 `
+  --temporal-nms-iou 0.50 `
+  --min-conf-passaggio 0.55 `
+  --min-conf-tiro 0.40 `
   --overwrite
 ```
 
@@ -404,13 +434,13 @@ python -m src.long_video.postprocess_events \
 
 ## 6B. Preview video validation completa
 
-```bash
-python -m src.long_video.render_preview \
-  --input-video data/datasets/dataset_basket_v1/videos/PrimaParte.mp4 \
-  --events-csv outputs/long_video/primaparte_0215_1215_exp46/events_postprocessed.csv \
-  --output-video outputs/long_video/primaparte_0215_1215_exp46/preview_annotated.mp4 \
-  --start-sec 135 \
-  --end-sec 735 \
+```powershell
+python -m src.long_video.render_preview `
+  --input-video data/datasets/dataset_basket_v1/videos/PrimaParte.mp4 `
+  --events-csv outputs/long_video/primaparte_0215_1215_exp46/events_postprocessed.csv `
+  --output-video outputs/long_video/primaparte_0215_1215_exp46/preview_annotated.mp4 `
+  --start-sec 135 `
+  --end-sec 735 `
   --overwrite
 ```
 
@@ -418,15 +448,15 @@ python -m src.long_video.render_preview \
 
 ## 7B. Valutazione automatica validation completa
 
-```bash
-python -m src.long_video.evaluate_events_from_manifest \
-  --manifest data/datasets/dataset_basket_v1/manifest.csv \
-  --pred-events-csv outputs/long_video/primaparte_0215_1215_exp46/events_postprocessed.csv \
-  --video-id prima_parte \
-  --start-sec 135 \
-  --end-sec 735 \
-  --output-dir outputs/long_video/primaparte_0215_1215_exp46/evaluation \
-  --iou-threshold 0.30 \
+```powershell
+python -m src.long_video.evaluate_events_from_manifest `
+  --manifest data/datasets/dataset_basket_v1/manifest.csv `
+  --pred-events-csv outputs/long_video/primaparte_0215_1215_exp46/events_postprocessed.csv `
+  --video-id prima_parte `
+  --start-sec 135 `
+  --end-sec 735 `
+  --output-dir outputs/long_video/primaparte_0215_1215_exp46/evaluation `
+  --iou-threshold 0.30 `
   --overwrite
 ```
 
@@ -448,17 +478,18 @@ Da usare solo alla fine, dopo aver scelto definitivamente soglie, finestre e pos
 
 ## 2C. Estrazione feature store test completo
 
-```bash
-python -m src.long_video.extract_feature_store \
-  --input-video data/datasets/dataset_basket_v1/videos/PSA_converted.mp4 \
-  --start-sec 10 \
-  --end-sec 610 \
-  --output-dir data/features_long/psa_converted_0010_1010_exp46 \
-  --feature-fps 24 \
-  --device 0 \
-  --batch-size-decode 128 \
-  --batch-size-dino 32 \
-  --batch-size-yolo 16 \
+Se stai usando un PC Windows senza GPU e hai già copiato questa feature store, salta questo comando.
+
+```powershell
+python -m src.long_video.extract_feature_store `
+  --input-video data/datasets/dataset_basket_v1/videos/PSA_converted.mp4 `
+  --start-sec 10 `
+  --end-sec 610 `
+  --output-dir data/features_long/psa_converted_0010_1010_exp46 `
+  --device 0 `
+  --batch-size-decode 128 `
+  --batch-size-dino 32 `
+  --batch-size-yolo 16 `
   --overwrite
 ```
 
@@ -466,12 +497,12 @@ python -m src.long_video.extract_feature_store \
 
 ## 3C. Creazione finestre test completo
 
-```bash
-python -m src.long_video.build_windows_from_store \
-  --feature-store-dir data/features_long/psa_converted_0010_1010_exp46 \
-  --output-dir outputs/long_video/psa_converted_0010_1010_exp46 \
-  --window-sizes 1.0 1.5 2.0 3.0 \
-  --stride-sec 0.25 \
+```powershell
+python -m src.long_video.build_windows_from_store `
+  --feature-store-dir data/features_long/psa_converted_0010_1010_exp46 `
+  --output-dir outputs/long_video/psa_converted_0010_1010_exp46 `
+  --window-sizes 0.5 0.75 1.0 1.5 2.0 `
+  --stride-sec 0.25 `
   --overwrite
 ```
 
@@ -479,14 +510,16 @@ python -m src.long_video.build_windows_from_store \
 
 ## 4C. Inferenza `exp_46` test completo
 
-```bash
-python -m src.long_video.infer_exp46_from_store \
-  --feature-store-dir data/features_long/psa_converted_0010_1010_exp46 \
-  --windows-csv outputs/long_video/psa_converted_0010_1010_exp46/windows_manifest.csv \
-  --output-dir outputs/long_video/psa_converted_0010_1010_exp46 \
-  --device 0 \
-  --batch-size 128 \
-  --num-frames 48 \
+Comando impostato per CPU su Windows. Non serve più passare `--num-frames`: la lunghezza della sequenza viene ricavata dalla finestra, come nel training sulle clip.
+
+```powershell
+python -m src.long_video.infer_exp46_from_store `
+  --feature-store-dir data/features_long/psa_converted_0010_1010_exp46 `
+  --windows-csv outputs/long_video/psa_converted_0010_1010_exp46/windows_manifest.csv `
+  --output-dir outputs/long_video/psa_converted_0010_1010_exp46 `
+  --device cpu `
+  --batch-size 32 `
+  --no-amp `
   --overwrite
 ```
 
@@ -494,16 +527,16 @@ python -m src.long_video.infer_exp46_from_store \
 
 ## 5C. Post-processing test completo
 
-```bash
-python -m src.long_video.postprocess_events \
-  --predictions-csv outputs/long_video/psa_converted_0010_1010_exp46/window_predictions_raw.csv \
-  --output-dir outputs/long_video/psa_converted_0010_1010_exp46 \
-  --smooth-window 3 \
-  --min-event-duration-sec 0.4 \
-  --merge-gap-sec 0.75 \
-  --temporal-nms-iou 0.50 \
-  --min-conf-passaggio 0.55 \
-  --min-conf-tiro 0.40 \
+```powershell
+python -m src.long_video.postprocess_events `
+  --predictions-csv outputs/long_video/psa_converted_0010_1010_exp46/window_predictions_raw.csv `
+  --output-dir outputs/long_video/psa_converted_0010_1010_exp46 `
+  --smooth-window 3 `
+  --min-event-duration-sec 0.4 `
+  --merge-gap-sec 0.75 `
+  --temporal-nms-iou 0.50 `
+  --min-conf-passaggio 0.55 `
+  --min-conf-tiro 0.40 `
   --overwrite
 ```
 
@@ -511,13 +544,13 @@ python -m src.long_video.postprocess_events \
 
 ## 6C. Preview video test completo
 
-```bash
-python -m src.long_video.render_preview \
-  --input-video data/datasets/dataset_basket_v1/videos/PSA_converted.mp4 \
-  --events-csv outputs/long_video/psa_converted_0010_1010_exp46/events_postprocessed.csv \
-  --output-video outputs/long_video/psa_converted_0010_1010_exp46/preview_annotated.mp4 \
-  --start-sec 10 \
-  --end-sec 610 \
+```powershell
+python -m src.long_video.render_preview `
+  --input-video data/datasets/dataset_basket_v1/videos/PSA_converted.mp4 `
+  --events-csv outputs/long_video/psa_converted_0010_1010_exp46/events_postprocessed.csv `
+  --output-video outputs/long_video/psa_converted_0010_1010_exp46/preview_annotated.mp4 `
+  --start-sec 10 `
+  --end-sec 610 `
   --overwrite
 ```
 
@@ -525,15 +558,15 @@ python -m src.long_video.render_preview \
 
 ## 7C. Valutazione automatica test completo
 
-```bash
-python -m src.long_video.evaluate_events_from_manifest \
-  --manifest data/datasets/dataset_basket_v1/manifest.csv \
-  --pred-events-csv outputs/long_video/psa_converted_0010_1010_exp46/events_postprocessed.csv \
-  --video-id psa_converted \
-  --start-sec 10 \
-  --end-sec 610 \
-  --output-dir outputs/long_video/psa_converted_0010_1010_exp46/evaluation \
-  --iou-threshold 0.30 \
+```powershell
+python -m src.long_video.evaluate_events_from_manifest `
+  --manifest data/datasets/dataset_basket_v1/manifest.csv `
+  --pred-events-csv outputs/long_video/psa_converted_0010_1010_exp46/events_postprocessed.csv `
+  --video-id psa_converted `
+  --start-sec 10 `
+  --end-sec 610 `
+  --output-dir outputs/long_video/psa_converted_0010_1010_exp46/evaluation `
+  --iou-threshold 0.30 `
   --overwrite
 ```
 
@@ -553,38 +586,38 @@ Questo comando va usato solo alla fine, dopo aver scelto la configurazione migli
 
 Non rieseguire feature extraction, windows e inferenza. Rilancia solo:
 
-```bash
-python -m src.long_video.postprocess_events \
-  --predictions-csv outputs/long_video/primaparte_0215_1215_exp46/window_predictions_raw.csv \
-  --output-dir outputs/long_video/primaparte_0215_1215_exp46 \
-  --smooth-window 3 \
-  --min-event-duration-sec 0.4 \
-  --merge-gap-sec 0.75 \
-  --temporal-nms-iou 0.50 \
-  --min-conf-passaggio 0.55 \
-  --min-conf-tiro 0.40 \
+```powershell
+python -m src.long_video.postprocess_events `
+  --predictions-csv outputs/long_video/primaparte_0215_1215_exp46/window_predictions_raw.csv `
+  --output-dir outputs/long_video/primaparte_0215_1215_exp46 `
+  --smooth-window 3 `
+  --min-event-duration-sec 0.4 `
+  --merge-gap-sec 0.75 `
+  --temporal-nms-iou 0.50 `
+  --min-conf-passaggio 0.55 `
+  --min-conf-tiro 0.40 `
   --overwrite
 ```
 
-```bash
-python -m src.long_video.render_preview \
-  --input-video data/datasets/dataset_basket_v1/videos/PrimaParte.mp4 \
-  --events-csv outputs/long_video/primaparte_0215_1215_exp46/events_postprocessed.csv \
-  --output-video outputs/long_video/primaparte_0215_1215_exp46/preview_annotated.mp4 \
-  --start-sec 135 \
-  --end-sec 735 \
+```powershell
+python -m src.long_video.render_preview `
+  --input-video data/datasets/dataset_basket_v1/videos/PrimaParte.mp4 `
+  --events-csv outputs/long_video/primaparte_0215_1215_exp46/events_postprocessed.csv `
+  --output-video outputs/long_video/primaparte_0215_1215_exp46/preview_annotated.mp4 `
+  --start-sec 135 `
+  --end-sec 735 `
   --overwrite
 ```
 
-```bash
-python -m src.long_video.evaluate_events_from_manifest \
-  --manifest data/datasets/dataset_basket_v1/manifest.csv \
-  --pred-events-csv outputs/long_video/primaparte_0215_1215_exp46/events_postprocessed.csv \
-  --video-id prima_parte \
-  --start-sec 135 \
-  --end-sec 735 \
-  --output-dir outputs/long_video/primaparte_0215_1215_exp46/evaluation \
-  --iou-threshold 0.30 \
+```powershell
+python -m src.long_video.evaluate_events_from_manifest `
+  --manifest data/datasets/dataset_basket_v1/manifest.csv `
+  --pred-events-csv outputs/long_video/primaparte_0215_1215_exp46/events_postprocessed.csv `
+  --video-id prima_parte `
+  --start-sec 135 `
+  --end-sec 735 `
+  --output-dir outputs/long_video/primaparte_0215_1215_exp46/evaluation `
+  --iou-threshold 0.30 `
   --overwrite
 ```
 
@@ -600,13 +633,15 @@ render_preview.py
 evaluate_events_from_manifest.py
 ```
 
-## Se cambi `feature-fps`, segmento video, DINOv3 o YOLO
+## Se cambi segmento video, DINOv3 o YOLO
 
 Rilancia tutta la pipeline da:
 
 ```text
 extract_feature_store.py
 ```
+
+La pipeline non usa più `feature-fps`: la feature store viene estratta sui frame reali del video sorgente.
 
 ---
 
@@ -621,7 +656,7 @@ macro_f1_active_classes
 f1_micro
 precision_micro
 recall_micro
-mean_iou
+matched_mean_iou
 center_mae_sec
 true_positive
 false_positive
@@ -637,21 +672,23 @@ e non peggiora in modo evidente recall dei tiri, precision dei passaggi e qualit
 
 Per leggere rapidamente il risultato di un run:
 
-```bash
-cat outputs/long_video/primaparte_0215_1215_exp46/evaluation/event_metrics.md
+```powershell
+Get-Content outputs/long_video/primaparte_0215_1215_exp46/evaluation/event_metrics.md
 ```
 
 Per controllare gli errori:
 
-```bash
-python - <<'PY'
+```powershell
+@'
+from pathlib import Path
 import pandas as pd
-base = 'outputs/long_video/primaparte_0215_1215_exp46/evaluation'
+
+base = Path('outputs/long_video/primaparte_0215_1215_exp46/evaluation')
 print('False positives:')
-print(pd.read_csv(f'{base}/false_positives.csv').head(20))
+print(pd.read_csv(base / 'false_positives.csv').head(20))
 print('False negatives:')
-print(pd.read_csv(f'{base}/false_negatives.csv').head(20))
-PY
+print(pd.read_csv(base / 'false_negatives.csv').head(20))
+'@ | python
 ```
 
 ---
