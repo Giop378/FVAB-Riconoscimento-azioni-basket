@@ -10,16 +10,20 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterator
 
 import cv2
 import numpy as np
 import torch
-from PIL import Image
 from tqdm import tqdm
-from torchvision import transforms
-from torchvision.transforms import InterpolationMode
 
+from src.features.dinov3_extractor import (
+    DINO_FEATURE_DIMS,
+    DINOv3FeatureExtractor,
+    build_dino_transform,
+    extract_dino_features_for_frames,
+    get_dino_config,
+)
 from src.long_video import defaults
 
 
@@ -67,6 +71,8 @@ def parse_device_for_torch(device: str) -> torch.device:
     if device.lower() == "cpu":
         return torch.device("cpu")
     if torch.cuda.is_available():
+        if device == "cuda":
+            return torch.device("cuda")
         if device.startswith("cuda"):
             return torch.device(device)
         return torch.device(f"cuda:{device}")
@@ -81,8 +87,8 @@ def parse_device_for_yolo(device: str) -> str:
     return device.replace("cuda:", "")
 
 
-def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str | None:
-    if not path.exists() or not path.is_file():
+def file_sha256(path: Path | None, chunk_size: int = 1024 * 1024) -> str | None:
+    if path is None or not path.exists() or not path.is_file():
         return None
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -141,13 +147,11 @@ def make_source_frame_grid(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Crea una griglia usando tutti i frame reali del video sorgente.
 
-    Questa è la modalità train-like per la pipeline long-video: come nelle clip
-    usate per il training, ogni frame reale compreso nel segmento produce una
-    feature DINOv3 e una riga di primitive YOLO palla/canestro.
+    È la modalità train-like per la pipeline long-video: come nelle clip usate
+    per il training, ogni frame reale compreso nel segmento produce una feature
+    DINOv3 e una riga di primitive YOLO palla/canestro.
 
-    La finestra temporale è trattata come [start_sec, end_sec):
-    - il primo frame è il primo con timestamp >= start_sec;
-    - il limite end_sec è escluso.
+    La finestra temporale è [start_sec, end_sec): end_sec escluso.
     """
     if start_sec < 0:
         raise ValueError(f"start_sec deve essere >= 0, trovato {start_sec}")
@@ -187,12 +191,7 @@ def iter_sampled_frame_batches(
     frame_indices: np.ndarray,
     batch_size: int,
 ) -> Iterator[tuple[np.ndarray, list[np.ndarray]]]:
-    """Yield batch di frame BGR seguendo gli indici campionati in ordine temporale.
-
-    sample_positions contiene le posizioni nell'array globale, frame_indices gli indici
-    frame assoluti nel video. Il decoder procede in avanti e riusa il frame precedente
-    se due sample puntano allo stesso frame.
-    """
+    """Yield batch di frame BGR seguendo gli indici campionati in ordine temporale."""
     if batch_size <= 0:
         raise ValueError(f"batch_size deve essere > 0, trovato {batch_size}")
     if len(sample_positions) != len(frame_indices):
@@ -254,186 +253,6 @@ def iter_sampled_frame_batches(
             yield np.asarray(batch_positions, dtype=np.int64), batch_frames
     finally:
         cap.release()
-
-
-# =============================================================================
-# DINOv3
-# =============================================================================
-
-
-def build_dino_transform(input_size: int, resize_mode: str) -> transforms.Compose:
-    if resize_mode == "stretch":
-        resize = transforms.Resize(
-            (input_size, input_size),
-            interpolation=InterpolationMode.BICUBIC,
-            antialias=True,
-        )
-    elif resize_mode == "center_crop":
-        resize = transforms.Compose(
-            [
-                transforms.Resize(
-                    input_size,
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True,
-                ),
-                transforms.CenterCrop(input_size),
-            ]
-        )
-    else:
-        raise ValueError(f"resize_mode non supportato: {resize_mode}")
-
-    return transforms.Compose(
-        [
-            resize,
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.485, 0.456, 0.406),
-                std=(0.229, 0.224, 0.225),
-            ),
-        ]
-    )
-
-
-def load_dinov3_model(
-    repo_path: Path,
-    model_name: str,
-    device: torch.device,
-    weights_path: Path | None = None,
-) -> torch.nn.Module:
-    ensure_exists(repo_path, "Repository DINOv3", must_be_file=False)
-    if weights_path is not None:
-        ensure_exists(weights_path, "Pesi DINOv3", must_be_file=True)
-
-    attempts: list[tuple[str, dict[str, Any]]] = []
-    if weights_path is not None:
-        attempts.extend(
-            [
-                ("weights=Path", {"weights": str(weights_path)}),
-                ("pretrained=False + weights=Path", {"pretrained": False, "weights": str(weights_path)}),
-            ]
-        )
-    attempts.extend(
-        [
-            ("default", {}),
-            ("pretrained=True", {"pretrained": True}),
-            ("pretrained=False", {"pretrained": False}),
-        ]
-    )
-
-    errors: list[str] = []
-    for label, kwargs in attempts:
-        try:
-            print(f"Caricamento DINOv3: torch.hub.load(..., {model_name}, {label})")
-            model = torch.hub.load(
-                str(repo_path),
-                model_name,
-                source="local",
-                **kwargs,
-            )
-            model.eval().to(device)
-            return model
-        except Exception as exc:  # noqa: BLE001 - qui vogliamo provare più firme possibili
-            errors.append(f"- {label}: {type(exc).__name__}: {exc}")
-
-    raise RuntimeError(
-        "Impossibile caricare il modello DINOv3. Tentativi falliti:\n" + "\n".join(errors)
-    )
-
-
-def tensor_from_bgr_frame(frame_bgr: np.ndarray, transform: transforms.Compose) -> torch.Tensor:
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    image = Image.fromarray(frame_rgb)
-    return transform(image)
-
-
-def model_output_to_features(output: Any) -> torch.Tensor:
-    """Normalizza l'output di diversi wrapper DINO in una matrice [B, D]."""
-    if isinstance(output, dict):
-        preferred_keys = [
-            "x_norm_clstoken",
-            "cls_token",
-            "pooler_output",
-            "features",
-            "last_hidden_state",
-            "x_norm_patchtokens",
-        ]
-        selected = None
-        selected_key = None
-        for key in preferred_keys:
-            if key in output and torch.is_tensor(output[key]):
-                selected = output[key]
-                selected_key = key
-                break
-        if selected is None:
-            tensor_values = [v for v in output.values() if torch.is_tensor(v)]
-            if not tensor_values:
-                raise TypeError("Output modello dict senza tensori utilizzabili.")
-            selected = tensor_values[0]
-            selected_key = "<first_tensor>"
-
-        if selected.ndim == 3:
-            if selected_key == "x_norm_patchtokens":
-                return selected.mean(dim=1)
-            return selected[:, 0]
-        if selected.ndim == 2:
-            return selected
-        if selected.ndim == 4:
-            return selected.flatten(2).mean(dim=-1)
-        raise ValueError(f"Tensor output DINO non supportato: key={selected_key}, shape={tuple(selected.shape)}")
-
-    if isinstance(output, (list, tuple)):
-        if len(output) == 0:
-            raise TypeError("Output modello vuoto.")
-        return model_output_to_features(output[0])
-
-    if torch.is_tensor(output):
-        if output.ndim == 2:
-            return output
-        if output.ndim == 3:
-            return output[:, 0]
-        if output.ndim == 4:
-            return output.flatten(2).mean(dim=-1)
-        raise ValueError(f"Tensor output DINO non supportato: shape={tuple(output.shape)}")
-
-    raise TypeError(f"Tipo output DINO non supportato: {type(output)}")
-
-
-def extract_dino_features_for_frames(
-    frames_bgr: list[np.ndarray],
-    model: torch.nn.Module,
-    transform: transforms.Compose,
-    device: torch.device,
-    batch_size: int,
-    expected_dim: int,
-    use_amp: bool,
-) -> np.ndarray:
-    if batch_size <= 0:
-        raise ValueError(f"batch_size_dino deve essere > 0, trovato {batch_size}")
-
-    all_features: list[np.ndarray] = []
-    amp_enabled = bool(use_amp and device.type == "cuda")
-
-    with torch.inference_mode():
-        for start in range(0, len(frames_bgr), batch_size):
-            sub_frames = frames_bgr[start : start + batch_size]
-            batch = torch.stack([tensor_from_bgr_frame(f, transform) for f in sub_frames], dim=0)
-            batch = batch.to(device, non_blocking=True)
-
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
-                output = model(batch)
-                features = model_output_to_features(output)
-
-            if features.ndim != 2:
-                raise RuntimeError(f"Feature DINO non bidimensionali: {tuple(features.shape)}")
-            if features.shape[1] != expected_dim:
-                raise RuntimeError(
-                    f"Dimensione feature DINO inattesa: {features.shape[1]} invece di {expected_dim}. "
-                    f"Controlla modello/pesi DINO."
-                )
-
-            all_features.append(features.detach().float().cpu().numpy().astype(np.float32))
-
-    return np.concatenate(all_features, axis=0)
 
 
 # =============================================================================
@@ -567,6 +386,7 @@ def run_yolo_on_frames(
             conf=conf,
             iou=iou,
             device=device,
+            classes=[int(ball_class_id), int(rim_class_id)],
             verbose=False,
         )
 
@@ -638,7 +458,7 @@ def run_yolo_on_frames(
 
 
 # =============================================================================
-# Main extraction
+# Output
 # =============================================================================
 
 
@@ -650,6 +470,25 @@ def write_metadata(
     frame_indices: np.ndarray,
     started_at: float,
 ) -> None:
+    dino_meta: dict[str, Any]
+    if args.skip_dino:
+        dino_meta = {"enabled": False, "output_file": None}
+    else:
+        dino_meta = get_dino_config(
+            model_name=args.dino_model_name,
+            weights=args.dino_weights,
+            repo_or_dir=args.dino_repo,
+            source=args.dino_source,
+            image_size=args.dino_input_size,
+        )
+        dino_meta.update(
+            {
+                "enabled": True,
+                "weights_sha256": file_sha256(args.dino_weights),
+                "output_file": "dinov3_features.npy",
+            }
+        )
+
     metadata = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "elapsed_sec": round(time.time() - started_at, 3),
@@ -676,16 +515,7 @@ def write_metadata(
             "first_frame_index": int(frame_indices[0]),
             "last_frame_index": int(frame_indices[-1]),
         },
-        "dinov3": {
-            "enabled": not args.skip_dino,
-            "repo": str(args.dino_repo),
-            "weights": str_or_none(args.dino_weights),
-            "model_name": args.dino_model_name,
-            "input_size": args.dino_input_size,
-            "resize_mode": args.dino_resize_mode,
-            "feature_dim": args.dino_feature_dim,
-            "output_file": "dinov3_features.npy" if not args.skip_dino else None,
-        },
+        "dinov3": dino_meta,
         "yolo": {
             "enabled_v1": not args.skip_yolo_v1,
             "enabled_v2": not args.skip_yolo_v2,
@@ -696,6 +526,7 @@ def write_metadata(
             "imgsz": args.imgsz,
             "conf": args.conf,
             "iou": args.iou,
+            "classes_filter": [int(args.ball_class_id), int(args.rim_class_id)],
             "ball_class_id": args.ball_class_id,
             "rim_class_id": args.rim_class_id,
         },
@@ -704,7 +535,7 @@ def write_metadata(
             "batch_size_decode": args.batch_size_decode,
             "batch_size_dino": args.batch_size_dino,
             "batch_size_yolo": args.batch_size_yolo,
-            "amp": not args.no_amp,
+            "amp": bool(args.amp),
         },
         "files": {
             "metadata": "metadata.json",
@@ -737,11 +568,17 @@ def save_primitives_npz(
     )
 
 
+# =============================================================================
+# CLI
+# =============================================================================
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Estrae una feature store temporale per la pipeline long-video: "
-            "DINOv3 frame-level + primitive YOLO palla/canestro su un segmento video."
+            "DINOv3 frame-level + primitive YOLO palla/canestro su un segmento video. "
+            "La logica DINOv3 è la stessa usata per le clip."
         )
     )
 
@@ -756,20 +593,30 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--overwrite", action="store_true")
 
-    parser.add_argument("--dino-repo", type=Path, default=defaults.DINOV3_REPO)
-    parser.add_argument("--dino-weights", type=Path, default=None)
-    parser.add_argument("--dino-model-name", type=str, default="dinov3_vitl16")
+    parser.add_argument("--dino-repo", type=Path, default=getattr(defaults, "DINOV3_REPO", Path("third_party/dinov3")))
+    parser.add_argument("--dino-weights", type=Path, default=getattr(defaults, "DINOV3_WEIGHTS", None))
+    parser.add_argument("--dino-source", type=str, default=getattr(defaults, "DINOV3_SOURCE", "local"), choices=["local", "github"])
+    parser.add_argument("--dino-model-name", type=str, default=getattr(defaults, "DINOV3_MODEL_NAME", "dinov3_vitl16"), choices=list(DINO_FEATURE_DIMS.keys()))
     parser.add_argument("--dino-input-size", type=int, default=defaults.DINOV3_INPUT_SIZE)
     parser.add_argument("--dino-feature-dim", type=int, default=defaults.DINOV3_FEATURE_DIM)
     parser.add_argument(
         "--dino-resize-mode",
         type=str,
         default="stretch",
-        choices=["stretch", "center_crop"],
-        help="stretch replica la resize diretta a 336x336; center_crop mantiene il rapporto d'aspetto.",
+        choices=["stretch"],
+        help="Compatibilità CLI: la pipeline supporta solo stretch, come nelle clip.",
     )
     parser.add_argument("--skip-dino", action="store_true")
-    parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Abilita AMP per DINOv3. Default disattivato per massimizzare la coerenza con le clip.",
+    )
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help=argparse.SUPPRESS,  # accettato per compatibilità con i vecchi comandi
+    )
 
     parser.add_argument("--yolo-v1-weights", type=Path, default=defaults.YOLO_V1_WEIGHTS)
     parser.add_argument("--yolo-v2-weights", type=Path, default=defaults.YOLO_V2_WEIGHTS)
@@ -788,6 +635,10 @@ def main() -> None:
     args = make_parser().parse_args()
     started_at = time.time()
 
+    # Vecchio flag: se presente, forza AMP off.
+    if getattr(args, "no_amp", False):
+        args.amp = False
+
     args.input_video = as_path(args.input_video)
     args.output_dir = as_path(args.output_dir)
     args.dino_repo = as_path(args.dino_repo)
@@ -797,13 +648,30 @@ def main() -> None:
 
     assert args.input_video is not None
     assert args.output_dir is not None
-    assert args.dino_repo is not None
     assert args.yolo_v1_weights is not None
     assert args.yolo_v2_weights is not None
 
     ensure_exists(args.input_video, "Video input", must_be_file=True)
+
     if not args.skip_dino:
+        if args.dino_weights is None:
+            raise ValueError(
+                "I pesi DINOv3 sono obbligatori. Imposta defaults.DINOV3_WEIGHTS "
+                "oppure passa --dino-weights."
+            )
+        assert args.dino_repo is not None
         ensure_exists(args.dino_repo, "Repository DINOv3", must_be_file=False)
+        ensure_exists(args.dino_weights, "Pesi DINOv3", must_be_file=True)
+
+        expected_dim = int(DINO_FEATURE_DIMS[args.dino_model_name])
+        if int(args.dino_feature_dim) != expected_dim:
+            raise ValueError(
+                f"--dino-feature-dim={args.dino_feature_dim} non coerente con "
+                f"{args.dino_model_name}, che richiede {expected_dim}."
+            )
+        if args.dino_resize_mode != "stretch":
+            raise ValueError("La pipeline supporta solo --dino-resize-mode stretch.")
+
     if not args.skip_yolo_v1:
         ensure_exists(args.yolo_v1_weights, "Pesi YOLO v1", must_be_file=True)
     if not args.skip_yolo_v2:
@@ -842,16 +710,28 @@ def main() -> None:
     yolo_device = parse_device_for_yolo(args.device)
 
     dino_model: torch.nn.Module | None = None
-    dino_transform: transforms.Compose | None = None
+    dino_transform = None
     dino_features = None
     if not args.skip_dino:
-        dino_model = load_dinov3_model(
-            repo_path=args.dino_repo,
+        print("\n=== DINOv3 ===")
+        print(f"repo:        {args.dino_repo}")
+        print(f"source:      {args.dino_source}")
+        print(f"weights:     {args.dino_weights}")
+        print(f"model:       {args.dino_model_name}")
+        print(f"input size:  {args.dino_input_size}")
+        print("resize:      stretch, no center crop")
+        print("output:      x_norm_clstoken")
+        print(f"amp:         {bool(args.amp)}")
+
+        dino_model = DINOv3FeatureExtractor(
             model_name=args.dino_model_name,
-            device=torch_device,
-            weights_path=args.dino_weights,
-        )
-        dino_transform = build_dino_transform(args.dino_input_size, args.dino_resize_mode)
+            weights=args.dino_weights,
+            repo_or_dir=args.dino_repo,
+            source=args.dino_source,
+        ).to(torch_device)
+        dino_model.eval()
+
+        dino_transform = build_dino_transform(args.dino_input_size)
         dino_features = np.lib.format.open_memmap(
             args.output_dir / "dinov3_features.npy",
             mode="w+",
@@ -918,7 +798,7 @@ def main() -> None:
                     device=torch_device,
                     batch_size=args.batch_size_dino,
                     expected_dim=args.dino_feature_dim,
-                    use_amp=not args.no_amp,
+                    use_amp=bool(args.amp),
                 )
                 if feats.shape[0] != len(batch_positions):
                     raise RuntimeError(

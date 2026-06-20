@@ -46,8 +46,17 @@ TEST_END_SEC = 610.0
 # =============================================================================
 
 DINOV3_REPO = Path("third_party/dinov3")
+DINOV3_SOURCE = "local"
+DINOV3_MODEL_NAME = "dinov3_vitl16"
 DINOV3_INPUT_SIZE = 336
 DINOV3_FEATURE_DIM = 1024
+DINOV3_OUTPUT_TOKEN = "x_norm_clstoken"
+
+# Pesi DINOv3 da usare sia per le clip sia per i video lunghi.
+# Aggiorna questo path se nel tuo progetto i checkpoint sono salvati altrove.
+DINOV3_WEIGHTS = Path(
+    "checkpoints/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+)
 
 # Feature DINOv3 già usate negli esperimenti clip-level.
 # Per la pipeline long-video verranno create nuove feature store in data/features_long.
@@ -159,6 +168,13 @@ YOLO_V2_PRIMITIVES_FILENAME = "yolo_v2_primitives.npz"
 
 WINDOWS_MANIFEST_FILENAME = "windows_manifest.csv"
 WINDOWS_METADATA_FILENAME = "windows_metadata.json"
+
+WINDOW_FEATURES_DIRNAME = "window_features_exp46"
+WINDOW_FEATURES_L1_FILENAME = "window_features_l1.npz"
+WINDOW_FEATURES_L2_FILENAME = "window_features_l2.npz"
+WINDOW_FEATURES_L3_FILENAME = "window_features_l3.npz"
+WINDOW_FEATURES_INDEX_FILENAME = "window_features_index.json"
+WINDOW_FEATURES_METADATA_FILENAME = "window_features_metadata.json"
 
 WINDOW_PREDICTIONS_FILENAME = "window_predictions_raw.csv"
 INFERENCE_METADATA_FILENAME = "inference_metadata.json"

@@ -19,6 +19,10 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from src.long_video import defaults
+from src.features.extract_ball_rim_tracking_features import (
+    compute_pair_features,
+    compute_temporal_sequence_features,
+)
 
 
 # =============================================================================
@@ -64,14 +68,17 @@ MODEL_CLASS_CANDIDATES = [
 # Policy temporale long-video train-like
 # =============================================================================
 
-# Nella pipeline long-video vogliamo replicare il più possibile il training su clip:
-# - DINOv3 usa tutte le feature/frame della finestra;
-# - il tracking palla/canestro usa al massimo 48 frame campionati uniformemente;
-# - il tracking viene poi interpolato alla lunghezza DINO e concatenato per timestep;
-# - il modello riceve sequenze a lunghezza variabile con padding e lengths reali.
+# Replica il training delle sequenze tracking clip-level:
+# - DINOv3 usa tutti i frame/source samples della finestra;
+# - il tracking palla/canestro usa al massimo 48 frame uniformi, come
+#   extract_ball_rim_tracking_features.py;
+# - le feature temporali vengono costruite con compute_temporal_sequence_features;
+# - il tracking viene normalizzato con mean/std salvati nel checkpoint;
+# - il modello riceve sequenze a lunghezza variabile con lengths reali.
 TRACKING_MAX_FRAMES_PER_WINDOW = 48
-TRACKING_VELOCITY_MODE = "per_second"
-TEMPORAL_POLICY = "train_like_dino_all_frames_tracking_max_48"
+TRACKING_NEAR_THRESHOLD = 0.12
+TRACKING_RIM_INSIDE_MARGIN = 0.15
+TEMPORAL_POLICY = "train_like_dino_all_frames_tracking_traincode_max48_checkpoint_zscore"
 
 
 # =============================================================================
@@ -108,6 +115,9 @@ class LevelBundle:
     feature_names: list[str]
     labels: list[str]
     model: nn.Module
+    tracking_normalized: bool
+    tracking_mean: np.ndarray
+    tracking_std: np.ndarray
 
 
 @dataclass
@@ -613,6 +623,59 @@ def extract_labels_from_checkpoint(
     return list(default_labels)
 
 
+def get_tracking_normalizer(
+    name: str,
+    tracking_config: dict[str, Any],
+    num_features: int,
+) -> tuple[bool, np.ndarray, np.ndarray]:
+    """Legge mean/std dal checkpoint per replicare la normalizzazione del training."""
+    normalized = bool(tracking_config.get("normalized", False))
+    mean_value = tracking_config.get("mean")
+    std_value = tracking_config.get("std")
+
+    if normalized:
+        if mean_value is None or std_value is None:
+            raise ValueError(
+                f"{name}: tracking_config.normalized=True ma mean/std sono assenti nel checkpoint."
+            )
+        mean = np.asarray(mean_value, dtype=np.float32)
+        std = np.asarray(std_value, dtype=np.float32)
+    else:
+        mean = np.zeros((num_features,), dtype=np.float32)
+        std = np.ones((num_features,), dtype=np.float32)
+
+    if mean.ndim != 1 or std.ndim != 1:
+        raise ValueError(
+            f"{name}: mean/std tracking devono essere vettori 1D, trovati {mean.shape} e {std.shape}."
+        )
+    if mean.shape[0] != int(num_features) or std.shape[0] != int(num_features):
+        raise ValueError(
+            f"{name}: dimensione mean/std tracking non coerente. "
+            f"Feature={num_features}, mean={mean.shape[0]}, std={std.shape[0]}."
+        )
+
+    std = np.where(np.abs(std) < 1e-6, 1.0, std).astype(np.float32)
+    return normalized, mean.astype(np.float32), std.astype(np.float32)
+
+
+def apply_tracking_normalization(tracking_seq: np.ndarray, level: LevelBundle) -> np.ndarray:
+    """Applica z-score alle feature tracking [T, K] se il checkpoint lo richiede."""
+    tracking_seq = np.asarray(tracking_seq, dtype=np.float32)
+    if tracking_seq.ndim != 2:
+        raise ValueError(f"{level.name}: tracking_seq deve avere shape [T, K], trovato {tracking_seq.shape}.")
+    if tracking_seq.shape[1] != len(level.feature_names):
+        raise ValueError(
+            f"{level.name}: tracking_seq ha K={tracking_seq.shape[1]}, "
+            f"ma il checkpoint richiede K={len(level.feature_names)}."
+        )
+    if not level.tracking_normalized:
+        return tracking_seq.astype(np.float32)
+    return (
+        (tracking_seq - level.tracking_mean.reshape(1, -1))
+        / level.tracking_std.reshape(1, -1)
+    ).astype(np.float32)
+
+
 def load_level_bundle(
     name: str,
     checkpoint_path: Path,
@@ -656,6 +719,12 @@ def load_level_bundle(
             f"Trovate {len(feature_names)}, attese {expected_tracking_features}."
         )
 
+    tracking_normalized, tracking_mean, tracking_std = get_tracking_normalizer(
+        name=name,
+        tracking_config=tracking_config,
+        num_features=len(feature_names),
+    )
+
     if state_dict is not None:
         cleaned = strip_state_dict_prefixes(state_dict)
         try:
@@ -687,6 +756,7 @@ def load_level_bundle(
     print(f"[OK] {name}: {checkpoint_path}")
     print(f"     labels: {labels}")
     print(f"     tracking features: {len(feature_names)}")
+    print(f"     tracking normalized: {tracking_normalized}")
 
     return LevelBundle(
         name=name,
@@ -697,6 +767,9 @@ def load_level_bundle(
         feature_names=feature_names,
         labels=labels,
         model=model,
+        tracking_normalized=tracking_normalized,
+        tracking_mean=tracking_mean,
+        tracking_std=tracking_std,
     )
 
 
@@ -705,8 +778,7 @@ def model_forward_logits(
     x: torch.Tensor,
     lengths: torch.Tensor,
 ) -> torch.Tensor:
-    # La pipeline train-like usa sequenze a lunghezza variabile, come nel training:
-    # il batch è padded a Tmax, ma lengths contiene la lunghezza reale di ogni finestra.
+    # Replica il training: batch paddato a Tmax, lengths contiene la lunghezza reale.
     if lengths.ndim != 1 or lengths.shape[0] != x.shape[0]:
         raise ValueError(
             f"lengths deve avere shape [B], trovato {tuple(lengths.shape)} per x={tuple(x.shape)}"
@@ -716,7 +788,6 @@ def model_forward_logits(
     padding_mask = time_positions >= lengths.unsqueeze(1)
 
     attempts: list[Callable[[], Any]] = [
-        # TemporalTransformerActionClassifier del progetto richiede features e lengths.
         lambda: model(x, lengths=lengths),
         lambda: model(x, lengths),
         lambda: model(x, padding_mask=padding_mask),
@@ -755,91 +826,17 @@ def output_to_logits(output: Any) -> torch.Tensor:
 
 
 # =============================================================================
-# Campionamento feature da feature store
+# Costruzione feature tracking train-like
 # =============================================================================
 
-
-def make_query_times(start_time: float, end_time: float, num_frames: int) -> np.ndarray:
-    if num_frames < 2:
-        raise ValueError("num_frames deve essere >= 2")
-    return np.linspace(float(start_time), float(end_time), num_frames, endpoint=True, dtype=np.float64)
-
-
-def interpolate_matrix(
-    store_timestamps: np.ndarray,
-    matrix: np.ndarray,
-    query_times: np.ndarray,
-) -> np.ndarray:
-    """Interpolazione lineare vettoriale da [N, D] a [T, D]."""
-    q = np.clip(query_times.astype(np.float64), store_timestamps[0], store_timestamps[-1])
-    right = np.searchsorted(store_timestamps, q, side="left")
-    right = np.clip(right, 0, len(store_timestamps) - 1)
-    left = np.maximum(right - 1, 0)
-
-    exact_or_left = np.isclose(store_timestamps[right], q, rtol=0.0, atol=1e-9)
-    left = np.where(exact_or_left, right, left)
-
-    t_left = store_timestamps[left]
-    t_right = store_timestamps[right]
-    denom = np.maximum(t_right - t_left, 1e-12)
-    w = ((q - t_left) / denom).astype(np.float32)
-    w = np.where(left == right, 0.0, w).astype(np.float32)
-
-    a = np.asarray(matrix[left], dtype=np.float32)
-    b = np.asarray(matrix[right], dtype=np.float32)
-    return ((1.0 - w[:, None]) * a + w[:, None] * b).astype(np.float32)
-
-
-def sample_series_linear(
-    store_timestamps: np.ndarray,
-    values: np.ndarray,
-    query_times: np.ndarray,
-) -> np.ndarray:
-    values_f = values.astype(np.float32)
-    q = np.clip(query_times.astype(np.float64), store_timestamps[0], store_timestamps[-1])
-    return np.interp(q, store_timestamps, values_f).astype(np.float32)
-
-
-def sample_series_nearest(
-    store_timestamps: np.ndarray,
-    values: np.ndarray,
-    query_times: np.ndarray,
-) -> np.ndarray:
-    q = np.clip(query_times.astype(np.float64), store_timestamps[0], store_timestamps[-1])
-    right = np.searchsorted(store_timestamps, q, side="left")
-    right = np.clip(right, 0, len(store_timestamps) - 1)
-    left = np.maximum(right - 1, 0)
-    choose_right = np.abs(store_timestamps[right] - q) < np.abs(q - store_timestamps[left])
-    idx = np.where(choose_right, right, left)
-    return values[idx].astype(np.float32)
-
-
-def sample_primitives(
-    store_timestamps: np.ndarray,
-    primitives: dict[str, np.ndarray],
-    query_times: np.ndarray,
-) -> dict[str, np.ndarray]:
-    sampled: dict[str, np.ndarray] = {}
-    for key, values in primitives.items():
-        if key in {"timestamps", "frame_indices"}:
-            continue
-        if values.ndim != 1:
-            continue
-        if key.endswith("_detected") or key.startswith("num_") or key == "both_detected":
-            sampled[key] = sample_series_nearest(store_timestamps, values, query_times)
-        else:
-            sampled[key] = sample_series_linear(store_timestamps, values, query_times)
-
-    # Ricalcola both_detected dopo nearest sampling per evitare incoerenze.
-    if "ball_detected" in sampled and "rim_detected" in sampled:
-        sampled["both_detected"] = (
-            (sampled["ball_detected"] >= 0.5) & (sampled["rim_detected"] >= 0.5)
-        ).astype(np.float32)
-    return sampled
+# Nota: le vecchie funzioni di interpolazione diretta delle primitive sono state
+# rimosse. La pipeline exp_46 usa solo la strada train-like: ricostruzione dei
+# frame_rows e chiamata a compute_temporal_sequence_features, cioè la stessa
+# logica usata per le clip.
 
 
 def select_uniform_local_indices(num_items: int, max_items: int) -> np.ndarray:
-    """Replica la logica clip-level: usa tutti i frame se <= max_items, altrimenti 48 uniformi."""
+    """Stessa logica delle clip: usa tutti i frame se <= max_items, altrimenti max_items uniformi."""
     if num_items <= 0:
         return np.empty((0,), dtype=np.int64)
     if max_items <= 0 or num_items <= max_items:
@@ -877,353 +874,144 @@ def interpolate_sequence_array(sequence: np.ndarray, target_len: int) -> np.ndar
     return resized.astype(np.float32)
 
 
-# =============================================================================
-# Costruzione feature tracking
-# =============================================================================
+def primitive_value(primitives: dict[str, np.ndarray], name: str, idx: int, default: float = 0.0) -> float:
+    values = primitives.get(name)
+    if values is None:
+        return float(default)
+    return float(values[int(idx)])
 
 
-def delta_previous(x: np.ndarray) -> np.ndarray:
-    out = np.zeros_like(x, dtype=np.float32)
-    out[1:] = x[1:] - x[:-1]
-    return out
-
-
-def gradient_series(x: np.ndarray) -> np.ndarray:
-    if x.shape[0] <= 1:
-        return np.zeros_like(x, dtype=np.float32)
-    return np.gradient(x.astype(np.float32)).astype(np.float32)
-
-
-def safe_divide(a: np.ndarray, b: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    return (a / np.maximum(np.abs(b), eps)).astype(np.float32)
-
-
-def build_available_tracking_features(
-    sampled: dict[str, np.ndarray],
-    start_time: float,
-    end_time: float,
-    velocity_mode: str,
-) -> dict[str, np.ndarray]:
-    n = next(iter(sampled.values())).shape[0] if sampled else 0
-    duration = max(float(end_time - start_time), 1e-6)
-    t_rel = np.linspace(0.0, 1.0, n, endpoint=True, dtype=np.float32)
-
-    def get(name: str) -> np.ndarray:
-        if name in sampled:
-            return sampled[name].astype(np.float32)
-        return np.zeros((n,), dtype=np.float32)
-
-    ball_detected = (get("ball_detected") >= 0.5).astype(np.float32)
-    rim_detected = (get("rim_detected") >= 0.5).astype(np.float32)
-    both_detected = ((ball_detected > 0.5) & (rim_detected > 0.5)).astype(np.float32)
-
-    ball_xc = get("ball_xc")
-    ball_yc = get("ball_yc")
-    ball_w = get("ball_w")
-    ball_h = get("ball_h")
-    ball_x1 = get("ball_x1")
-    ball_y1 = get("ball_y1")
-    ball_x2 = get("ball_x2")
-    ball_y2 = get("ball_y2")
-
-    rim_xc = get("rim_xc")
-    rim_yc = get("rim_yc")
-    rim_w = get("rim_w")
-    rim_h = get("rim_h")
-    rim_x1 = get("rim_x1")
-    rim_y1 = get("rim_y1")
-    rim_x2 = get("rim_x2")
-    rim_y2 = get("rim_y2")
-
-    ball_conf = get("ball_conf") * ball_detected
-    rim_conf = get("rim_conf") * rim_detected
-
-    ball_area = (ball_w * ball_h).astype(np.float32)
-    rim_area = (rim_w * rim_h).astype(np.float32)
-    ball_aspect = safe_divide(ball_w, ball_h)
-    rim_aspect = safe_divide(rim_w, rim_h)
-
-    rel_x = (ball_xc - rim_xc).astype(np.float32)
-    rel_y = (ball_yc - rim_yc).astype(np.float32)
-    rel_dist = np.sqrt(rel_x * rel_x + rel_y * rel_y).astype(np.float32)
-    rel_x_masked = rel_x * both_detected
-    rel_y_masked = rel_y * both_detected
-    rel_dist_masked = rel_dist * both_detected
-
-    if velocity_mode == "per_second":
-        # Coordinate normalizzate per secondo assoluto.
-        dt = duration / max(n - 1, 1)
-        ball_vx = gradient_series(ball_xc) / max(dt, 1e-6)
-        ball_vy = gradient_series(ball_yc) / max(dt, 1e-6)
-        rim_vx = gradient_series(rim_xc) / max(dt, 1e-6)
-        rim_vy = gradient_series(rim_yc) / max(dt, 1e-6)
-    elif velocity_mode == "delta":
-        # Delta normalizzato per step temporale, più vicino alle sequenze uniformi usate in training.
-        ball_vx = delta_previous(ball_xc)
-        ball_vy = delta_previous(ball_yc)
-        rim_vx = delta_previous(rim_xc)
-        rim_vy = delta_previous(rim_yc)
-    else:
-        raise ValueError(f"velocity_mode non supportato: {velocity_mode}")
-
-    ball_speed = np.sqrt(ball_vx * ball_vx + ball_vy * ball_vy).astype(np.float32)
-    rim_speed = np.sqrt(rim_vx * rim_vx + rim_vy * rim_vy).astype(np.float32)
-
-    ball_ax = delta_previous(ball_vx)
-    ball_ay = delta_previous(ball_vy)
-    ball_acc = np.sqrt(ball_ax * ball_ax + ball_ay * ball_ay).astype(np.float32)
-
-    rel_vx = delta_previous(rel_x)
-    rel_vy = delta_previous(rel_y)
-    rel_speed = np.sqrt(rel_vx * rel_vx + rel_vy * rel_vy).astype(np.float32)
-
-    ball_inside_rim_x = ((ball_xc >= rim_x1) & (ball_xc <= rim_x2) & (both_detected > 0.5)).astype(np.float32)
-    ball_inside_rim_y = ((ball_yc >= rim_y1) & (ball_yc <= rim_y2) & (both_detected > 0.5)).astype(np.float32)
-    ball_inside_rim_bbox = (ball_inside_rim_x * ball_inside_rim_y).astype(np.float32)
-
-    # Feature temp43 richieste dai checkpoint exp_46.
-    # Sono ricostruite a partire dalle primitive salvate nella feature store
-    # long-video, mantenendo una semantica per-frame/finestra coerente con
-    # le sequenze temporali usate in training.
-    expanded_rim_w = rim_w * 1.5
-    expanded_rim_h = rim_h * 1.5
-    expanded_rim_x1 = rim_xc - expanded_rim_w * 0.5
-    expanded_rim_x2 = rim_xc + expanded_rim_w * 0.5
-    expanded_rim_y1 = rim_yc - expanded_rim_h * 0.5
-    expanded_rim_y2 = rim_yc + expanded_rim_h * 0.5
-
-    ball_center_inside_expanded_rim = (
-        (ball_xc >= expanded_rim_x1)
-        & (ball_xc <= expanded_rim_x2)
-        & (ball_yc >= expanded_rim_y1)
-        & (ball_yc <= expanded_rim_y2)
-        & (both_detected > 0.5)
-    ).astype(np.float32)
-
-    inter_x1 = np.maximum(ball_x1, rim_x1)
-    inter_y1 = np.maximum(ball_y1, rim_y1)
-    inter_x2 = np.minimum(ball_x2, rim_x2)
-    inter_y2 = np.minimum(ball_y2, rim_y2)
-    inter_w = np.maximum(0.0, inter_x2 - inter_x1)
-    inter_h = np.maximum(0.0, inter_y2 - inter_y1)
-    inter_area = (inter_w * inter_h).astype(np.float32)
-    union_area = np.maximum(ball_area + rim_area - inter_area, 1e-6)
-    ball_rim_iou = (inter_area / union_area * both_detected).astype(np.float32)
-
-    ball_above_rim = ((ball_yc < rim_yc) & (both_detected > 0.5)).astype(np.float32)
-    ball_below_rim = ((ball_yc > rim_yc) & (both_detected > 0.5)).astype(np.float32)
-    ball_left_of_rim = ((ball_xc < rim_xc) & (both_detected > 0.5)).astype(np.float32)
-    ball_right_of_rim = ((ball_xc > rim_xc) & (both_detected > 0.5)).astype(np.float32)
-    ball_near_rim = ((rel_dist <= np.maximum(rim_w, rim_h) * 1.5) & (both_detected > 0.5)).astype(np.float32)
-    ball_passes_close_to_rim = np.full((n,), float(ball_near_rim.max() if n > 0 else 0.0), dtype=np.float32)
-
-    motion_den = np.maximum(np.abs(ball_vx) + np.abs(ball_vy), 1e-6)
-    ball_motion_horizontal_ratio = (np.abs(ball_vx) / motion_den).astype(np.float32)
-    ball_motion_vertical_ratio = (np.abs(ball_vy) / motion_den).astype(np.float32)
-
-    ball_rim_dist_delta = (delta_previous(rel_dist) * both_detected).astype(np.float32)
-    ball_relative_vx = (ball_vx - rim_vx).astype(np.float32)
-    ball_relative_vy = (ball_vy - rim_vy).astype(np.float32)
-    ball_relative_speed = np.sqrt(ball_relative_vx * ball_relative_vx + ball_relative_vy * ball_relative_vy).astype(np.float32)
-    ball_rim_approach_speed = np.maximum(-ball_rim_dist_delta, 0.0).astype(np.float32)
-    ball_rim_departure_speed = np.maximum(ball_rim_dist_delta, 0.0).astype(np.float32)
-
-    prev_rel_y = np.concatenate([rel_y[:1], rel_y[:-1]]) if n > 0 else rel_y
-    prev_both = np.concatenate([both_detected[:1], both_detected[:-1]]) if n > 0 else both_detected
-    valid_cross = (both_detected > 0.5) & (prev_both > 0.5)
-    crosses_down = ((prev_rel_y < 0.0) & (rel_y >= 0.0) & valid_cross).astype(np.float32)
-    crosses_up = ((prev_rel_y > 0.0) & (rel_y <= 0.0) & valid_cross).astype(np.float32)
-    crosses_any = np.maximum(crosses_down, crosses_up).astype(np.float32)
-
-    # Dizionario canonico.
-    available: dict[str, np.ndarray] = {
-        "t_rel": t_rel,
-        "time_rel": t_rel,
-        "relative_time": t_rel,
-        "ball_detected": ball_detected,
-        "rim_detected": rim_detected,
-        "both_detected": both_detected,
-        "ball_conf": ball_conf,
-        "rim_conf": rim_conf,
-        "ball_x1": ball_x1,
-        "ball_y1": ball_y1,
-        "ball_x2": ball_x2,
-        "ball_y2": ball_y2,
-        "ball_xc": ball_xc,
-        "ball_yc": ball_yc,
-        "ball_cx": ball_xc,
-        "ball_cy": ball_yc,
-        "ball_center_x": ball_xc,
-        "ball_center_y": ball_yc,
-        "ball_w": ball_w,
-        "ball_h": ball_h,
-        "ball_width": ball_w,
-        "ball_height": ball_h,
-        "ball_area": ball_area,
-        "ball_aspect": ball_aspect,
-        "ball_aspect_ratio": ball_aspect,
-        "rim_x1": rim_x1,
-        "rim_y1": rim_y1,
-        "rim_x2": rim_x2,
-        "rim_y2": rim_y2,
-        "rim_xc": rim_xc,
-        "rim_yc": rim_yc,
-        "rim_cx": rim_xc,
-        "rim_cy": rim_yc,
-        "rim_center_x": rim_xc,
-        "rim_center_y": rim_yc,
-        "rim_w": rim_w,
-        "rim_h": rim_h,
-        "rim_width": rim_w,
-        "rim_height": rim_h,
-        "rim_area": rim_area,
-        "rim_aspect": rim_aspect,
-        "rim_aspect_ratio": rim_aspect,
-        "dx": rel_x_masked,
-        "dy": rel_y_masked,
-        "ball_rim_dx": rel_x_masked,
-        "ball_rim_dy": rel_y_masked,
-        "ball_rim_dist": rel_dist_masked,
-        "ball_rim_distance": rel_dist_masked,
-        "ball_rim_dist_delta": ball_rim_dist_delta,
-        "ball_rim_delta": ball_rim_dist_delta,
-        "ball_rim_iou": ball_rim_iou,
-        "ball_to_rim_dx": rel_x_masked,
-        "ball_to_rim_dy": rel_y_masked,
-        "ball_to_rim_dist": rel_dist_masked,
-        "ball_to_rim_distance": rel_dist_masked,
-        "dx_ball_rim": rel_x_masked,
-        "dy_ball_rim": rel_y_masked,
-        "dist_ball_rim": rel_dist_masked,
-        "rim_ball_dx": -rel_x_masked,
-        "rim_ball_dy": -rel_y_masked,
-        "rim_ball_dist": rel_dist_masked,
-        "rel_x": rel_x_masked,
-        "rel_y": rel_y_masked,
-        "rel_dist": rel_dist_masked,
-        "relative_x": rel_x_masked,
-        "relative_y": rel_y_masked,
-        "relative_dist": rel_dist_masked,
-        "ball_vx": ball_vx,
-        "ball_vy": ball_vy,
-        "ball_vel_x": ball_vx,
-        "ball_vel_y": ball_vy,
-        "ball_velocity_x": ball_vx,
-        "ball_velocity_y": ball_vy,
-        "ball_dx": ball_vx,
-        "ball_dy": ball_vy,
-        "ball_speed": ball_speed,
-        "ball_velocity": ball_speed,
-        "ball_motion": ball_speed,
-        "rim_vx": rim_vx,
-        "rim_vy": rim_vy,
-        "rim_speed": rim_speed,
-        "ball_ax": ball_ax,
-        "ball_ay": ball_ay,
-        "ball_acc_x": ball_ax,
-        "ball_acc_y": ball_ay,
-        "ball_acceleration_x": ball_ax,
-        "ball_acceleration_y": ball_ay,
-        "ball_acc": ball_acc,
-        "ball_acceleration": ball_acc,
-        "rel_vx": rel_vx,
-        "rel_vy": rel_vy,
-        "rel_speed": rel_speed,
-        "ball_rim_vx": rel_vx,
-        "ball_rim_vy": rel_vy,
-        "ball_rim_speed": rel_speed,
-        "ball_relative_vx": ball_relative_vx,
-        "ball_relative_vy": ball_relative_vy,
-        "ball_relative_speed": ball_relative_speed,
-        "ball_rim_approach_speed": ball_rim_approach_speed,
-        "ball_rim_departure_speed": ball_rim_departure_speed,
-        "ball_motion_horizontal_ratio": ball_motion_horizontal_ratio,
-        "ball_motion_vertical_ratio": ball_motion_vertical_ratio,
-        "num_ball_detections": get("num_ball_detections"),
-        "num_rim_detections": get("num_rim_detections"),
-        "ball_inside_rim_x": ball_inside_rim_x,
-        "ball_inside_rim_y": ball_inside_rim_y,
-        "ball_inside_rim_bbox": ball_inside_rim_bbox,
-        "ball_center_inside_rim": ball_inside_rim_bbox,
-        "ball_center_inside_expanded_rim": ball_center_inside_expanded_rim,
-        "ball_in_rim_x": ball_inside_rim_x,
-        "ball_in_rim_y": ball_inside_rim_y,
-        "ball_in_rim": ball_inside_rim_bbox,
-        "ball_above_rim": ball_above_rim,
-        "ball_below_rim": ball_below_rim,
-        "ball_left_of_rim": ball_left_of_rim,
-        "ball_right_of_rim": ball_right_of_rim,
-        "ball_near_rim": ball_near_rim,
-        "ball_passes_close_to_rim": ball_passes_close_to_rim,
-        "ball_crosses_rim_y_frame": crosses_any,
-        "ball_crosses_rim_y_downward_frame": crosses_down,
-        "ball_crosses_rim_y_upward_frame": crosses_up,
+def primitive_detection(primitives: dict[str, np.ndarray], prefix: str, idx: int) -> dict[str, float | int]:
+    detected = int(primitive_value(primitives, f"{prefix}_detected", idx, 0.0) >= 0.5)
+    conf = primitive_value(primitives, f"{prefix}_conf", idx, 0.0) if detected else 0.0
+    xc = primitive_value(primitives, f"{prefix}_xc", idx, 0.0) if detected else 0.0
+    yc = primitive_value(primitives, f"{prefix}_yc", idx, 0.0) if detected else 0.0
+    w = primitive_value(primitives, f"{prefix}_w", idx, 0.0) if detected else 0.0
+    h = primitive_value(primitives, f"{prefix}_h", idx, 0.0) if detected else 0.0
+    return {
+        "detected": detected,
+        "conf": float(conf),
+        "xc": float(xc),
+        "yc": float(yc),
+        "w": float(w),
+        "h": float(h),
+        "area": float(max(0.0, w) * max(0.0, h)) if detected else 0.0,
     }
 
-    # Aggiunge anche tutte le primitive dirette non già normalizzate.
-    for key, value in sampled.items():
-        available.setdefault(key, value.astype(np.float32))
 
-    return available
-
-
-def normalize_feature_name(name: str) -> str:
-    return str(name).strip()
-
-
-def build_tracking_sequence(
-    store_timestamps: np.ndarray,
+def build_frame_rows_trainlike(
+    feature_store: FeatureStore,
+    row: WindowRow,
     primitives: dict[str, np.ndarray],
-    feature_names: list[str],
-    query_times: np.ndarray,
-    start_time: float,
-    end_time: float,
-    velocity_mode: str,
-) -> np.ndarray:
-    sampled = sample_primitives(store_timestamps, primitives, query_times)
-    available = build_available_tracking_features(
-        sampled=sampled,
-        start_time=start_time,
-        end_time=end_time,
-        velocity_mode=velocity_mode,
-    )
+    selected_local_indices: np.ndarray,
+) -> list[dict[str, Any]]:
+    """Ricostruisce frame_rows compatibili con extract_ball_rim_tracking_features.py."""
+    dino_len = int(row.store_end_index - row.store_start_index)
+    fps = float(feature_store.feature_fps or 29.97002997002997)
+    frame_rows: list[dict[str, Any]] = []
 
-    columns: list[np.ndarray] = []
-    missing: list[str] = []
-    for raw_name in feature_names:
-        name = normalize_feature_name(raw_name)
-        if name in available:
-            columns.append(available[name].astype(np.float32))
-        else:
-            # fallback case-insensitive
-            lower_map = {k.lower(): v for k, v in available.items()}
-            if name.lower() in lower_map:
-                columns.append(lower_map[name.lower()].astype(np.float32))
-            else:
-                missing.append(name)
+    for frame_order, local_idx_value in enumerate(selected_local_indices.tolist()):
+        local_idx = int(local_idx_value)
+        global_idx = int(row.store_start_index + local_idx)
 
-    if missing:
-        available_preview = ", ".join(sorted(available.keys())[:120])
-        raise KeyError(
-            "Impossibile costruire alcune feature tracking richieste dal checkpoint:\n"
-            + "\n".join(f"- {m}" for m in missing)
-            + "\n\nFeature disponibili/fallback principali:\n"
-            + available_preview
+        ball = primitive_detection(primitives, "ball", global_idx)
+        rim = primitive_detection(primitives, "rim", global_idx)
+
+        pair = compute_pair_features(
+            ball=ball,
+            rim=rim,
+            near_threshold=TRACKING_NEAR_THRESHOLD,
+            rim_inside_margin=TRACKING_RIM_INSIDE_MARGIN,
         )
 
-    return np.stack(columns, axis=1).astype(np.float32)
+        t_rel = local_idx / max(1, dino_len - 1)
+        time_sec = local_idx / fps if fps > 0 else 0.0
+
+        frame_rows.append(
+            {
+                "clip_id": row.window_id,
+                "split": "long-video",
+                "label": "unknown",
+                "path": row.window_id,
+                "frame_order": int(frame_order),
+                # Importante: frame_idx è locale alla finestra ma conserva gli spazi tra frame
+                # campionati, come nelle clip usate in training.
+                "frame_idx": int(local_idx),
+                "time_sec": float(time_sec),
+                "t_rel": float(t_rel),
+                "width": 1,
+                "height": 1,
+                "ball_detected": int(ball["detected"]),
+                "ball_conf": float(ball["conf"]),
+                "ball_xc": float(ball["xc"]),
+                "ball_yc": float(ball["yc"]),
+                "ball_w": float(ball["w"]),
+                "ball_h": float(ball["h"]),
+                "ball_area": float(ball["area"]),
+                "rim_detected": int(rim["detected"]),
+                "rim_conf": float(rim["conf"]),
+                "rim_xc": float(rim["xc"]),
+                "rim_yc": float(rim["yc"]),
+                "rim_w": float(rim["w"]),
+                "rim_h": float(rim["h"]),
+                "rim_area": float(rim["area"]),
+                "both_detected": int(pair["both_detected"]),
+                "dx": float(pair["dx"]),
+                "dy": float(pair["dy"]),
+                "ball_rim_dist": float(pair["dist"]),
+                "ball_above_rim": int(pair["ball_above_rim"]),
+                "ball_below_rim": int(pair["ball_below_rim"]),
+                "ball_near_rim": int(pair["ball_near_rim"]),
+                "ball_center_inside_rim": int(pair["ball_center_inside_rim"]),
+                "ball_center_inside_expanded_rim": int(pair["ball_center_inside_expanded_rim"]),
+                "ball_rim_iou": float(pair["ball_rim_iou"]),
+                "ball_passes_close_to_rim": int(pair["ball_passes_close_to_rim"]),
+            }
+        )
+
+    return frame_rows
+
+
+def build_tracking_sequence_trainlike(
+    feature_store: FeatureStore,
+    row: WindowRow,
+    level: LevelBundle,
+    primitives: dict[str, np.ndarray],
+    selected_local_indices: np.ndarray,
+) -> np.ndarray:
+    """Costruisce il tracking usando la stessa funzione usata nel training clip-level."""
+    frame_rows = build_frame_rows_trainlike(
+        feature_store=feature_store,
+        row=row,
+        primitives=primitives,
+        selected_local_indices=selected_local_indices,
+    )
+    fps = float(feature_store.feature_fps or 29.97002997002997)
+    sequence = compute_temporal_sequence_features(
+        frame_rows=frame_rows,
+        fps=fps,
+        temporal_feature_names=level.feature_names,
+    )
+    if sequence.ndim != 2 or sequence.shape[1] != len(level.feature_names):
+        raise RuntimeError(
+            f"{level.name}: sequenza tracking inattesa {sequence.shape}, "
+            f"attesa [S, {len(level.feature_names)}]."
+        )
+    return sequence.astype(np.float32)
 
 
 def build_input_for_window(
     feature_store: FeatureStore,
     row: WindowRow,
-    feature_names: list[str],
+    level: LevelBundle,
     primitives: dict[str, np.ndarray],
 ) -> np.ndarray:
     # Train-like:
     # - DINO usa tutti i sample/frame reali della finestra;
-    # - il tracking palla/canestro viene calcolato su max 48 frame uniformi;
-    # - il tracking viene interpolato alla lunghezza DINO.
+    # - tracking viene calcolato con compute_temporal_sequence_features su max 48 frame uniformi;
+    # - tracking viene interpolato alla lunghezza DINO;
+    # - tracking viene normalizzato con mean/std del checkpoint;
+    # - DINO e tracking vengono concatenati per timestep.
     start_idx = int(row.store_start_index)
     end_idx = int(row.store_end_index)
 
@@ -1234,9 +1022,7 @@ def build_input_for_window(
         )
 
     dino_seq = np.asarray(feature_store.dino_features[start_idx:end_idx], dtype=np.float32)
-    dino_times = feature_store.timestamps[start_idx:end_idx].astype(np.float64)
     dino_len = int(dino_seq.shape[0])
-
     if dino_len <= 0:
         raise ValueError(f"Finestra senza feature DINO: {row.window_id}")
 
@@ -1247,20 +1033,20 @@ def build_input_for_window(
     if tracking_local_indices.size == 0:
         raise ValueError(f"Finestra senza frame tracking: {row.window_id}")
 
-    tracking_query_times = dino_times[tracking_local_indices]
-    tracking_raw_seq = build_tracking_sequence(
-        store_timestamps=feature_store.timestamps,
+    tracking_raw_seq = build_tracking_sequence_trainlike(
+        feature_store=feature_store,
+        row=row,
+        level=level,
         primitives=primitives,
-        feature_names=feature_names,
-        query_times=tracking_query_times,
-        start_time=row.start_time,
-        end_time=row.end_time,
-        velocity_mode=TRACKING_VELOCITY_MODE,
+        selected_local_indices=tracking_local_indices,
     )
     tracking_seq = interpolate_sequence_array(tracking_raw_seq, target_len=dino_len)
+    tracking_seq = apply_tracking_normalization(tracking_seq, level=level)
 
     if dino_seq.shape[0] != tracking_seq.shape[0]:
-        raise RuntimeError(f"T diverso tra DINO e tracking: {dino_seq.shape} vs {tracking_seq.shape}")
+        raise RuntimeError(
+            f"T diverso tra DINO e tracking: {dino_seq.shape} vs {tracking_seq.shape}"
+        )
 
     return np.concatenate([dino_seq, tracking_seq], axis=1).astype(np.float32)
 
@@ -1304,7 +1090,7 @@ def build_batch_inputs(
             build_input_for_window(
                 feature_store=feature_store,
                 row=row,
-                feature_names=l1.feature_names,
+                level=l1,
                 primitives=feature_store.yolo_v2_primitives,
             )
         )
@@ -1312,7 +1098,7 @@ def build_batch_inputs(
             build_input_for_window(
                 feature_store=feature_store,
                 row=row,
-                feature_names=l2.feature_names,
+                level=l2,
                 primitives=feature_store.yolo_v2_primitives,
             )
         )
@@ -1320,7 +1106,7 @@ def build_batch_inputs(
             build_input_for_window(
                 feature_store=feature_store,
                 row=row,
-                feature_names=l3.feature_names,
+                level=l3,
                 primitives=feature_store.yolo_v1_primitives,
             )
         )
@@ -1545,6 +1331,7 @@ def predict_batch(
         probs = torch.softmax(logits.float(), dim=1)
     return probs.detach().cpu().numpy().astype(np.float32)
 
+
 def infer_all_windows(
     feature_store: FeatureStore,
     windows: list[WindowRow],
@@ -1604,6 +1391,11 @@ def infer_all_windows(
         "label_counts": label_counts,
         "temporal_policy": TEMPORAL_POLICY,
         "tracking_max_frames_per_window": TRACKING_MAX_FRAMES_PER_WINDOW,
+        "tracking_normalized": {
+            "L1": bool(l1.tracking_normalized),
+            "L2": bool(l2.tracking_normalized),
+            "L3": bool(l3.tracking_normalized),
+        },
         "input_lengths": {
             "min": int(input_lengths_arr.min()) if input_lengths_arr.size else 0,
             "max": int(input_lengths_arr.max()) if input_lengths_arr.size else 0,
@@ -1652,15 +1444,19 @@ def write_inference_metadata(
             "max_windows": args.max_windows,
             "temporal_policy": TEMPORAL_POLICY,
             "dino_policy": "all_store_samples_in_window",
-            "tracking_policy": "uniform_max_48_then_interpolate_to_dino_length",
+            "tracking_policy": "compute_temporal_sequence_features_max48_then_interpolate_then_checkpoint_zscore",
             "tracking_max_frames_per_window": TRACKING_MAX_FRAMES_PER_WINDOW,
-            "tracking_velocity_mode": TRACKING_VELOCITY_MODE,
+            "tracking_near_threshold": TRACKING_NEAR_THRESHOLD,
+            "tracking_rim_inside_margin": TRACKING_RIM_INSIDE_MARGIN,
         },
         "levels": {
             "L1": {
                 "checkpoint": str(l1.checkpoint_path),
                 "tracking_source": "yolo_v2",
                 "num_tracking_features": len(l1.feature_names),
+                "tracking_normalized": bool(l1.tracking_normalized),
+                "tracking_mean_len": int(l1.tracking_mean.shape[0]),
+                "tracking_std_len": int(l1.tracking_std.shape[0]),
                 "labels": l1.labels,
                 "feature_names": l1.feature_names,
             },
@@ -1668,6 +1464,9 @@ def write_inference_metadata(
                 "checkpoint": str(l2.checkpoint_path),
                 "tracking_source": "yolo_v2",
                 "num_tracking_features": len(l2.feature_names),
+                "tracking_normalized": bool(l2.tracking_normalized),
+                "tracking_mean_len": int(l2.tracking_mean.shape[0]),
+                "tracking_std_len": int(l2.tracking_std.shape[0]),
                 "labels": l2.labels,
                 "feature_names": l2.feature_names,
             },
@@ -1675,6 +1474,9 @@ def write_inference_metadata(
                 "checkpoint": str(l3.checkpoint_path),
                 "tracking_source": "yolo_v1",
                 "num_tracking_features": len(l3.feature_names),
+                "tracking_normalized": bool(l3.tracking_normalized),
+                "tracking_mean_len": int(l3.tracking_mean.shape[0]),
+                "tracking_std_len": int(l3.tracking_std.shape[0]),
                 "labels": l3.labels,
                 "feature_names": l3.feature_names,
             },
@@ -1820,9 +1622,12 @@ def main() -> None:
     print(f"device:             {device}")
     print(f"batch_size:         {args.batch_size}")
     print(f"temporal_policy:    {TEMPORAL_POLICY}")
-    print(f"DINO policy:        tutti i sample/frame della finestra")
-    print(f"tracking policy:    max {TRACKING_MAX_FRAMES_PER_WINDOW} frame uniformi, poi interpolazione a T DINO")
-    print(f"velocity_mode:      {TRACKING_VELOCITY_MODE}")
+    print("DINO policy:        tutti i sample/frame della finestra")
+    print(f"tracking policy:    compute_temporal_sequence_features su max {TRACKING_MAX_FRAMES_PER_WINDOW} frame, poi interpolazione a T DINO")
+    print("tracking normalized:")
+    print(f"  L1: {l1.tracking_normalized}")
+    print(f"  L2: {l2.tracking_normalized}")
+    print(f"  L3: {l3.tracking_normalized}")
 
     summary = infer_all_windows(
         feature_store=feature_store,
