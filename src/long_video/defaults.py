@@ -53,7 +53,6 @@ DINOV3_FEATURE_DIM = 1024
 DINOV3_OUTPUT_TOKEN = "x_norm_clstoken"
 
 # Pesi DINOv3 da usare sia per le clip sia per i video lunghi.
-# Aggiorna questo path se nel tuo progetto i checkpoint sono salvati altrove.
 DINOV3_WEIGHTS = Path(
     "checkpoints/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
 )

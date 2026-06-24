@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -11,12 +12,11 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
-from src.long_video import defaults
+try:
+    from src.long_video import defaults
+except Exception:  # pragma: no cover
+    defaults = None
 
-
-# =============================================================================
-# Label e colonne attese dall'inferenza exp_46
-# =============================================================================
 
 ACTION_LABELS = [
     "passaggio",
@@ -27,8 +27,8 @@ ACTION_LABELS = [
     "tiroLibero0",
     "tiroLibero1",
 ]
-
 ALL_LABELS = ACTION_LABELS + ["no-action"]
+SHOT_LABELS = [label for label in ACTION_LABELS if label != "passaggio"]
 
 SCORE_COLUMN_CANDIDATES: dict[str, list[str]] = {
     "passaggio": ["score_passaggio", "p_passaggio", "p_l1_passaggio"],
@@ -40,6 +40,19 @@ SCORE_COLUMN_CANDIDATES: dict[str, list[str]] = {
     "tiroLibero1": ["score_tiroLibero1", "score_tiro_libero1", "p_tiroLibero1"],
     "no-action": ["score_noaction", "score_no-action", "p_noaction", "p_l1_noaction"],
 }
+
+CANDIDATE_COLUMNS = [
+    "window_id",
+    "label",
+    "start_time",
+    "end_time",
+    "center_time",
+    "confidence",
+    "noaction_score",
+    "threshold",
+    "scale_index",
+    "scale_sec",
+]
 
 RAW_EVENT_COLUMNS = [
     "event_id",
@@ -67,30 +80,33 @@ FINAL_EVENT_COLUMNS = RAW_EVENT_COLUMNS + [
 ]
 
 
-# =============================================================================
-# Dataclass
-# =============================================================================
-
-
 @dataclass(frozen=True)
 class ArgsSnapshot:
     predictions_csv: str
     output_dir: str
-    smooth_window: int
-    min_event_duration_sec: float
-    merge_gap_sec: float
-    temporal_nms_iou: float
     min_conf_passaggio: float
     min_conf_tiro: float
-    candidate_mode: str
-    confidence_aggregation: str
+    min_event_duration_sec: float
+    merge_gap_sec: float
+    max_duration_passaggio: float
+    max_duration_tiro: float
+    max_window_sec_passaggio: float | None
+    min_window_sec_tiro: float | None
+    max_window_sec_tiro: float | None
     require_action_gt_noaction: bool
     noaction_margin: float
+    noaction_margin_passaggio: float | None
+    noaction_margin_tiro: float | None
+    event_confidence_mode: str
+    prefer_shots_over_passaggi: bool
+    prefer_shots_min_confidence: float
+    forbid_overlaps: bool
 
 
-# =============================================================================
-# Utility generali
-# =============================================================================
+def fallback_val_output_dir() -> Path:
+    if defaults is not None:
+        return Path(getattr(defaults, "VAL_OUTPUT_DIR", Path("outputs/long_video/validation")))
+    return Path("outputs/long_video/validation")
 
 
 def as_path(value: str | Path | None) -> Path | None:
@@ -110,15 +126,31 @@ def ensure_exists(path: Path, name: str, must_be_file: bool | None = None) -> No
         raise NotADirectoryError(f"{name} dovrebbe essere una cartella: {path}")
 
 
+def json_sanitize(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): json_sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_sanitize(v) for v in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        value = float(value)
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    return value
+
+
 def write_json(path: Path, data: dict[str, Any]) -> None:
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.write_text(json.dumps(json_sanitize(data), indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def check_output_files(output_dir: Path, output_files: Iterable[str], overwrite: bool) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    existing = [output_dir / f for f in output_files if (output_dir / f).exists()]
+    existing = [output_dir / name for name in output_files if (output_dir / name).exists()]
     if existing and not overwrite:
-        joined = "\n".join(str(p) for p in existing)
+        joined = "\n".join(str(path) for path in existing)
         raise FileExistsError(
             "Alcuni file di output esistono già:\n"
             f"{joined}\n"
@@ -141,17 +173,54 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     return out
 
 
+def round_float(value: Any, ndigits: int = 6) -> float:
+    return round(safe_float(value), ndigits)
+
+
 def threshold_for_label(label: str, min_conf_passaggio: float, min_conf_tiro: float) -> float:
     if label == "passaggio":
         return float(min_conf_passaggio)
     return float(min_conf_tiro)
 
 
+def noaction_margin_for_label(
+    label: str,
+    default_margin: float,
+    margin_passaggio: float | None,
+    margin_tiro: float | None,
+) -> float:
+    if label == "passaggio" and margin_passaggio is not None:
+        return float(margin_passaggio)
+    if label in SHOT_LABELS and margin_tiro is not None:
+        return float(margin_tiro)
+    return float(default_margin)
+
+
+def normalize_label(label: Any) -> str:
+    text = str(label).strip()
+    aliases = {
+        "noaction": "no-action",
+        "no_action": "no-action",
+        "idle": "no-action",
+        "background": "no-action",
+        "non-gioco": "no-action",
+        "non_gioco": "no-action",
+        "nongioco": "no-action",
+        "tiro_da_due_0": "tiroDaDue0",
+        "tiro_da_due_1": "tiroDaDue1",
+        "tiro_da_tre_0": "tiroDaTre0",
+        "tiro_da_tre_1": "tiroDaTre1",
+        "tiro_libero_0": "tiroLibero0",
+        "tiro_libero_1": "tiroLibero1",
+    }
+    return aliases.get(text, text)
+
+
 def normalize_score_col_name(name: str) -> str:
     return str(name).strip()
 
 
-def find_score_column(df: pd.DataFrame, label: str) -> str:
+def find_score_column(df: pd.DataFrame, label: str, required: bool = True) -> str | None:
     columns = {normalize_score_col_name(c): c for c in df.columns}
     columns_lower = {normalize_score_col_name(c).lower(): c for c in df.columns}
 
@@ -161,22 +230,24 @@ def find_score_column(df: pd.DataFrame, label: str) -> str:
         if candidate.lower() in columns_lower:
             return columns_lower[candidate.lower()]
 
-    # Fallback: infer_exp46_from_store usa score_{label.replace('-', '')}.
     fallback = f"score_{label.replace('-', '')}"
     if fallback in columns:
         return columns[fallback]
     if fallback.lower() in columns_lower:
         return columns_lower[fallback.lower()]
 
-    raise KeyError(
-        f"Colonna score per label '{label}' non trovata. "
-        f"Candidati: {SCORE_COLUMN_CANDIDATES[label]}"
-    )
+    if required:
+        raise KeyError(
+            f"Colonna score per label '{label}' non trovata. "
+            f"Candidati: {SCORE_COLUMN_CANDIDATES[label]}"
+        )
+    return None
 
 
-# =============================================================================
-# Lettura e preparazione predizioni
-# =============================================================================
+def count_by_label(events: pd.DataFrame) -> dict[str, int]:
+    if events.empty or "label" not in events.columns:
+        return {}
+    return {str(k): int(v) for k, v in events["label"].value_counts().sort_index().items()}
 
 
 def load_predictions(predictions_csv: Path) -> pd.DataFrame:
@@ -186,251 +257,314 @@ def load_predictions(predictions_csv: Path) -> pd.DataFrame:
         raise ValueError(f"Il file predizioni è vuoto: {predictions_csv}")
 
     required = ["window_id", "start_time", "end_time"]
-    missing = [c for c in required if c not in df.columns]
+    missing = [col for col in required if col not in df.columns]
     if missing:
         raise KeyError(f"Colonne obbligatorie mancanti in {predictions_csv}: {missing}")
 
-    if "center_time" not in df.columns:
-        df["center_time"] = (pd.to_numeric(df["start_time"]) + pd.to_numeric(df["end_time"])) / 2.0
+    out = df.copy()
+    out["window_id"] = out["window_id"].astype(str)
+    out["start_time"] = pd.to_numeric(out["start_time"], errors="coerce")
+    out["end_time"] = pd.to_numeric(out["end_time"], errors="coerce")
 
-    if "scale_sec" not in df.columns:
-        df["scale_sec"] = pd.to_numeric(df["end_time"]) - pd.to_numeric(df["start_time"])
+    if "center_time" not in out.columns:
+        out["center_time"] = (out["start_time"] + out["end_time"]) / 2.0
+    else:
+        out["center_time"] = pd.to_numeric(out["center_time"], errors="coerce")
 
-    if "scale_index" not in df.columns:
-        # Codifica stabile per scale diverse.
-        unique_scales = sorted(pd.to_numeric(df["scale_sec"]).dropna().unique().tolist())
-        scale_to_idx = {float(v): i for i, v in enumerate(unique_scales)}
-        df["scale_index"] = pd.to_numeric(df["scale_sec"]).map(lambda x: scale_to_idx.get(float(x), -1))
+    if "scale_sec" not in out.columns:
+        out["scale_sec"] = out["end_time"] - out["start_time"]
+    else:
+        out["scale_sec"] = pd.to_numeric(out["scale_sec"], errors="coerce")
+
+    if "scale_index" not in out.columns:
+        unique_scales = sorted(out["scale_sec"].dropna().astype(float).unique().tolist())
+        scale_to_idx = {float(value): idx for idx, value in enumerate(unique_scales)}
+        out["scale_index"] = out["scale_sec"].map(lambda x: scale_to_idx.get(float(x), -1))
+    else:
+        out["scale_index"] = pd.to_numeric(out["scale_index"], errors="coerce").fillna(-1).astype(int)
 
     numeric_cols = ["start_time", "end_time", "center_time", "scale_sec", "scale_index"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if df[numeric_cols].isna().any().any():
-        bad_cols = [c for c in numeric_cols if df[c].isna().any()]
+    if out[numeric_cols].isna().any().any():
+        bad_cols = [col for col in numeric_cols if out[col].isna().any()]
         raise ValueError(f"Valori numerici non validi nelle colonne: {bad_cols}")
 
-    if (df["end_time"] <= df["start_time"]).any():
-        raise ValueError("Trovate finestre con end_time <= start_time")
-
-    # Mappa le colonne score a nomi canonici score__{label}.
-    for label in ALL_LABELS:
-        col = find_score_column(df, label)
-        canonical = f"score__{label}"
-        df[canonical] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).clip(lower=0.0)
-
-    df = df.sort_values(["scale_index", "start_time", "end_time"]).reset_index(drop=True)
-    return df
-
-
-def add_smoothed_scores(df: pd.DataFrame, smooth_window: int) -> pd.DataFrame:
-    if smooth_window < 1:
-        raise ValueError(f"smooth_window deve essere >= 1, trovato {smooth_window}")
-
-    out = df.copy()
-    group_cols = ["scale_index"]
+    out = out[out["end_time"] > out["start_time"]].copy()
+    if out.empty:
+        raise ValueError("Nessuna finestra valida dopo il filtro end_time > start_time")
 
     for label in ALL_LABELS:
-        raw_col = f"score__{label}"
-        smooth_col = f"score_smooth__{label}"
-        if smooth_window == 1:
-            out[smooth_col] = out[raw_col].astype(float)
+        col = find_score_column(out, label, required=False)
+        if col is None:
+            if label == "no-action":
+                out[f"score__{label}"] = 0.0
+            else:
+                raise KeyError(f"Score mancante per label azione '{label}'")
         else:
-            out[smooth_col] = (
-                out.groupby(group_cols, group_keys=False)[raw_col]
-                .apply(
-                    lambda s: s.rolling(
-                        window=int(smooth_window),
-                        min_periods=1,
-                        center=True,
-                    ).mean()
-                )
-                .astype(float)
-            )
-    return out
+            out[f"score__{label}"] = pd.to_numeric(out[col], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    if "pred_label" in out.columns:
+        out["pred_label_resolved"] = out["pred_label"].apply(normalize_label)
+    elif "label" in out.columns:
+        out["pred_label_resolved"] = out["label"].apply(normalize_label)
+    else:
+        score_matrix = np.stack(
+            [out[f"score__{label}"].to_numpy(dtype=np.float32) for label in ALL_LABELS],
+            axis=1,
+        )
+        pred_idx = score_matrix.argmax(axis=1)
+        out["pred_label_resolved"] = [ALL_LABELS[int(idx)] for idx in pred_idx]
+
+    if "confidence" in out.columns:
+        out["pred_confidence_resolved"] = (
+            pd.to_numeric(out["confidence"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        )
+    else:
+        out["pred_confidence_resolved"] = out.apply(
+            lambda row: safe_float(row.get(f"score__{normalize_label(row['pred_label_resolved'])}", 0.0)),
+            axis=1,
+        )
+
+    def resolved_action_score(row: pd.Series) -> float:
+        label = normalize_label(row["pred_label_resolved"])
+        if label in ALL_LABELS:
+            value = row.get(f"score__{label}", np.nan)
+            if pd.notna(value):
+                return safe_float(value)
+        return safe_float(row.get("pred_confidence_resolved", 0.0))
+
+    out["action_score"] = out.apply(resolved_action_score, axis=1)
+    out["noaction_score"] = pd.to_numeric(out["score__no-action"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    return out.sort_values(["start_time", "end_time", "scale_sec"]).reset_index(drop=True)
 
 
-# =============================================================================
-# Candidati finestra -> eventi raw
-# =============================================================================
-
-
-def build_candidate_rows(
-    df: pd.DataFrame,
+def build_candidate_windows(
+    predictions: pd.DataFrame,
     min_conf_passaggio: float,
     min_conf_tiro: float,
-    candidate_mode: str,
     require_action_gt_noaction: bool,
     noaction_margin: float,
+    noaction_margin_passaggio: float | None,
+    noaction_margin_tiro: float | None,
+    max_window_sec_passaggio: float | None,
+    min_window_sec_tiro: float | None,
+    max_window_sec_tiro: float | None,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
 
-    if noaction_margin < 0:
-        raise ValueError(f"noaction_margin deve essere >= 0, trovato {noaction_margin}")
+    for _, row in predictions.iterrows():
+        label = normalize_label(row["pred_label_resolved"])
+        if label == "no-action" or label not in ACTION_LABELS:
+            continue
 
-    action_score_cols = {label: f"score_smooth__{label}" for label in ACTION_LABELS}
-    noaction_col = "score_smooth__no-action"
+        scale_sec = safe_float(row["scale_sec"])
 
-    if candidate_mode not in {"best_per_window", "threshold_all"}:
-        raise ValueError(f"candidate_mode non supportato: {candidate_mode}")
-
-    for _, row in df.iterrows():
-        noaction_score = safe_float(row[noaction_col])
-
-        if candidate_mode == "best_per_window":
-            scores = {label: safe_float(row[col]) for label, col in action_score_cols.items()}
-            label = max(scores, key=scores.get)
-            score = float(scores[label])
-            raw_score = safe_float(row[f"score__{label}"])
-            threshold = threshold_for_label(label, min_conf_passaggio, min_conf_tiro)
-
-            if score < threshold:
-                continue
-            if require_action_gt_noaction and score < noaction_score * noaction_margin:
+        if label == "passaggio" and max_window_sec_passaggio is not None:
+            if scale_sec > float(max_window_sec_passaggio):
                 continue
 
-            rows.append(
-                make_candidate_dict(
-                    row=row,
-                    label=label,
-                    score=score,
-                    raw_score=raw_score,
-                    noaction_score=noaction_score,
-                    threshold=threshold,
-                )
-            )
+        if label in SHOT_LABELS:
+            if min_window_sec_tiro is not None and scale_sec < float(min_window_sec_tiro):
+                continue
+            if max_window_sec_tiro is not None and scale_sec > float(max_window_sec_tiro):
+                continue
 
-        else:  # threshold_all
-            for label, col in action_score_cols.items():
-                score = safe_float(row[col])
-                raw_score = safe_float(row[f"score__{label}"])
-                threshold = threshold_for_label(label, min_conf_passaggio, min_conf_tiro)
-                if score < threshold:
-                    continue
-                if require_action_gt_noaction and score < noaction_score * noaction_margin:
-                    continue
-                rows.append(
-                    make_candidate_dict(
-                        row=row,
-                        label=label,
-                        score=score,
-                        raw_score=raw_score,
-                        noaction_score=noaction_score,
-                        threshold=threshold,
-                    )
-                )
+        score = safe_float(row["action_score"])
+        noaction_score = safe_float(row["noaction_score"])
+        threshold = threshold_for_label(label, min_conf_passaggio, min_conf_tiro)
 
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "window_id",
-                "scale_index",
-                "scale_sec",
-                "start_time",
-                "end_time",
-                "center_time",
-                "label",
-                "score",
-                "raw_score",
-                "noaction_score",
-                "threshold",
-            ]
+        if score < threshold:
+            continue
+
+        label_noaction_margin = noaction_margin_for_label(
+            label=label,
+            default_margin=float(noaction_margin),
+            margin_passaggio=noaction_margin_passaggio,
+            margin_tiro=noaction_margin_tiro,
+        )
+        if require_action_gt_noaction and score < noaction_score * label_noaction_margin:
+            continue
+
+        rows.append(
+            {
+                "window_id": str(row["window_id"]),
+                "label": label,
+                "start_time": safe_float(row["start_time"]),
+                "end_time": safe_float(row["end_time"]),
+                "center_time": safe_float(row["center_time"]),
+                "confidence": score,
+                "noaction_score": noaction_score,
+                "threshold": float(threshold),
+                "scale_index": int(row["scale_index"]),
+                "scale_sec": scale_sec,
+            }
         )
 
-    return pd.DataFrame(rows).sort_values(["scale_index", "label", "start_time"]).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame(columns=CANDIDATE_COLUMNS)
+
+    return pd.DataFrame(rows, columns=CANDIDATE_COLUMNS).sort_values(
+        ["label", "start_time", "end_time", "scale_sec"]
+    ).reset_index(drop=True)
 
 
-def make_candidate_dict(
-    row: pd.Series,
-    label: str,
-    score: float,
-    raw_score: float,
-    noaction_score: float,
-    threshold: float,
-) -> dict[str, Any]:
-    return {
-        "window_id": str(row["window_id"]),
-        "scale_index": int(row["scale_index"]),
-        "scale_sec": float(row["scale_sec"]),
-        "start_time": float(row["start_time"]),
-        "end_time": float(row["end_time"]),
-        "center_time": float(row["center_time"]),
-        "label": str(label),
-        "score": float(score),
-        "raw_score": float(raw_score),
-        "noaction_score": float(noaction_score),
-        "threshold": float(threshold),
-    }
+def aggregate_confidence(scores: np.ndarray, mode: str) -> float:
+    if scores.size == 0:
+        return 0.0
+    if mode == "max":
+        return float(np.max(scores))
+    if mode == "mean":
+        return float(np.mean(scores))
+    if mode == "median":
+        return float(np.median(scores))
+    raise ValueError(f"event_confidence_mode non supportato: {mode}")
 
 
-def aggregate_candidate_group(
-    group_rows: list[dict[str, Any]],
+def aggregate_rows_to_event(
+    rows: list[dict[str, Any]],
     event_id: int,
-    confidence_aggregation: str,
+    event_confidence_mode: str,
+    forced_start: float | None = None,
+    forced_end: float | None = None,
 ) -> dict[str, Any]:
-    if not group_rows:
-        raise ValueError("aggregate_candidate_group chiamata con gruppo vuoto")
+    if not rows:
+        raise ValueError("aggregate_rows_to_event chiamata con rows vuoto")
 
-    scores = np.array([safe_float(r["score"]) for r in group_rows], dtype=np.float64)
-    noaction_scores = np.array([safe_float(r["noaction_score"]) for r in group_rows], dtype=np.float64)
-    thresholds = np.array([safe_float(r["threshold"]) for r in group_rows], dtype=np.float64)
+    ordered = sorted(rows, key=lambda r: (safe_float(r["start_time"]), safe_float(r["end_time"])))
+    start_time = safe_float(forced_start) if forced_start is not None else min(
+        safe_float(r["start_time"]) for r in ordered
+    )
+    end_time = safe_float(forced_end) if forced_end is not None else max(
+        safe_float(r["end_time"]) for r in ordered
+    )
+    if end_time <= start_time:
+        end_time = start_time + 1e-6
 
-    if confidence_aggregation == "max":
-        confidence = float(np.max(scores))
-    elif confidence_aggregation == "mean":
-        confidence = float(np.mean(scores))
-    else:
-        raise ValueError(f"confidence_aggregation non supportato: {confidence_aggregation}")
+    scores = np.asarray([safe_float(r["confidence"]) for r in ordered], dtype=np.float64)
+    noaction_scores = np.asarray([safe_float(r["noaction_score"]) for r in ordered], dtype=np.float64)
+    thresholds = np.asarray([safe_float(r["threshold"]) for r in ordered], dtype=np.float64)
+    scales = [safe_float(r["scale_sec"]) for r in ordered]
+    scale_indices = {int(r["scale_index"]) for r in ordered}
+    unique_scales = sorted({f"{scale:.3f}".rstrip("0").rstrip(".") for scale in scales})
 
-    start_time = float(min(r["start_time"] for r in group_rows))
-    end_time = float(max(r["end_time"] for r in group_rows))
+    scale_index = int(ordered[0]["scale_index"]) if len(scale_indices) == 1 else -1
+    scale_sec = float(scales[0]) if len(unique_scales) == 1 else -1.0
 
     return {
         "event_id": int(event_id),
-        "label": str(group_rows[0]["label"]),
-        "start_time": start_time,
-        "end_time": end_time,
+        "label": str(ordered[0]["label"]),
+        "start_time": float(start_time),
+        "end_time": float(end_time),
         "duration_sec": float(end_time - start_time),
         "center_time": float((start_time + end_time) / 2.0),
-        "confidence": confidence,
-        "confidence_mean": float(np.mean(scores)),
-        "confidence_max": float(np.max(scores)),
-        "confidence_median": float(np.median(scores)),
-        "noaction_mean": float(np.mean(noaction_scores)),
-        "threshold": float(np.min(thresholds)),
-        "num_windows": int(len(group_rows)),
-        "scale_index": int(group_rows[0]["scale_index"]),
-        "scale_sec": float(group_rows[0]["scale_sec"]),
-        "first_window_id": str(group_rows[0]["window_id"]),
-        "last_window_id": str(group_rows[-1]["window_id"]),
+        "confidence": aggregate_confidence(scores, mode=event_confidence_mode),
+        "confidence_mean": float(np.mean(scores)) if scores.size else 0.0,
+        "confidence_max": float(np.max(scores)) if scores.size else 0.0,
+        "confidence_median": float(np.median(scores)) if scores.size else 0.0,
+        "noaction_mean": float(np.mean(noaction_scores)) if noaction_scores.size else 0.0,
+        "threshold": float(np.min(thresholds)) if thresholds.size else 0.0,
+        "num_windows": int(len(ordered)),
+        "scale_index": scale_index,
+        "scale_sec": scale_sec,
+        "first_window_id": str(ordered[0]["window_id"]),
+        "last_window_id": str(ordered[-1]["window_id"]),
     }
 
 
-def candidates_to_raw_events(
+def split_group_by_max_duration(
+    rows: list[dict[str, Any]],
+    max_duration: float,
+) -> list[tuple[list[dict[str, Any]], float | None, float | None]]:
+    if not rows:
+        return []
+    if max_duration <= 0:
+        return [(rows, None, None)]
+
+    group_start = min(safe_float(r["start_time"]) for r in rows)
+    group_end = max(safe_float(r["end_time"]) for r in rows)
+    duration = group_end - group_start
+    if duration <= max_duration:
+        return [(rows, None, None)]
+
+    chunks: list[tuple[list[dict[str, Any]], float | None, float | None]] = []
+    num_chunks = int(math.ceil(duration / float(max_duration)))
+
+    for chunk_idx in range(num_chunks):
+        chunk_start = group_start + chunk_idx * float(max_duration)
+        chunk_end = min(group_end, chunk_start + float(max_duration))
+        if chunk_end <= chunk_start:
+            continue
+
+        chunk_rows = []
+        for row in rows:
+            center = safe_float(row["center_time"])
+            if chunk_start <= center < chunk_end:
+                chunk_rows.append(row)
+            elif chunk_idx == num_chunks - 1 and math.isclose(center, chunk_end):
+                chunk_rows.append(row)
+
+        if chunk_rows:
+            chunks.append((chunk_rows, chunk_start, chunk_end))
+
+    return chunks
+
+
+def append_group_events(
+    events: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    event_id: int,
+    min_event_duration_sec: float,
+    max_duration_passaggio: float,
+    max_duration_tiro: float,
+    event_confidence_mode: str,
+) -> int:
+    if not rows:
+        return event_id
+
+    label = str(rows[0]["label"])
+    max_duration = 0.0
+    if label == "passaggio":
+        max_duration = float(max_duration_passaggio)
+    elif label in SHOT_LABELS:
+        max_duration = float(max_duration_tiro)
+
+    for chunk_rows, forced_start, forced_end in split_group_by_max_duration(rows, max_duration=max_duration):
+        event = aggregate_rows_to_event(
+            chunk_rows,
+            event_id=event_id,
+            event_confidence_mode=event_confidence_mode,
+            forced_start=forced_start,
+            forced_end=forced_end,
+        )
+        if safe_float(event["duration_sec"]) < float(min_event_duration_sec):
+            continue
+        events.append(event)
+        event_id += 1
+
+    return event_id
+
+
+def group_candidates_to_events(
     candidates: pd.DataFrame,
     merge_gap_sec: float,
-    confidence_aggregation: str,
+    min_event_duration_sec: float,
+    max_duration_passaggio: float,
+    max_duration_tiro: float,
+    event_confidence_mode: str,
 ) -> pd.DataFrame:
     if candidates.empty:
         return pd.DataFrame(columns=RAW_EVENT_COLUMNS)
 
-    if merge_gap_sec < 0:
-        raise ValueError(f"merge_gap_sec deve essere >= 0, trovato {merge_gap_sec}")
-
     events: list[dict[str, Any]] = []
     event_id = 0
 
-    grouped = candidates.sort_values(["scale_index", "label", "start_time"]).groupby(
-        ["scale_index", "label"], sort=True
-    )
-
-    for (_, _), group in grouped:
+    for _, group in candidates.sort_values(["label", "start_time", "end_time"]).groupby("label", sort=True):
         current: list[dict[str, Any]] = []
         current_end: float | None = None
 
         for row in group.to_dict("records"):
-            start = float(row["start_time"])
-            end = float(row["end_time"])
+            start = safe_float(row["start_time"])
+            end = safe_float(row["end_time"])
             if not current:
                 current = [row]
                 current_end = end
@@ -442,232 +576,124 @@ def candidates_to_raw_events(
                 current.append(row)
                 current_end = max(current_end, end)
             else:
-                events.append(
-                    aggregate_candidate_group(
-                        current,
-                        event_id=event_id,
-                        confidence_aggregation=confidence_aggregation,
-                    )
+                event_id = append_group_events(
+                    events=events,
+                    rows=current,
+                    event_id=event_id,
+                    min_event_duration_sec=min_event_duration_sec,
+                    max_duration_passaggio=max_duration_passaggio,
+                    max_duration_tiro=max_duration_tiro,
+                    event_confidence_mode=event_confidence_mode,
                 )
-                event_id += 1
                 current = [row]
                 current_end = end
 
         if current:
-            events.append(
-                aggregate_candidate_group(
-                    current,
-                    event_id=event_id,
-                    confidence_aggregation=confidence_aggregation,
-                )
+            event_id = append_group_events(
+                events=events,
+                rows=current,
+                event_id=event_id,
+                min_event_duration_sec=min_event_duration_sec,
+                max_duration_passaggio=max_duration_passaggio,
+                max_duration_tiro=max_duration_tiro,
+                event_confidence_mode=event_confidence_mode,
             )
-            event_id += 1
 
     if not events:
         return pd.DataFrame(columns=RAW_EVENT_COLUMNS)
 
-    return pd.DataFrame(events, columns=RAW_EVENT_COLUMNS).sort_values(
-        ["start_time", "end_time", "label"]
-    ).reset_index(drop=True)
-
-
-# =============================================================================
-# Eventi raw -> eventi finali
-# =============================================================================
-
-
-def temporal_iou(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
-    inter = max(0.0, min(a_end, b_end) - max(a_start, b_start))
-    if inter <= 0:
-        return 0.0
-    union = max(a_end, b_end) - min(a_start, b_start)
-    if union <= 0:
-        return 0.0
-    return float(inter / union)
-
-
-def merge_event_records(records: list[dict[str, Any]], new_event_id: int) -> dict[str, Any]:
-    if not records:
-        raise ValueError("merge_event_records chiamata con lista vuota")
-
-    start_time = float(min(r["start_time"] for r in records))
-    end_time = float(max(r["end_time"] for r in records))
-    num_windows = int(sum(int(r.get("num_windows", 0)) for r in records))
-    weights = np.array([max(int(r.get("num_windows", 1)), 1) for r in records], dtype=np.float64)
-
-    conf_mean_values = np.array([safe_float(r.get("confidence_mean", r.get("confidence", 0.0))) for r in records])
-    noaction_values = np.array([safe_float(r.get("noaction_mean", 0.0)) for r in records])
-
-    source_ids = []
-    scales = []
-    for r in records:
-        source_ids.append(str(r.get("event_id")))
-        scale = r.get("scale_sec", None)
-        if scale is not None:
-            scales.append(f"{safe_float(scale):.3f}".rstrip("0").rstrip("."))
-
-    # Per first/last window usiamo gli estremi temporali.
-    ordered = sorted(records, key=lambda r: (float(r["start_time"]), float(r["end_time"])))
-
-    return {
-        "event_id": int(new_event_id),
-        "label": str(records[0]["label"]),
-        "start_time": start_time,
-        "end_time": end_time,
-        "duration_sec": float(end_time - start_time),
-        "center_time": float((start_time + end_time) / 2.0),
-        "confidence": float(max(safe_float(r.get("confidence", 0.0)) for r in records)),
-        "confidence_mean": float(np.average(conf_mean_values, weights=weights)),
-        "confidence_max": float(max(safe_float(r.get("confidence_max", r.get("confidence", 0.0))) for r in records)),
-        "confidence_median": float(np.median([safe_float(r.get("confidence_median", r.get("confidence", 0.0))) for r in records])),
-        "noaction_mean": float(np.average(noaction_values, weights=weights)),
-        "threshold": float(min(safe_float(r.get("threshold", 0.0)) for r in records)),
-        "num_windows": num_windows,
-        "scale_index": -1 if len(records) > 1 else int(records[0].get("scale_index", -1)),
-        "scale_sec": float(records[0].get("scale_sec", 0.0)) if len(records) == 1 else -1.0,
-        "first_window_id": str(ordered[0].get("first_window_id", "")),
-        "last_window_id": str(ordered[-1].get("last_window_id", "")),
-        "source_event_ids": ";".join(source_ids),
-        "scales_used": ";".join(sorted(set(scales))),
-    }
-
-
-def filter_short_events(events: pd.DataFrame, min_event_duration_sec: float) -> pd.DataFrame:
-    if events.empty:
-        return events.copy()
-    if min_event_duration_sec < 0:
-        raise ValueError(
-            f"min_event_duration_sec deve essere >= 0, trovato {min_event_duration_sec}"
-        )
-    out = events.copy()
-    out["duration_sec"] = pd.to_numeric(out["end_time"]) - pd.to_numeric(out["start_time"])
-    return out[out["duration_sec"] >= float(min_event_duration_sec)].reset_index(drop=True)
-
-
-def merge_same_label_events(events: pd.DataFrame, merge_gap_sec: float) -> pd.DataFrame:
-    if events.empty:
-        return pd.DataFrame(columns=FINAL_EVENT_COLUMNS)
-
-    merged: list[dict[str, Any]] = []
-    new_event_id = 0
-
-    for label, group in events.sort_values(["label", "start_time", "end_time"]).groupby("label"):
-        current: list[dict[str, Any]] = []
-        current_end: float | None = None
-
-        for row in group.to_dict("records"):
-            start = float(row["start_time"])
-            end = float(row["end_time"])
-
-            if not current:
-                current = [row]
-                current_end = end
-                continue
-
-            assert current_end is not None
-            gap = start - current_end
-            if gap <= merge_gap_sec:
-                current.append(row)
-                current_end = max(current_end, end)
-            else:
-                merged.append(merge_event_records(current, new_event_id=new_event_id))
-                new_event_id += 1
-                current = [row]
-                current_end = end
-
-        if current:
-            merged.append(merge_event_records(current, new_event_id=new_event_id))
-            new_event_id += 1
-
-    if not merged:
-        return pd.DataFrame(columns=FINAL_EVENT_COLUMNS)
-
-    return pd.DataFrame(merged, columns=FINAL_EVENT_COLUMNS).sort_values(
-        ["start_time", "end_time", "label"]
-    ).reset_index(drop=True)
-
-
-def temporal_nms(events: pd.DataFrame, iou_threshold: float) -> pd.DataFrame:
-    if events.empty:
-        return events.copy()
-    if iou_threshold < 0:
-        raise ValueError(f"temporal_nms_iou deve essere >= 0, trovato {iou_threshold}")
-    if iou_threshold <= 0:
-        out = events.copy().sort_values(["start_time", "end_time", "label"]).reset_index(drop=True)
-        out["event_id"] = np.arange(len(out), dtype=int)
-        return out
-
-    records = events.to_dict("records")
-    order = sorted(
-        range(len(records)),
-        key=lambda i: (
-            -safe_float(records[i].get("confidence", 0.0)),
-            -safe_float(records[i].get("duration_sec", 0.0)),
-            safe_float(records[i].get("start_time", 0.0)),
-        ),
-    )
-
-    keep_indices: list[int] = []
-    for idx in order:
-        candidate = records[idx]
-        c_start = safe_float(candidate["start_time"])
-        c_end = safe_float(candidate["end_time"])
-
-        should_keep = True
-        for kept_idx in keep_indices:
-            kept = records[kept_idx]
-            iou = temporal_iou(
-                c_start,
-                c_end,
-                safe_float(kept["start_time"]),
-                safe_float(kept["end_time"]),
-            )
-            if iou > iou_threshold:
-                should_keep = False
-                break
-
-        if should_keep:
-            keep_indices.append(idx)
-
-    kept_records = [records[i] for i in keep_indices]
-    out = pd.DataFrame(kept_records, columns=FINAL_EVENT_COLUMNS).sort_values(
+    out = pd.DataFrame(events, columns=RAW_EVENT_COLUMNS).sort_values(
         ["start_time", "end_time", "label"]
     ).reset_index(drop=True)
     out["event_id"] = np.arange(len(out), dtype=int)
     return out
 
 
-def postprocess_events(
-    raw_events: pd.DataFrame,
-    min_event_duration_sec: float,
-    merge_gap_sec: float,
-    temporal_nms_iou_value: float,
+def overlap_duration(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    return float(max(0.0, min(a_end, b_end) - max(a_start, b_start)))
+
+
+def merge_final_record(record: dict[str, Any], new_event_id: int) -> dict[str, Any]:
+    out = dict(record)
+    out["event_id"] = int(new_event_id)
+    out["duration_sec"] = safe_float(out["end_time"]) - safe_float(out["start_time"])
+    out["center_time"] = (safe_float(out["start_time"]) + safe_float(out["end_time"])) / 2.0
+    out["source_event_ids"] = str(record.get("event_id", new_event_id))
+    scale = safe_float(record.get("scale_sec", -1.0))
+    out["scales_used"] = "mixed" if scale < 0 else f"{scale:.3f}".rstrip("0").rstrip(".")
+    return out
+
+
+def suppress_overlaps(
+    events: pd.DataFrame,
+    allow_overlaps: bool,
+    prefer_shots_over_passaggi: bool = False,
+    prefer_shots_min_confidence: float = 0.0,
 ) -> pd.DataFrame:
-    filtered = filter_short_events(raw_events, min_event_duration_sec=min_event_duration_sec)
-    merged = merge_same_label_events(filtered, merge_gap_sec=merge_gap_sec)
-    final = temporal_nms(merged, iou_threshold=temporal_nms_iou_value)
-    if final.empty:
+    if events.empty:
         return pd.DataFrame(columns=FINAL_EVENT_COLUMNS)
 
-    # Ricalcola durata e centro dopo tutte le operazioni.
-    final = final.copy()
-    final["duration_sec"] = pd.to_numeric(final["end_time"]) - pd.to_numeric(final["start_time"])
-    final["center_time"] = (pd.to_numeric(final["start_time"]) + pd.to_numeric(final["end_time"])) / 2.0
-    final = final.sort_values(["start_time", "end_time", "label"]).reset_index(drop=True)
-    final["event_id"] = np.arange(len(final), dtype=int)
-    return final[FINAL_EVENT_COLUMNS]
+    records = events.to_dict("records")
+    if allow_overlaps:
+        final_records = [merge_final_record(record, i) for i, record in enumerate(records)]
+        return pd.DataFrame(final_records, columns=FINAL_EVENT_COLUMNS).sort_values(
+            ["start_time", "end_time", "label"]
+        ).reset_index(drop=True)
+
+    def priority(record: dict[str, Any]) -> int:
+        label = str(record.get("label", ""))
+        if not prefer_shots_over_passaggi:
+            return 0
+
+        confidence = safe_float(record.get("confidence", 0.0))
+        if label in SHOT_LABELS and confidence >= float(prefer_shots_min_confidence):
+            return 0
+        if label == "passaggio":
+            return 1
+        if label in SHOT_LABELS:
+            return 2
+        return 3
+
+    order = sorted(
+        range(len(records)),
+        key=lambda i: (
+            priority(records[i]),
+            -safe_float(records[i].get("confidence", 0.0)),
+            -safe_float(records[i].get("confidence_max", records[i].get("confidence", 0.0))),
+            -safe_float(records[i].get("duration_sec", 0.0)),
+            safe_float(records[i].get("start_time", 0.0)),
+            safe_float(records[i].get("end_time", 0.0)),
+            str(records[i].get("label", "")),
+        ),
+    )
+
+    keep: list[int] = []
+    for idx in order:
+        candidate = records[idx]
+        c_start = safe_float(candidate["start_time"])
+        c_end = safe_float(candidate["end_time"])
+        if any(
+            overlap_duration(
+                c_start,
+                c_end,
+                safe_float(records[kept_idx]["start_time"]),
+                safe_float(records[kept_idx]["end_time"]),
+            )
+            > 1e-9
+            for kept_idx in keep
+        ):
+            continue
+        keep.append(idx)
+
+    final_records = [merge_final_record(records[idx], new_event_id=i) for i, idx in enumerate(keep)]
+    out = pd.DataFrame(final_records, columns=FINAL_EVENT_COLUMNS).sort_values(
+        ["start_time", "end_time", "label"]
+    ).reset_index(drop=True)
+    out["event_id"] = np.arange(len(out), dtype=int)
+    return out
 
 
-# =============================================================================
-# Export
-# =============================================================================
-
-
-def round_float(value: Any, ndigits: int = 6) -> float:
-    return round(safe_float(value), ndigits)
-
-
-def write_events_csv(path: Path, events: pd.DataFrame, columns: list[str]) -> None:
+def round_event_columns(events: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     out = events.copy()
     for col in [
         "start_time",
@@ -684,13 +710,14 @@ def write_events_csv(path: Path, events: pd.DataFrame, columns: list[str]) -> No
     ]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").round(6)
-
-    # Garantisce colonne stabili anche con DataFrame vuoto.
     for col in columns:
         if col not in out.columns:
             out[col] = []
-    out = out[columns]
-    out.to_csv(path, index=False)
+    return out[columns]
+
+
+def write_events_csv(path: Path, events: pd.DataFrame, columns: list[str]) -> None:
+    round_event_columns(events, columns=columns).to_csv(path, index=False)
 
 
 def events_to_annotations(final_events: pd.DataFrame) -> list[dict[str, Any]]:
@@ -711,55 +738,43 @@ def events_to_annotations(final_events: pd.DataFrame) -> list[dict[str, Any]]:
     return annotations
 
 
-def count_by_label(events: pd.DataFrame) -> dict[str, int]:
-    if events.empty or "label" not in events.columns:
-        return {label: 0 for label in ACTION_LABELS}
-    counts = events["label"].value_counts().to_dict()
-    return {label: int(counts.get(label, 0)) for label in ACTION_LABELS}
-
-
-def write_annotations_json(
-    path: Path,
-    final_events: pd.DataFrame,
-    args: argparse.Namespace,
-    predictions_csv: Path,
-) -> None:
-    data = {
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "source_predictions_csv": str(predictions_csv),
-        "num_events": int(len(final_events)),
-        "counts_by_label": count_by_label(final_events),
-        "events": events_to_annotations(final_events),
-        "notes": {
-            "time_reference": "Timestamp assoluti del video originale, in secondi.",
-            "labels": "Sono esportate solo le 7 azioni reali; no-action è usata come background.",
-        },
-        "postprocess": asdict(make_args_snapshot(args)),
-    }
-    write_json(path, data)
-
-
 def make_args_snapshot(args: argparse.Namespace) -> ArgsSnapshot:
     return ArgsSnapshot(
         predictions_csv=str(args.predictions_csv),
         output_dir=str(args.output_dir),
-        smooth_window=int(args.smooth_window),
-        min_event_duration_sec=float(args.min_event_duration_sec),
-        merge_gap_sec=float(args.merge_gap_sec),
-        temporal_nms_iou=float(args.temporal_nms_iou),
         min_conf_passaggio=float(args.min_conf_passaggio),
         min_conf_tiro=float(args.min_conf_tiro),
-        candidate_mode=str(args.candidate_mode),
-        confidence_aggregation=str(args.confidence_aggregation),
+        min_event_duration_sec=float(args.min_event_duration_sec),
+        merge_gap_sec=float(args.merge_gap_sec),
+        max_duration_passaggio=float(args.max_duration_passaggio),
+        max_duration_tiro=float(args.max_duration_tiro),
+        max_window_sec_passaggio=None
+        if args.max_window_sec_passaggio is None
+        else float(args.max_window_sec_passaggio),
+        min_window_sec_tiro=None
+        if args.min_window_sec_tiro is None
+        else float(args.min_window_sec_tiro),
+        max_window_sec_tiro=None
+        if args.max_window_sec_tiro is None
+        else float(args.max_window_sec_tiro),
         require_action_gt_noaction=bool(args.require_action_gt_noaction),
         noaction_margin=float(args.noaction_margin),
+        noaction_margin_passaggio=None
+        if args.noaction_margin_passaggio is None
+        else float(args.noaction_margin_passaggio),
+        noaction_margin_tiro=None
+        if args.noaction_margin_tiro is None
+        else float(args.noaction_margin_tiro),
+        event_confidence_mode=str(args.event_confidence_mode),
+        prefer_shots_over_passaggi=bool(args.prefer_shots_over_passaggi),
+        prefer_shots_min_confidence=float(args.prefer_shots_min_confidence),
+        forbid_overlaps=not bool(args.allow_overlaps),
     )
 
 
 def write_metadata(
     path: Path,
     args: argparse.Namespace,
-    predictions_csv: Path,
     predictions: pd.DataFrame,
     candidates: pd.DataFrame,
     raw_events: pd.DataFrame,
@@ -767,140 +782,176 @@ def write_metadata(
     started_at: str,
 ) -> None:
     data = {
+        "kind": "postprocess_events",
         "started_at": started_at,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
-        "source_predictions_csv": str(predictions_csv),
+        "source_predictions_csv": str(args.predictions_csv),
         "args": asdict(make_args_snapshot(args)),
         "summary": {
             "num_windows": int(len(predictions)),
             "num_candidate_windows": int(len(candidates)),
             "num_raw_events": int(len(raw_events)),
             "num_final_events": int(len(final_events)),
+            "candidate_counts_by_label": count_by_label(candidates),
             "raw_counts_by_label": count_by_label(raw_events),
             "final_counts_by_label": count_by_label(final_events),
         },
+        "logic": [
+            "read window_predictions_raw.csv",
+            "use pred_label/confidence for each window",
+            "discard no-action",
+            "apply passaggio/tiro thresholds",
+            "filter passaggio/tiro candidates by window scale when configured",
+            "optionally require action score > no-action score * margin, with optional separate margins for passaggio and shots",
+            "group windows by label when temporal gap <= merge_gap_sec",
+            "split events longer than max_duration_passaggio/max_duration_tiro",
+            "discard events shorter than min_event_duration_sec",
+            "optionally suppress overlaps greedily by event confidence",
+            "when configured, overlapping shots are prioritized over passaggio, optionally only above a confidence threshold",
+        ],
         "outputs": {
+            "candidate_windows_csv": "candidate_windows.csv",
             "events_raw_csv": "events_raw.csv",
             "events_postprocessed_csv": "events_postprocessed.csv",
             "annotations_json": "annotations.json",
+            "postprocess_metadata_json": "postprocess_metadata.json",
         },
     }
     write_json(path, data)
 
 
-# =============================================================================
-# CLI
-# =============================================================================
-
-
 def build_argparser() -> argparse.ArgumentParser:
+    val_output = fallback_val_output_dir()
     parser = argparse.ArgumentParser(
         description=(
-            "Post-processing temporale delle predizioni raw su finestre long-video. "
-            "Produce eventi raw, eventi post-processati e annotations.json."
+            "Post-processing delle predizioni raw long-video. "
+            "Usa pred_label/confidence, soglie, filtri per scala, merge per gap, durata massima e overlap suppression."
         )
     )
 
     parser.add_argument(
         "--predictions-csv",
         type=Path,
-        default=defaults.VAL_OUTPUT_DIR / "window_predictions_raw.csv",
+        default=val_output / "window_predictions_raw.csv",
         help="CSV prodotto da infer_exp46_from_store.py.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=defaults.VAL_OUTPUT_DIR,
-        help="Cartella in cui salvare events_raw.csv, events_postprocessed.csv e annotations.json.",
+        default=val_output,
+        help="Cartella in cui salvare eventi e annotations.json.",
     )
-
+    parser.add_argument("--min-conf-passaggio", type=float, default=0.65)
+    parser.add_argument("--min-conf-tiro", type=float, default=0.40)
+    parser.add_argument("--min-event-duration-sec", type=float, default=0.25)
+    parser.add_argument("--merge-gap-sec", type=float, default=0.20)
     parser.add_argument(
-        "--smooth-window",
-        type=int,
-        default=3,
-        help="Numero di finestre per smoothing rolling per ogni scala. Usa 1 per disattivarlo.",
-    )
-    parser.add_argument(
-        "--min-event-duration-sec",
+        "--max-duration-passaggio",
         type=float,
-        default=0.4,
-        help="Durata minima degli eventi finali in secondi.",
+        default=1.20,
+        help="Durata massima di un evento passaggio. Usa 0 o valore negativo per disattivare.",
     )
     parser.add_argument(
-        "--merge-gap-sec",
+        "--max-duration-tiro",
         type=float,
-        default=0.75,
-        help="Gap massimo per unire finestre/eventi adiacenti della stessa classe.",
+        default=2.00,
+        help="Durata massima di un evento tiro. Usa 0 o valore negativo per disattivare.",
     )
     parser.add_argument(
-        "--temporal-nms-iou",
+        "--max-window-sec-passaggio",
         type=float,
-        default=0.50,
-        help="Soglia IoU temporale per sopprimere eventi sovrapposti. Usa 0 per disattivare.",
+        default=None,
+        help="Scarta candidati passaggio provenienti da finestre più lunghe di questo valore.",
     )
     parser.add_argument(
-        "--min-conf-passaggio",
+        "--min-window-sec-tiro",
         type=float,
-        default=0.55,
-        help="Soglia minima per confermare finestre candidate di passaggio.",
+        default=None,
+        help="Scarta candidati tiro provenienti da finestre più corte di questo valore.",
     )
     parser.add_argument(
-        "--min-conf-tiro",
+        "--max-window-sec-tiro",
         type=float,
-        default=0.40,
-        help="Soglia minima per confermare finestre candidate di tiro.",
-    )
-    parser.add_argument(
-        "--candidate-mode",
-        choices=["best_per_window", "threshold_all"],
-        default="best_per_window",
-        help=(
-            "best_per_window tiene al massimo una classe azione per finestra; "
-            "threshold_all crea candidati per tutte le classi sopra soglia."
-        ),
-    )
-    parser.add_argument(
-        "--confidence-aggregation",
-        choices=["max", "mean"],
-        default="max",
-        help="Come calcolare la confidenza principale di un evento da più finestre.",
+        default=None,
+        help="Scarta candidati tiro provenienti da finestre più lunghe di questo valore.",
     )
     parser.add_argument(
         "--require-action-gt-noaction",
         action="store_true",
+        help="Richiede score azione >= score no-action * noaction-margin.",
+    )
+    parser.add_argument("--noaction-margin", type=float, default=1.05)
+    parser.add_argument(
+        "--noaction-margin-passaggio",
+        type=float,
+        default=None,
+        help="Margine action > no-action specifico per passaggio. Se omesso, usa --noaction-margin.",
+    )
+    parser.add_argument(
+        "--noaction-margin-tiro",
+        type=float,
+        default=None,
+        help="Margine action > no-action specifico per i tiri. Se omesso, usa --noaction-margin.",
+    )
+    parser.add_argument(
+        "--event-confidence-mode",
+        choices=["max", "mean", "median"],
+        default="max",
+        help="Come calcolare la confidence finale dell'evento dalle finestre raggruppate.",
+    )
+    parser.add_argument(
+        "--prefer-shots-over-passaggi",
+        action="store_true",
         help=(
-            "Richiede che lo score azione superi lo score no-action moltiplicato per "
-            "--noaction-margin. Di default è disattivato per non penalizzare troppo i tiri."
+            "Durante la soppressione degli overlap, dà priorità agli eventi tiro rispetto ai passaggi. "
+            "Utile quando i tiri vengono eliminati perché sovrapposti a passaggi più confidenti."
         ),
     )
     parser.add_argument(
-        "--noaction-margin",
+        "--prefer-shots-min-confidence",
         type=float,
-        default=1.0,
-        help="Margine usato con --require-action-gt-noaction.",
+        default=0.0,
+        help=(
+            "Quando --prefer-shots-over-passaggi è attivo, dà priorità ai tiri solo se "
+            "la confidence del tiro è almeno questo valore. Con 0.0 la priorità è sempre attiva."
+        ),
     )
     parser.add_argument(
-        "--overwrite",
+        "--allow-overlaps",
         action="store_true",
-        help="Sovrascrive output esistenti.",
+        help="Permette eventi sovrapposti. Di default viene tenuto solo l'evento più confidente.",
     )
-
+    parser.add_argument("--overwrite", action="store_true")
     return parser
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.smooth_window < 1:
-        raise ValueError("--smooth-window deve essere >= 1")
+    if args.min_conf_passaggio < 0 or args.min_conf_tiro < 0:
+        raise ValueError("Le soglie di confidenza devono essere >= 0")
     if args.min_event_duration_sec < 0:
         raise ValueError("--min-event-duration-sec deve essere >= 0")
     if args.merge_gap_sec < 0:
         raise ValueError("--merge-gap-sec deve essere >= 0")
-    if args.temporal_nms_iou < 0:
-        raise ValueError("--temporal-nms-iou deve essere >= 0")
-    if args.min_conf_passaggio < 0 or args.min_conf_tiro < 0:
-        raise ValueError("Le soglie di confidenza devono essere >= 0")
     if args.noaction_margin < 0:
         raise ValueError("--noaction-margin deve essere >= 0")
+    if args.noaction_margin_passaggio is not None and args.noaction_margin_passaggio < 0:
+        raise ValueError("--noaction-margin-passaggio deve essere >= 0")
+    if args.noaction_margin_tiro is not None and args.noaction_margin_tiro < 0:
+        raise ValueError("--noaction-margin-tiro deve essere >= 0")
+    if args.prefer_shots_min_confidence < 0:
+        raise ValueError("--prefer-shots-min-confidence deve essere >= 0")
+    if args.max_window_sec_passaggio is not None and args.max_window_sec_passaggio <= 0:
+        raise ValueError("--max-window-sec-passaggio deve essere > 0, oppure omesso")
+    if args.min_window_sec_tiro is not None and args.min_window_sec_tiro <= 0:
+        raise ValueError("--min-window-sec-tiro deve essere > 0, oppure omesso")
+    if args.max_window_sec_tiro is not None and args.max_window_sec_tiro <= 0:
+        raise ValueError("--max-window-sec-tiro deve essere > 0, oppure omesso")
+    if (
+        args.min_window_sec_tiro is not None
+        and args.max_window_sec_tiro is not None
+        and args.min_window_sec_tiro > args.max_window_sec_tiro
+    ):
+        raise ValueError("--min-window-sec-tiro non può essere maggiore di --max-window-sec-tiro")
 
 
 def main() -> None:
@@ -917,6 +968,7 @@ def main() -> None:
     check_output_files(
         args.output_dir,
         output_files=[
+            "candidate_windows.csv",
             "events_raw.csv",
             "events_postprocessed.csv",
             "annotations.json",
@@ -926,53 +978,61 @@ def main() -> None:
     )
 
     print("=== Post-processing long-video ===")
-    print(f"predictions_csv:       {args.predictions_csv}")
-    print(f"output_dir:            {args.output_dir}")
-    print(f"smooth_window:         {args.smooth_window}")
-    print(f"min_conf_passaggio:    {args.min_conf_passaggio:.3f}")
-    print(f"min_conf_tiro:         {args.min_conf_tiro:.3f}")
-    print(f"min_event_duration:    {args.min_event_duration_sec:.3f}s")
-    print(f"merge_gap_sec:         {args.merge_gap_sec:.3f}s")
-    print(f"temporal_nms_iou:      {args.temporal_nms_iou:.3f}")
-    print(f"candidate_mode:        {args.candidate_mode}")
+    print(f"predictions_csv:      {args.predictions_csv}")
+    print(f"output_dir:           {args.output_dir}")
+    print(f"min_conf_passaggio:   {args.min_conf_passaggio:.3f}")
+    print(f"min_conf_tiro:        {args.min_conf_tiro:.3f}")
+    print(f"merge_gap_sec:        {args.merge_gap_sec:.3f}")
+    print(f"min_event_duration:   {args.min_event_duration_sec:.3f}")
+    print(f"max_duration_pass:    {args.max_duration_passaggio:.3f}")
+    print(f"max_duration_tiro:    {args.max_duration_tiro:.3f}")
+    print(f"max_window_passaggio: {args.max_window_sec_passaggio}")
+    print(f"min_window_tiro:      {args.min_window_sec_tiro}")
+    print(f"max_window_tiro:      {args.max_window_sec_tiro}")
+    print(f"action_gt_noaction:   {bool(args.require_action_gt_noaction)}")
+    print(f"noaction_margin:      {args.noaction_margin:.3f}")
+    print(f"noaction_margin_pass: {args.noaction_margin_passaggio}")
+    print(f"noaction_margin_tiro: {args.noaction_margin_tiro}")
+    print(f"confidence_mode:      {args.event_confidence_mode}")
+    print(f"prefer_shots_pass:    {bool(args.prefer_shots_over_passaggi)}")
+    print(f"prefer_shots_minconf: {args.prefer_shots_min_confidence:.3f}")
+    print(f"forbid_overlaps:      {not bool(args.allow_overlaps)}")
 
     predictions = load_predictions(args.predictions_csv)
-    predictions = add_smoothed_scores(predictions, smooth_window=int(args.smooth_window))
-
-    candidates = build_candidate_rows(
-        predictions,
+    candidates = build_candidate_windows(
+        predictions=predictions,
         min_conf_passaggio=float(args.min_conf_passaggio),
         min_conf_tiro=float(args.min_conf_tiro),
-        candidate_mode=str(args.candidate_mode),
         require_action_gt_noaction=bool(args.require_action_gt_noaction),
         noaction_margin=float(args.noaction_margin),
+        noaction_margin_passaggio=args.noaction_margin_passaggio,
+        noaction_margin_tiro=args.noaction_margin_tiro,
+        max_window_sec_passaggio=args.max_window_sec_passaggio,
+        min_window_sec_tiro=args.min_window_sec_tiro,
+        max_window_sec_tiro=args.max_window_sec_tiro,
     )
-
-    raw_events = candidates_to_raw_events(
-        candidates,
+    raw_events = group_candidates_to_events(
+        candidates=candidates,
         merge_gap_sec=float(args.merge_gap_sec),
-        confidence_aggregation=str(args.confidence_aggregation),
-    )
-
-    final_events = postprocess_events(
-        raw_events,
         min_event_duration_sec=float(args.min_event_duration_sec),
-        merge_gap_sec=float(args.merge_gap_sec),
-        temporal_nms_iou_value=float(args.temporal_nms_iou),
+        max_duration_passaggio=float(args.max_duration_passaggio),
+        max_duration_tiro=float(args.max_duration_tiro),
+        event_confidence_mode=str(args.event_confidence_mode),
+    )
+    final_events = suppress_overlaps(
+        raw_events,
+        allow_overlaps=bool(args.allow_overlaps),
+        prefer_shots_over_passaggi=bool(args.prefer_shots_over_passaggi),
+        prefer_shots_min_confidence=float(args.prefer_shots_min_confidence),
     )
 
-    raw_csv = args.output_dir / "events_raw.csv"
-    final_csv = args.output_dir / "events_postprocessed.csv"
-    annotations_json = args.output_dir / "annotations.json"
-    metadata_json = args.output_dir / "postprocess_metadata.json"
-
-    write_events_csv(raw_csv, raw_events, RAW_EVENT_COLUMNS)
-    write_events_csv(final_csv, final_events, FINAL_EVENT_COLUMNS)
-    write_annotations_json(annotations_json, final_events, args, args.predictions_csv)
+    candidates.to_csv(args.output_dir / "candidate_windows.csv", index=False)
+    write_events_csv(args.output_dir / "events_raw.csv", raw_events, columns=RAW_EVENT_COLUMNS)
+    write_events_csv(args.output_dir / "events_postprocessed.csv", final_events, columns=FINAL_EVENT_COLUMNS)
+    write_json(args.output_dir / "annotations.json", {"annotations": events_to_annotations(final_events)})
     write_metadata(
-        metadata_json,
+        args.output_dir / "postprocess_metadata.json",
         args=args,
-        predictions_csv=args.predictions_csv,
         predictions=predictions,
         candidates=candidates,
         raw_events=raw_events,
@@ -980,20 +1040,12 @@ def main() -> None:
         started_at=started_at,
     )
 
-    print("\n=== Output ===")
-    print(f"events_raw.csv:           {raw_csv}")
-    print(f"events_postprocessed.csv: {final_csv}")
-    print(f"annotations.json:         {annotations_json}")
-    print(f"postprocess_metadata.json:{metadata_json}")
-
-    print("\n=== Riepilogo ===")
-    print(f"finestre totali:          {len(predictions)}")
-    print(f"finestre candidate:       {len(candidates)}")
-    print(f"eventi raw:               {len(raw_events)}")
-    print(f"eventi finali:            {len(final_events)}")
-    print("conteggio eventi finali:")
-    for label, count in count_by_label(final_events).items():
-        print(f"  {label:12s}: {count}")
+    print("\n=== Summary ===")
+    print(f"finestre totali:      {len(predictions)}")
+    print(f"candidate windows:    {len(candidates)} | {count_by_label(candidates)}")
+    print(f"eventi raw:           {len(raw_events)} | {count_by_label(raw_events)}")
+    print(f"eventi finali:        {len(final_events)} | {count_by_label(final_events)}")
+    print(f"\n[OK] events_postprocessed.csv salvato in: {args.output_dir / 'events_postprocessed.csv'}")
 
 
 if __name__ == "__main__":
