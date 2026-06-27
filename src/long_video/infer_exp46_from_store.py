@@ -2,36 +2,42 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib
 import inspect
-import json
 import math
-import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
 import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from src.long_video import defaults
 from src.features.extract_ball_rim_tracking_features import (
     compute_pair_features,
     compute_temporal_sequence_features,
 )
+from src.long_video import defaults
+from src.long_video.utils import (
+    as_path,
+    check_output_files,
+    ensure_exists,
+    parse_device_for_torch,
+    read_json,
+    write_json,
+)
+from src.models.temporal_transformer_classifier import TemporalTransformerActionClassifier
 
 
 # =============================================================================
-# Costanti label exp_46
+# Configurazione fissa exp_long_13 / exp_46
 # =============================================================================
 
-DEFAULT_L1_LABELS = ["passaggio", "tiro", "no-action"]
-DEFAULT_L2_LABELS = ["tiroDaDue", "tiroDaTre", "tiroLibero"]
-DEFAULT_L3_LABELS = ["0", "1"]
+L1_LABELS = ["passaggio", "tiro", "no-action"]
+L2_LABELS = ["tiroDaDue", "tiroDaTre", "tiroLibero"]
+L3_LABELS = ["0", "1"]
 
 FINAL_LABELS = [
     "passaggio",
@@ -44,41 +50,16 @@ FINAL_LABELS = [
     "no-action",
 ]
 
-SHOT_TYPE_TO_PREFIX = {
-    "tiroDaDue": "tiroDaDue",
-    "tiroDaTre": "tiroDaTre",
-    "tiroLibero": "tiroLibero",
-}
-
-# Candidati import del modello. Il primo dovrebbe essere quello del progetto.
-MODEL_CLASS_CANDIDATES = [
-    # Nome reale usato nel progetto. Vedi src/models/temporal_transformer_classifier.py.
-    ("src.models.temporal_transformer_classifier", "TemporalTransformerActionClassifier"),
-
-    # Alias/fallback mantenuti per compatibilità con eventuali versioni precedenti.
-    ("src.models.temporal_transformer_classifier", "TemporalTransformerClassifier"),
-    ("src.models.temporal_transformer_classifier", "TemporalTransformer"),
-    ("src.models.temporal_transformer_classifier", "TransformerClassifier"),
-    ("src.models.temporal_transformer", "TemporalTransformerClassifier"),
-    ("src.models.temporal_transformer", "TemporalTransformer"),
-]
-
-
-# =============================================================================
-# Policy temporale long-video train-like
-# =============================================================================
-
-# Replica il training delle sequenze tracking clip-level:
-# - DINOv3 usa tutti i frame/source samples della finestra;
-# - il tracking palla/canestro usa al massimo 48 frame uniformi, come
-#   extract_ball_rim_tracking_features.py;
-# - le feature temporali vengono costruite con compute_temporal_sequence_features;
-# - il tracking viene normalizzato con mean/std salvati nel checkpoint;
-# - il modello riceve sequenze a lunghezza variabile con lengths reali.
+# Coerente con gli esperimenti clip-level exp_46 usati dalla pipeline long-video.
 TRACKING_MAX_FRAMES_PER_WINDOW = 48
 TRACKING_NEAR_THRESHOLD = 0.12
 TRACKING_RIM_INSIDE_MARGIN = 0.15
-TEMPORAL_POLICY = "train_like_dino_all_frames_tracking_traincode_max48_checkpoint_zscore"
+TEMPORAL_POLICY = "exp13_train_like_dino_all_frames_tracking_max48_checkpoint_zscore"
+
+# Struttura feature tracking dei tre livelli exp_46.
+L1_EXPECTED_TRACKING_FEATURES = 43  # YOLO v2, temp43
+L2_EXPECTED_TRACKING_FEATURES = 29  # YOLO v2, temp29
+L3_EXPECTED_TRACKING_FEATURES = 43  # YOLO v1, temp43
 
 
 # =============================================================================
@@ -99,17 +80,12 @@ class WindowRow:
     store_start_index: int
     store_end_index: int
     num_store_samples: int
-    first_sample_time: float | None
-    last_sample_time: float | None
-    dino_num_frames: int | None = None
-    tracking_raw_num_frames: int | None = None
 
 
 @dataclass
 class LevelBundle:
     name: str
     checkpoint_path: Path
-    checkpoint: dict[str, Any]
     model_config: dict[str, Any]
     tracking_config: dict[str, Any]
     feature_names: list[str]
@@ -135,58 +111,8 @@ class FeatureStore:
 
 
 # =============================================================================
-# Utility generali
+# Lettura feature store e finestre
 # =============================================================================
-
-
-def as_path(value: str | Path | None) -> Path | None:
-    if value is None:
-        return None
-    if isinstance(value, Path):
-        return value
-    return Path(value)
-
-
-def ensure_exists(path: Path, name: str, must_be_file: bool | None = None) -> None:
-    if not path.exists():
-        raise FileNotFoundError(f"{name} non trovato: {path}")
-    if must_be_file is True and not path.is_file():
-        raise FileNotFoundError(f"{name} dovrebbe essere un file: {path}")
-    if must_be_file is False and not path.is_dir():
-        raise NotADirectoryError(f"{name} dovrebbe essere una cartella: {path}")
-
-
-def write_json(path: Path, data: dict[str, Any]) -> None:
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def check_output_files(output_dir: Path, output_files: Iterable[str], overwrite: bool) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    existing = [output_dir / f for f in output_files if (output_dir / f).exists()]
-    if existing and not overwrite:
-        joined = "\n".join(str(p) for p in existing)
-        raise FileExistsError(
-            "Alcuni file di output esistono già:\n"
-            f"{joined}\n"
-            "Usa --overwrite per sovrascriverli."
-        )
-    for p in existing:
-        if p.is_dir():
-            shutil.rmtree(p)
-        else:
-            p.unlink()
-
-
-def parse_device(device: str) -> torch.device:
-    device = str(device)
-    if device.lower() == "cpu":
-        return torch.device("cpu")
-    if torch.cuda.is_available():
-        if device.startswith("cuda"):
-            return torch.device(device)
-        return torch.device(f"cuda:{device}")
-    print("[WARN] CUDA non disponibile: uso CPU.")
-    return torch.device("cpu")
 
 
 def safe_torch_load(path: Path) -> Any:
@@ -196,65 +122,70 @@ def safe_torch_load(path: Path) -> Any:
         return torch.load(path, map_location="cpu")
 
 
-# =============================================================================
-# Lettura feature store e finestre
-# =============================================================================
-
-
-def load_metadata(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def npz_to_dict(npz_path: Path) -> dict[str, np.ndarray]:
     ensure_exists(npz_path, npz_path.name, must_be_file=True)
-    data = np.load(npz_path)
-    return {k: data[k] for k in data.files}
+    with np.load(npz_path) as data:
+        return {k: data[k] for k in data.files}
 
 
 def load_feature_store(feature_store_dir: Path) -> FeatureStore:
     ensure_exists(feature_store_dir, "Feature store", must_be_file=False)
 
-    metadata_path = feature_store_dir / "metadata.json"
-    timestamps_path = feature_store_dir / "timestamps.npy"
-    dino_path = feature_store_dir / "dinov3_features.npy"
-    yolo_v1_path = feature_store_dir / "yolo_v1_primitives.npz"
-    yolo_v2_path = feature_store_dir / "yolo_v2_primitives.npz"
+    metadata_path = feature_store_dir / defaults.METADATA_FILENAME
+    timestamps_path = feature_store_dir / defaults.TIMESTAMPS_FILENAME
+    dino_path = feature_store_dir / defaults.DINOV3_FEATURES_FILENAME
+    yolo_v1_path = feature_store_dir / defaults.YOLO_V1_PRIMITIVES_FILENAME
+    yolo_v2_path = feature_store_dir / defaults.YOLO_V2_PRIMITIVES_FILENAME
 
     ensure_exists(timestamps_path, "timestamps.npy", must_be_file=True)
     ensure_exists(dino_path, "dinov3_features.npy", must_be_file=True)
     ensure_exists(yolo_v1_path, "yolo_v1_primitives.npz", must_be_file=True)
     ensure_exists(yolo_v2_path, "yolo_v2_primitives.npz", must_be_file=True)
 
-    metadata = load_metadata(metadata_path)
+    metadata = read_json(metadata_path) if metadata_path.exists() else {}
     timestamps = np.load(timestamps_path).astype(np.float64)
     dino_features = np.load(dino_path, mmap_mode="r")
 
     if timestamps.ndim != 1:
         raise ValueError(f"timestamps.npy deve avere shape [N], trovato {timestamps.shape}")
+    if timestamps.size == 0:
+        raise ValueError("timestamps.npy è vuoto")
     if dino_features.ndim != 2:
         raise ValueError(f"dinov3_features.npy deve avere shape [N, D], trovato {dino_features.shape}")
     if dino_features.shape[0] != timestamps.shape[0]:
         raise ValueError(
             f"timestamps e DINO hanno N diverso: {timestamps.shape[0]} vs {dino_features.shape[0]}"
         )
-    if np.any(np.diff(timestamps) < 0):
-        raise ValueError("timestamps.npy non è monotono crescente")
+    if np.any(~np.isfinite(timestamps)) or np.any(np.diff(timestamps) < 0):
+        raise ValueError("timestamps.npy contiene valori non finiti oppure non è monotono crescente")
 
     video_meta = metadata.get("video", {}) if isinstance(metadata, dict) else {}
     sampling_meta = metadata.get("sampling", {}) if isinstance(metadata, dict) else {}
 
     store_start = float(video_meta.get("start_sec", float(timestamps[0])))
     store_end = float(video_meta.get("end_sec", float(timestamps[-1])))
-    feature_fps = sampling_meta.get("feature_fps")
-    feature_fps = None if feature_fps is None else float(feature_fps)
+    feature_fps_value = sampling_meta.get("feature_fps")
+    feature_fps = None if feature_fps_value is None else float(feature_fps_value)
 
     yolo_v1 = npz_to_dict(yolo_v1_path)
     yolo_v2 = npz_to_dict(yolo_v2_path)
 
+    required_primitive_fields = [
+        "ball_detected",
+        "ball_conf",
+        "ball_xc",
+        "ball_yc",
+        "ball_w",
+        "ball_h",
+        "rim_detected",
+        "rim_conf",
+        "rim_xc",
+        "rim_yc",
+        "rim_w",
+        "rim_h",
+    ]
     for source_name, primitives in [("yolo_v1", yolo_v1), ("yolo_v2", yolo_v2)]:
-        for required in ["ball_detected", "rim_detected", "ball_xc", "ball_yc", "rim_xc", "rim_yc"]:
+        for required in required_primitive_fields:
             if required not in primitives:
                 raise KeyError(f"{source_name}_primitives.npz non contiene '{required}'")
         n = primitives["ball_detected"].shape[0]
@@ -277,36 +208,26 @@ def load_feature_store(feature_store_dir: Path) -> FeatureStore:
     )
 
 
-def parse_optional_float(value: str) -> float | None:
-    if value == "" or value is None:
-        return None
-    return float(value)
-
-
-def parse_optional_int(value: str | None) -> int | None:
-    if value == "" or value is None:
-        return None
-    return int(value)
-
-
-def read_windows_csv(path: Path, max_windows: int | None = None) -> list[WindowRow]:
+def read_windows_csv(path: Path) -> list[WindowRow]:
     ensure_exists(path, "windows_manifest.csv", must_be_file=True)
     rows: list[WindowRow] = []
+
+    required = [
+        "window_id",
+        "scale_index",
+        "scale_sec",
+        "start_time",
+        "end_time",
+        "center_time",
+        "start_rel_sec",
+        "end_rel_sec",
+        "store_start_index",
+        "store_end_index",
+        "num_store_samples",
+    ]
+
     with path.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        required = [
-            "window_id",
-            "scale_index",
-            "scale_sec",
-            "start_time",
-            "end_time",
-            "center_time",
-            "start_rel_sec",
-            "end_rel_sec",
-            "store_start_index",
-            "store_end_index",
-            "num_store_samples",
-        ]
         missing = [c for c in required if c not in (reader.fieldnames or [])]
         if missing:
             raise KeyError(f"windows_manifest.csv non contiene colonne richieste: {missing}")
@@ -325,14 +246,8 @@ def read_windows_csv(path: Path, max_windows: int | None = None) -> list[WindowR
                     store_start_index=int(row["store_start_index"]),
                     store_end_index=int(row["store_end_index"]),
                     num_store_samples=int(row["num_store_samples"]),
-                    first_sample_time=parse_optional_float(row.get("first_sample_time", "")),
-                    last_sample_time=parse_optional_float(row.get("last_sample_time", "")),
-                    dino_num_frames=parse_optional_int(row.get("dino_num_frames", "")),
-                    tracking_raw_num_frames=parse_optional_int(row.get("tracking_raw_num_frames", "")),
                 )
             )
-            if max_windows is not None and len(rows) >= max_windows:
-                break
 
     if not rows:
         raise RuntimeError(f"Nessuna finestra letta da {path}")
@@ -340,7 +255,7 @@ def read_windows_csv(path: Path, max_windows: int | None = None) -> list[WindowR
 
 
 # =============================================================================
-# Checkpoint e modello
+# Checkpoint e modello exp_46
 # =============================================================================
 
 
@@ -353,10 +268,12 @@ def find_tracking_config(ckpt: dict[str, Any]) -> dict[str, Any]:
     tracking_config = ckpt.get("tracking_config")
     if isinstance(tracking_config, dict):
         return dict(tracking_config)
+
     model_config = find_model_config(ckpt)
     tracking_config = model_config.get("tracking_config")
     if isinstance(tracking_config, dict):
         return dict(tracking_config)
+
     raise KeyError("tracking_config non trovato nel checkpoint")
 
 
@@ -366,22 +283,13 @@ def get_state_dict_from_checkpoint(ckpt: dict[str, Any]) -> dict[str, torch.Tens
         if isinstance(value, dict) and value and all(torch.is_tensor(v) for v in value.values()):
             return value
 
-    value = ckpt.get("model")
-    if isinstance(value, dict) and value and all(torch.is_tensor(v) for v in value.values()):
-        return value
-
-    if ckpt and all(torch.is_tensor(v) for v in ckpt.values()):
-        return ckpt
-
-    raise KeyError(
-        "State dict del modello non trovato nel checkpoint. "
-        "Chiavi cercate: model_state_dict, state_dict, model_state, net_state_dict, model."
-    )
+    raise KeyError("State dict del modello non trovato nel checkpoint exp_46")
 
 
 def strip_state_dict_prefixes(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     prefixes = ["module.", "model.", "net."]
     cleaned: dict[str, torch.Tensor] = {}
+
     for key, value in state_dict.items():
         new_key = key
         changed = True
@@ -392,137 +300,28 @@ def strip_state_dict_prefixes(state_dict: dict[str, torch.Tensor]) -> dict[str, 
                     new_key = new_key[len(prefix) :]
                     changed = True
         cleaned[new_key] = value
+
     return cleaned
-
-
-def import_model_class() -> type[nn.Module]:
-    """Importa la classe del modello temporale.
-
-    Nel progetto la classe reale si chiama TemporalTransformerActionClassifier.
-    Manteniamo comunque un fallback automatico per evitare che la pipeline si rompa
-    se in futuro il file viene rinominato o vengono aggiunti alias.
-    """
-    errors: list[str] = []
-
-    for module_name, class_name in MODEL_CLASS_CANDIDATES:
-        try:
-            module = importlib.import_module(module_name)
-            cls = getattr(module, class_name)
-            if not inspect.isclass(cls) or not issubclass(cls, nn.Module):
-                errors.append(f"{module_name}.{class_name}: non è una sottoclasse nn.Module")
-                continue
-            print(f"[INFO] Classe modello importata: {module_name}.{class_name}")
-            return cls
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{module_name}.{class_name}: {type(exc).__name__}: {exc}")
-
-    # Fallback: cerca automaticamente una classe nn.Module definita nel modulo del progetto.
-    module_name = "src.models.temporal_transformer_classifier"
-    try:
-        module = importlib.import_module(module_name)
-    except Exception as exc:  # noqa: BLE001
-        raise ImportError(
-            f"Impossibile importare il modulo {module_name}.\n"
-            f"Errore: {type(exc).__name__}: {exc}\n\n"
-            "Tentativi precedenti:\n" + "\n".join(errors)
-        ) from exc
-
-    candidates: list[tuple[int, str, type[nn.Module], Any]] = []
-
-    for name, obj in vars(module).items():
-        if not inspect.isclass(obj):
-            continue
-        try:
-            if not issubclass(obj, nn.Module):
-                continue
-        except TypeError:
-            continue
-
-        # Evita classi importate da torch o classi ausiliarie definite altrove.
-        if getattr(obj, "__module__", None) != module.__name__:
-            continue
-
-        lower_name = name.lower()
-        if "positional" in lower_name or "encoding" in lower_name:
-            continue
-
-        try:
-            sig = inspect.signature(obj)
-        except Exception:  # noqa: BLE001
-            sig = None
-
-        score = 0
-        for token in ["classifier", "transformer", "temporal", "action", "video"]:
-            if token in lower_name:
-                score += 5
-
-        if sig is not None:
-            params = set(sig.parameters.keys())
-            for token in [
-                "input_dim",
-                "d_model",
-                "num_layers",
-                "num_heads",
-                "dim_feedforward",
-                "ff_dim",
-                "num_classes",
-                "dropout",
-                "pooling",
-                "max_len",
-                "last_mean_ratio",
-            ]:
-                if token in params:
-                    score += 2
-
-        candidates.append((score, name, obj, sig))
-
-    if candidates:
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        score, name, cls, sig = candidates[0]
-        print(
-            f"[INFO] Classe modello rilevata automaticamente: "
-            f"{module_name}.{name} | score={score} | signature={sig}"
-        )
-        return cls
-
-    raise ImportError(
-        "Impossibile importare la classe del classificatore temporale.\n"
-        "Tentativi espliciti:\n" + "\n".join(errors)
-    )
-
-def get_num_classes_from_state_dict(state_dict: dict[str, torch.Tensor]) -> int | None:
-    candidates: list[tuple[str, torch.Tensor]] = []
-    for key, value in state_dict.items():
-        if not torch.is_tensor(value):
-            continue
-        if value.ndim == 2 and any(token in key.lower() for token in ["classifier", "head", "fc", "linear"]):
-            candidates.append((key, value))
-    if not candidates:
-        return None
-    # Di solito l'ultimo layer di classificazione ha shape [num_classes, hidden_dim].
-    key, value = candidates[-1]
-    return int(value.shape[0])
 
 
 def normalize_model_config(model_config: dict[str, Any], num_classes: int) -> dict[str, Any]:
     config = dict(model_config)
 
-    # I checkpoint storici possono salvare la feed-forward dimension come ff_dim,
-    # mentre TemporalTransformerActionClassifier usa dim_feedforward.
     if "dim_feedforward" not in config and "ff_dim" in config:
         config["dim_feedforward"] = config["ff_dim"]
     if "ff_dim" not in config and "dim_feedforward" in config:
         config["ff_dim"] = config["dim_feedforward"]
 
-    config.setdefault("num_classes", num_classes)
-    config.setdefault("n_classes", num_classes)
-    config.setdefault("num_labels", num_classes)
+    config["num_classes"] = int(num_classes)
+    config["n_classes"] = int(num_classes)
+    config["num_labels"] = int(num_classes)
     return config
 
 
 def instantiate_model(model_config: dict[str, Any], num_classes: int) -> nn.Module:
-    cls = import_model_class()
     config = normalize_model_config(model_config, num_classes=num_classes)
+    cls = TemporalTransformerActionClassifier
+    signature = inspect.signature(cls)
 
     alias_values: dict[str, Any] = {
         "input_dim": config.get("input_dim"),
@@ -537,90 +336,24 @@ def instantiate_model(model_config: dict[str, Any], num_classes: int) -> nn.Modu
         "nhead": config.get("num_heads"),
         "n_heads": config.get("num_heads"),
         "ff_dim": config.get("ff_dim"),
-        "dim_feedforward": config.get("ff_dim", config.get("dim_feedforward")),
+        "dim_feedforward": config.get("dim_feedforward", config.get("ff_dim")),
         "dropout": config.get("dropout"),
         "pooling": config.get("pooling"),
         "pooling_mode": config.get("pooling"),
+        "max_len": config.get("max_len"),
+        "last_mean_ratio": config.get("last_mean_ratio"),
     }
 
-    try:
-        sig = inspect.signature(cls)
-        params = sig.parameters
-        has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-        kwargs: dict[str, Any] = {}
-        for name in params:
-            if name == "self":
-                continue
-            if name in alias_values and alias_values[name] is not None:
-                kwargs[name] = alias_values[name]
-            elif name in config and config[name] is not None:
-                kwargs[name] = config[name]
-        if has_var_kwargs:
-            for key, value in alias_values.items():
-                if value is not None:
-                    kwargs.setdefault(key, value)
-        return cls(**kwargs)
-    except Exception as exc_first:  # noqa: BLE001
-        # Fallback per firme meno standard.
-        fallback_kwargs = {
-            "input_dim": config.get("input_dim"),
-            "num_classes": num_classes,
-            "d_model": config.get("d_model"),
-            "num_layers": config.get("num_layers"),
-            "num_heads": config.get("num_heads"),
-            "ff_dim": config.get("ff_dim"),
-            "dropout": config.get("dropout"),
-            "pooling": config.get("pooling"),
-        }
-        fallback_kwargs = {k: v for k, v in fallback_kwargs.items() if v is not None}
-        try:
-            return cls(**fallback_kwargs)
-        except Exception as exc_second:  # noqa: BLE001
-            raise RuntimeError(
-                f"Impossibile istanziare {cls}.\n"
-                f"Primo errore: {type(exc_first).__name__}: {exc_first}\n"
-                f"Fallback errore: {type(exc_second).__name__}: {exc_second}\n"
-                f"model_config disponibile: {model_config}"
-            ) from exc_second
+    kwargs: dict[str, Any] = {}
+    for name in signature.parameters:
+        if name == "self":
+            continue
+        if name in alias_values and alias_values[name] is not None:
+            kwargs[name] = alias_values[name]
+        elif name in config and config[name] is not None:
+            kwargs[name] = config[name]
 
-
-def extract_labels_from_checkpoint(
-    ckpt: dict[str, Any],
-    default_labels: list[str],
-    expected_num_classes: int,
-) -> list[str]:
-    candidates = [
-        ckpt.get("class_names"),
-        ckpt.get("classes"),
-        ckpt.get("labels"),
-        ckpt.get("label_names"),
-        ckpt.get("idx_to_class"),
-        ckpt.get("idx_to_label"),
-    ]
-    model_config = find_model_config(ckpt)
-    candidates.extend(
-        [
-            model_config.get("class_names"),
-            model_config.get("classes"),
-            model_config.get("labels"),
-            model_config.get("label_names"),
-            model_config.get("idx_to_class"),
-            model_config.get("idx_to_label"),
-        ]
-    )
-
-    for candidate in candidates:
-        if isinstance(candidate, dict):
-            try:
-                labels = [str(candidate[str(i)]) if str(i) in candidate else str(candidate[i]) for i in range(len(candidate))]
-                if len(labels) == expected_num_classes:
-                    return labels
-            except Exception:
-                continue
-        if isinstance(candidate, (list, tuple)) and len(candidate) == expected_num_classes:
-            return [str(v) for v in candidate]
-
-    return list(default_labels)
+    return cls(**kwargs)
 
 
 def get_tracking_normalizer(
@@ -628,7 +361,6 @@ def get_tracking_normalizer(
     tracking_config: dict[str, Any],
     num_features: int,
 ) -> tuple[bool, np.ndarray, np.ndarray]:
-    """Legge mean/std dal checkpoint per replicare la normalizzazione del training."""
     normalized = bool(tracking_config.get("normalized", False))
     mean_value = tracking_config.get("mean")
     std_value = tracking_config.get("std")
@@ -645,10 +377,8 @@ def get_tracking_normalizer(
         std = np.ones((num_features,), dtype=np.float32)
 
     if mean.ndim != 1 or std.ndim != 1:
-        raise ValueError(
-            f"{name}: mean/std tracking devono essere vettori 1D, trovati {mean.shape} e {std.shape}."
-        )
-    if mean.shape[0] != int(num_features) or std.shape[0] != int(num_features):
+        raise ValueError(f"{name}: mean/std tracking devono essere vettori 1D")
+    if mean.shape[0] != num_features or std.shape[0] != num_features:
         raise ValueError(
             f"{name}: dimensione mean/std tracking non coerente. "
             f"Feature={num_features}, mean={mean.shape[0]}, std={std.shape[0]}."
@@ -658,66 +388,37 @@ def get_tracking_normalizer(
     return normalized, mean.astype(np.float32), std.astype(np.float32)
 
 
-def apply_tracking_normalization(tracking_seq: np.ndarray, level: LevelBundle) -> np.ndarray:
-    """Applica z-score alle feature tracking [T, K] se il checkpoint lo richiede."""
-    tracking_seq = np.asarray(tracking_seq, dtype=np.float32)
-    if tracking_seq.ndim != 2:
-        raise ValueError(f"{level.name}: tracking_seq deve avere shape [T, K], trovato {tracking_seq.shape}.")
-    if tracking_seq.shape[1] != len(level.feature_names):
-        raise ValueError(
-            f"{level.name}: tracking_seq ha K={tracking_seq.shape[1]}, "
-            f"ma il checkpoint richiede K={len(level.feature_names)}."
-        )
-    if not level.tracking_normalized:
-        return tracking_seq.astype(np.float32)
-    return (
-        (tracking_seq - level.tracking_mean.reshape(1, -1))
-        / level.tracking_std.reshape(1, -1)
-    ).astype(np.float32)
-
-
 def load_level_bundle(
     name: str,
     checkpoint_path: Path,
-    default_labels: list[str],
+    labels: list[str],
     expected_tracking_features: int,
     device: torch.device,
-    strict: bool,
 ) -> LevelBundle:
     ensure_exists(checkpoint_path, f"Checkpoint {name}", must_be_file=True)
     ckpt = safe_torch_load(checkpoint_path)
+    if not isinstance(ckpt, dict):
+        raise TypeError(f"Checkpoint {name} non valido: atteso dict, ottenuto {type(ckpt)}")
 
-    # Se il checkpoint contiene direttamente il modello, lo usiamo.
-    direct_model = ckpt.get("model") if isinstance(ckpt, dict) else None
-    if isinstance(direct_model, nn.Module):
-        model = direct_model
-        model_config = find_model_config(ckpt)
-        tracking_config = find_tracking_config(ckpt)
-        state_dict = None
-        num_classes = len(default_labels)
-    else:
-        if not isinstance(ckpt, dict):
-            raise TypeError(f"Checkpoint {name} non valido: atteso dict, ottenuto {type(ckpt)}")
-        model_config = find_model_config(ckpt)
-        tracking_config = find_tracking_config(ckpt)
-        state_dict = get_state_dict_from_checkpoint(ckpt)
-        num_classes = (
-            int(model_config.get("num_classes"))
-            if model_config.get("num_classes") is not None
-            else get_num_classes_from_state_dict(state_dict) or len(default_labels)
-        )
-        model = instantiate_model(model_config=model_config, num_classes=num_classes)
+    model_config = find_model_config(ckpt)
+    tracking_config = find_tracking_config(ckpt)
+    state_dict = strip_state_dict_prefixes(get_state_dict_from_checkpoint(ckpt))
 
-    feature_names = tracking_config.get("feature_names")
-    if not isinstance(feature_names, (list, tuple)):
+    feature_names_raw = tracking_config.get("feature_names")
+    if not isinstance(feature_names_raw, (list, tuple)):
         raise TypeError(f"{name}: tracking_config.feature_names assente o non lista")
-    feature_names = [str(v) for v in feature_names]
+    feature_names = [str(v) for v in feature_names_raw]
 
-    if len(feature_names) != int(expected_tracking_features):
+    if len(feature_names) != expected_tracking_features:
         raise ValueError(
             f"{name}: numero feature tracking inatteso. "
             f"Trovate {len(feature_names)}, attese {expected_tracking_features}."
         )
+
+    model = instantiate_model(model_config=model_config, num_classes=len(labels))
+    model.load_state_dict(state_dict, strict=False)
+    model = model.to(device)
+    model.eval()
 
     tracking_normalized, tracking_mean, tracking_std = get_tracking_normalizer(
         name=name,
@@ -725,32 +426,13 @@ def load_level_bundle(
         num_features=len(feature_names),
     )
 
-    if state_dict is not None:
-        cleaned = strip_state_dict_prefixes(state_dict)
-        try:
-            model.load_state_dict(cleaned, strict=strict)
-        except RuntimeError as exc:
-            if strict:
-                raise
-            print(f"[WARN] {name}: load_state_dict strict=False dopo errore: {exc}")
-            model.load_state_dict(cleaned, strict=False)
-
-    labels = extract_labels_from_checkpoint(
-        ckpt if isinstance(ckpt, dict) else {},
-        default_labels=default_labels,
-        expected_num_classes=len(default_labels),
-    )
-
-    model = model.to(device)
-    model.eval()
-
     input_dim = model_config.get("input_dim")
     if input_dim is not None:
         expected_input_dim = int(defaults.DINOV3_FEATURE_DIM + len(feature_names))
         if int(input_dim) != expected_input_dim:
             print(
                 f"[WARN] {name}: model_config.input_dim={input_dim}, "
-                f"mentre DINO {defaults.DINOV3_FEATURE_DIM} + tracking {len(feature_names)} = {expected_input_dim}."
+                f"atteso {expected_input_dim}."
             )
 
     print(f"[OK] {name}: {checkpoint_path}")
@@ -761,11 +443,10 @@ def load_level_bundle(
     return LevelBundle(
         name=name,
         checkpoint_path=checkpoint_path,
-        checkpoint=ckpt if isinstance(ckpt, dict) else {},
         model_config=model_config,
         tracking_config=tracking_config,
         feature_names=feature_names,
-        labels=labels,
+        labels=list(labels),
         model=model,
         tracking_normalized=tracking_normalized,
         tracking_mean=tracking_mean,
@@ -773,12 +454,29 @@ def load_level_bundle(
     )
 
 
-def model_forward_logits(
-    model: nn.Module,
-    x: torch.Tensor,
-    lengths: torch.Tensor,
-) -> torch.Tensor:
-    # Replica il training: batch paddato a Tmax, lengths contiene la lunghezza reale.
+def output_to_logits(output: Any) -> torch.Tensor:
+    if isinstance(output, dict):
+        for key in ["logits", "out", "output", "pred", "prediction"]:
+            value = output.get(key)
+            if torch.is_tensor(value):
+                return value
+        tensors = [v for v in output.values() if torch.is_tensor(v)]
+        if tensors:
+            return tensors[0]
+        raise TypeError("Output dict senza tensori utilizzabili")
+
+    if isinstance(output, (list, tuple)):
+        if not output:
+            raise TypeError("Output tuple/list vuoto")
+        return output_to_logits(output[0])
+
+    if torch.is_tensor(output):
+        return output
+
+    raise TypeError(f"Output modello non supportato: {type(output)}")
+
+
+def model_forward_logits(model: nn.Module, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     if lengths.ndim != 1 or lengths.shape[0] != x.shape[0]:
         raise ValueError(
             f"lengths deve avere shape [B], trovato {tuple(lengths.shape)} per x={tuple(x.shape)}"
@@ -799,44 +497,19 @@ def model_forward_logits(
     errors: list[str] = []
     for attempt in attempts:
         try:
-            out = attempt()
-            return output_to_logits(out)
+            return output_to_logits(attempt())
         except TypeError as exc:
             errors.append(str(exc))
-            continue
-    raise RuntimeError("Forward del modello fallito. Errori TypeError:\n" + "\n".join(errors[-3:]))
 
-def output_to_logits(output: Any) -> torch.Tensor:
-    if isinstance(output, dict):
-        for key in ["logits", "out", "output", "pred", "prediction"]:
-            value = output.get(key)
-            if torch.is_tensor(value):
-                return value
-        tensors = [v for v in output.values() if torch.is_tensor(v)]
-        if tensors:
-            return tensors[0]
-        raise TypeError("Output dict senza tensori utilizzabili")
-    if isinstance(output, (list, tuple)):
-        if len(output) == 0:
-            raise TypeError("Output tuple/list vuoto")
-        return output_to_logits(output[0])
-    if torch.is_tensor(output):
-        return output
-    raise TypeError(f"Output modello non supportato: {type(output)}")
+    raise RuntimeError("Forward del modello fallito. Errori TypeError:\n" + "\n".join(errors[-3:]))
 
 
 # =============================================================================
 # Costruzione feature tracking train-like
 # =============================================================================
 
-# Nota: le vecchie funzioni di interpolazione diretta delle primitive sono state
-# rimosse. La pipeline exp_46 usa solo la strada train-like: ricostruzione dei
-# frame_rows e chiamata a compute_temporal_sequence_features, cioè la stessa
-# logica usata per le clip.
-
 
 def select_uniform_local_indices(num_items: int, max_items: int) -> np.ndarray:
-    """Stessa logica delle clip: usa tutti i frame se <= max_items, altrimenti max_items uniformi."""
     if num_items <= 0:
         return np.empty((0,), dtype=np.int64)
     if max_items <= 0 or num_items <= max_items:
@@ -849,7 +522,6 @@ def select_uniform_local_indices(num_items: int, max_items: int) -> np.ndarray:
 
 
 def interpolate_sequence_array(sequence: np.ndarray, target_len: int) -> np.ndarray:
-    """Ridimensiona una sequenza [S, K] a [target_len, K] con interpolazione lineare."""
     target_len = int(target_len)
     sequence = np.asarray(sequence, dtype=np.float32)
 
@@ -888,6 +560,7 @@ def primitive_detection(primitives: dict[str, np.ndarray], prefix: str, idx: int
     yc = primitive_value(primitives, f"{prefix}_yc", idx, 0.0) if detected else 0.0
     w = primitive_value(primitives, f"{prefix}_w", idx, 0.0) if detected else 0.0
     h = primitive_value(primitives, f"{prefix}_h", idx, 0.0) if detected else 0.0
+
     return {
         "detected": detected,
         "conf": float(conf),
@@ -905,7 +578,6 @@ def build_frame_rows_trainlike(
     primitives: dict[str, np.ndarray],
     selected_local_indices: np.ndarray,
 ) -> list[dict[str, Any]]:
-    """Ricostruisce frame_rows compatibili con extract_ball_rim_tracking_features.py."""
     dino_len = int(row.store_end_index - row.store_start_index)
     fps = float(feature_store.feature_fps or 29.97002997002997)
     frame_rows: list[dict[str, Any]] = []
@@ -916,7 +588,6 @@ def build_frame_rows_trainlike(
 
         ball = primitive_detection(primitives, "ball", global_idx)
         rim = primitive_detection(primitives, "rim", global_idx)
-
         pair = compute_pair_features(
             ball=ball,
             rim=rim,
@@ -934,8 +605,6 @@ def build_frame_rows_trainlike(
                 "label": "unknown",
                 "path": row.window_id,
                 "frame_order": int(frame_order),
-                # Importante: frame_idx è locale alla finestra ma conserva gli spazi tra frame
-                # campionati, come nelle clip usate in training.
                 "frame_idx": int(local_idx),
                 "time_sec": float(time_sec),
                 "t_rel": float(t_rel),
@@ -979,7 +648,6 @@ def build_tracking_sequence_trainlike(
     primitives: dict[str, np.ndarray],
     selected_local_indices: np.ndarray,
 ) -> np.ndarray:
-    """Costruisce il tracking usando la stessa funzione usata nel training clip-level."""
     frame_rows = build_frame_rows_trainlike(
         feature_store=feature_store,
         row=row,
@@ -1000,18 +668,29 @@ def build_tracking_sequence_trainlike(
     return sequence.astype(np.float32)
 
 
+def apply_tracking_normalization(tracking_seq: np.ndarray, level: LevelBundle) -> np.ndarray:
+    tracking_seq = np.asarray(tracking_seq, dtype=np.float32)
+    if tracking_seq.ndim != 2:
+        raise ValueError(f"{level.name}: tracking_seq deve avere shape [T, K], trovato {tracking_seq.shape}.")
+    if tracking_seq.shape[1] != len(level.feature_names):
+        raise ValueError(
+            f"{level.name}: tracking_seq ha K={tracking_seq.shape[1]}, "
+            f"ma il checkpoint richiede K={len(level.feature_names)}."
+        )
+    if not level.tracking_normalized:
+        return tracking_seq.astype(np.float32)
+    return (
+        (tracking_seq - level.tracking_mean.reshape(1, -1))
+        / level.tracking_std.reshape(1, -1)
+    ).astype(np.float32)
+
+
 def build_input_for_window(
     feature_store: FeatureStore,
     row: WindowRow,
     level: LevelBundle,
     primitives: dict[str, np.ndarray],
 ) -> np.ndarray:
-    # Train-like:
-    # - DINO usa tutti i sample/frame reali della finestra;
-    # - tracking viene calcolato con compute_temporal_sequence_features su max 48 frame uniformi;
-    # - tracking viene interpolato alla lunghezza DINO;
-    # - tracking viene normalizzato con mean/std del checkpoint;
-    # - DINO e tracking vengono concatenati per timestep.
     start_idx = int(row.store_start_index)
     end_idx = int(row.store_end_index)
 
@@ -1030,9 +709,6 @@ def build_input_for_window(
         num_items=dino_len,
         max_items=TRACKING_MAX_FRAMES_PER_WINDOW,
     )
-    if tracking_local_indices.size == 0:
-        raise ValueError(f"Finestra senza frame tracking: {row.window_id}")
-
     tracking_raw_seq = build_tracking_sequence_trainlike(
         feature_store=feature_store,
         row=row,
@@ -1043,11 +719,6 @@ def build_input_for_window(
     tracking_seq = interpolate_sequence_array(tracking_raw_seq, target_len=dino_len)
     tracking_seq = apply_tracking_normalization(tracking_seq, level=level)
 
-    if dino_seq.shape[0] != tracking_seq.shape[0]:
-        raise RuntimeError(
-            f"T diverso tra DINO e tracking: {dino_seq.shape} vs {tracking_seq.shape}"
-        )
-
     return np.concatenate([dino_seq, tracking_seq], axis=1).astype(np.float32)
 
 
@@ -1057,8 +728,7 @@ def pad_sequences(sequences: list[np.ndarray], expected_dim: int) -> tuple[np.nd
 
     lengths = np.asarray([seq.shape[0] for seq in sequences], dtype=np.int64)
     max_len = int(lengths.max())
-    batch_size = len(sequences)
-    padded = np.zeros((batch_size, max_len, expected_dim), dtype=np.float32)
+    padded = np.zeros((len(sequences), max_len, expected_dim), dtype=np.float32)
 
     for i, seq in enumerate(sequences):
         if seq.ndim != 2 or seq.shape[1] != expected_dim:
@@ -1081,35 +751,18 @@ def build_batch_inputs(
     l2_dim = feature_store.dino_dim + len(l2.feature_names)
     l3_dim = feature_store.dino_dim + len(l3.feature_names)
 
-    seqs_l1: list[np.ndarray] = []
-    seqs_l2: list[np.ndarray] = []
-    seqs_l3: list[np.ndarray] = []
-
-    for row in rows:
-        seqs_l1.append(
-            build_input_for_window(
-                feature_store=feature_store,
-                row=row,
-                level=l1,
-                primitives=feature_store.yolo_v2_primitives,
-            )
-        )
-        seqs_l2.append(
-            build_input_for_window(
-                feature_store=feature_store,
-                row=row,
-                level=l2,
-                primitives=feature_store.yolo_v2_primitives,
-            )
-        )
-        seqs_l3.append(
-            build_input_for_window(
-                feature_store=feature_store,
-                row=row,
-                level=l3,
-                primitives=feature_store.yolo_v1_primitives,
-            )
-        )
+    seqs_l1 = [
+        build_input_for_window(feature_store, row, l1, feature_store.yolo_v2_primitives)
+        for row in rows
+    ]
+    seqs_l2 = [
+        build_input_for_window(feature_store, row, l2, feature_store.yolo_v2_primitives)
+        for row in rows
+    ]
+    seqs_l3 = [
+        build_input_for_window(feature_store, row, l3, feature_store.yolo_v1_primitives)
+        for row in rows
+    ]
 
     x_l1, lengths = pad_sequences(seqs_l1, expected_dim=l1_dim)
     x_l2, lengths_l2 = pad_sequences(seqs_l2, expected_dim=l2_dim)
@@ -1122,49 +775,21 @@ def build_batch_inputs(
 
 
 # =============================================================================
-# Probabilità e gerarchia
+# Probabilità e output CSV
 # =============================================================================
 
 
-def probs_by_label(probs: np.ndarray, labels: list[str]) -> dict[str, np.ndarray]:
-    return {label: probs[:, i] for i, label in enumerate(labels)}
+def compute_final_scores(p_l1: np.ndarray, p_l2: np.ndarray, p_l3: np.ndarray) -> dict[str, np.ndarray]:
+    p_passaggio = p_l1[:, 0]
+    p_tiro = p_l1[:, 1]
+    p_noaction = p_l1[:, 2]
 
+    p_due = p_l2[:, 0]
+    p_tre = p_l2[:, 1]
+    p_libero = p_l2[:, 2]
 
-def get_prob(label_probs: dict[str, np.ndarray], names: list[str], default: float = 0.0) -> np.ndarray:
-    for name in names:
-        if name in label_probs:
-            return label_probs[name]
-    # fallback case-insensitive
-    lower = {k.lower(): v for k, v in label_probs.items()}
-    for name in names:
-        if name.lower() in lower:
-            return lower[name.lower()]
-    n = next(iter(label_probs.values())).shape[0]
-    return np.full((n,), float(default), dtype=np.float32)
-
-
-def compute_final_scores(
-    p_l1: np.ndarray,
-    p_l2: np.ndarray,
-    p_l3: np.ndarray,
-    l1_labels: list[str],
-    l2_labels: list[str],
-    l3_labels: list[str],
-) -> dict[str, np.ndarray]:
-    l1 = probs_by_label(p_l1, l1_labels)
-    l2 = probs_by_label(p_l2, l2_labels)
-    l3 = probs_by_label(p_l3, l3_labels)
-
-    p_passaggio = get_prob(l1, ["passaggio"])
-    p_tiro = get_prob(l1, ["tiro", "shot"])
-    p_noaction = get_prob(l1, ["no-action", "noaction", "idle", "non-gioco"])
-
-    p_due = get_prob(l2, ["tiroDaDue", "due", "2", "two", "tiro_da_due"])
-    p_tre = get_prob(l2, ["tiroDaTre", "tre", "3", "three", "tiro_da_tre"])
-    p_libero = get_prob(l2, ["tiroLibero", "libero", "free", "tiro_libero"])
-
-    p_0 = get_prob(l3, ["0", "tiro0", "miss", "missed", "sbagliato", "fallito"])
-    p_1 = get_prob(l3, ["1", "tiro1", "make", "made", "segnato", "successo"])
+    p_0 = p_l3[:, 0]
+    p_1 = p_l3[:, 1]
 
     return {
         "passaggio": p_passaggio,
@@ -1178,28 +803,16 @@ def compute_final_scores(
     }
 
 
-def argmax_labels(score_dict: dict[str, np.ndarray]) -> tuple[list[str], np.ndarray]:
-    matrix = np.stack([score_dict[label] for label in FINAL_LABELS], axis=1)
+def argmax_final_labels(scores: dict[str, np.ndarray]) -> tuple[list[str], np.ndarray]:
+    matrix = np.stack([scores[label] for label in FINAL_LABELS], axis=1)
     indices = matrix.argmax(axis=1)
     confidences = matrix[np.arange(matrix.shape[0]), indices]
     labels = [FINAL_LABELS[int(i)] for i in indices]
     return labels, confidences.astype(np.float32)
 
 
-def argmax_stage_labels(probs: np.ndarray, labels: list[str]) -> tuple[list[str], np.ndarray]:
-    indices = probs.argmax(axis=1)
-    conf = probs[np.arange(probs.shape[0]), indices]
-    pred = [labels[int(i)] for i in indices]
-    return pred, conf.astype(np.float32)
-
-
-# =============================================================================
-# CSV output
-# =============================================================================
-
-
 def output_fieldnames() -> list[str]:
-    base = [
+    return [
         "window_id",
         "scale_index",
         "scale_sec",
@@ -1208,108 +821,53 @@ def output_fieldnames() -> list[str]:
         "center_time",
         "start_rel_sec",
         "end_rel_sec",
-        "store_start_index",
-        "store_end_index",
-        "num_store_samples",
-        "dino_num_frames",
-        "tracking_raw_num_frames",
-        "model_input_length",
-        "p_l1_passaggio",
-        "p_l1_tiro",
-        "p_l1_noaction",
-        "p_l2_tiroDaDue",
-        "p_l2_tiroDaTre",
-        "p_l2_tiroLibero",
-        "p_l3_0",
-        "p_l3_1",
-    ]
-    score_fields = [f"score_{label.replace('-', '')}" for label in FINAL_LABELS]
-    tail = [
-        "l1_pred",
-        "l1_confidence",
-        "l2_pred",
-        "l2_confidence",
-        "l3_pred",
-        "l3_confidence",
         "pred_label",
         "confidence",
+        "score_passaggio",
+        "score_tiroDaDue0",
+        "score_tiroDaDue1",
+        "score_tiroDaTre0",
+        "score_tiroDaTre1",
+        "score_tiroLibero0",
+        "score_tiroLibero1",
+        "score_noaction",
     ]
-    return base + score_fields + tail
 
 
 def write_prediction_rows(
     writer: csv.DictWriter,
     rows: list[WindowRow],
-    p_l1: np.ndarray,
-    p_l2: np.ndarray,
-    p_l3: np.ndarray,
-    l1: LevelBundle,
-    l2: LevelBundle,
-    l3: LevelBundle,
+    scores: dict[str, np.ndarray],
+    pred_labels: list[str],
+    confidences: np.ndarray,
 ) -> None:
-    scores = compute_final_scores(p_l1, p_l2, p_l3, l1.labels, l2.labels, l3.labels)
-    pred_labels, confidences = argmax_labels(scores)
-    l1_pred, l1_conf = argmax_stage_labels(p_l1, l1.labels)
-    l2_pred, l2_conf = argmax_stage_labels(p_l2, l2.labels)
-    l3_pred, l3_conf = argmax_stage_labels(p_l3, l3.labels)
-
-    l1_probs = probs_by_label(p_l1, l1.labels)
-    l2_probs = probs_by_label(p_l2, l2.labels)
-    l3_probs = probs_by_label(p_l3, l3.labels)
-
-    p_l1_passaggio = get_prob(l1_probs, ["passaggio"])
-    p_l1_tiro = get_prob(l1_probs, ["tiro", "shot"])
-    p_l1_noaction = get_prob(l1_probs, ["no-action", "noaction", "idle", "non-gioco"])
-    p_l2_due = get_prob(l2_probs, ["tiroDaDue", "due", "2", "two", "tiro_da_due"])
-    p_l2_tre = get_prob(l2_probs, ["tiroDaTre", "tre", "3", "three", "tiro_da_tre"])
-    p_l2_libero = get_prob(l2_probs, ["tiroLibero", "libero", "free", "tiro_libero"])
-    p_l3_0 = get_prob(l3_probs, ["0", "tiro0", "miss", "missed", "sbagliato", "fallito"])
-    p_l3_1 = get_prob(l3_probs, ["1", "tiro1", "make", "made", "segnato", "successo"])
-
     for i, row in enumerate(rows):
-        out: dict[str, Any] = {
-            "window_id": row.window_id,
-            "scale_index": row.scale_index,
-            "scale_sec": f"{row.scale_sec:.6f}",
-            "start_time": f"{row.start_time:.6f}",
-            "end_time": f"{row.end_time:.6f}",
-            "center_time": f"{row.center_time:.6f}",
-            "start_rel_sec": f"{row.start_rel_sec:.6f}",
-            "end_rel_sec": f"{row.end_rel_sec:.6f}",
-            "store_start_index": row.store_start_index,
-            "store_end_index": row.store_end_index,
-            "num_store_samples": row.num_store_samples,
-            "dino_num_frames": row.dino_num_frames if row.dino_num_frames is not None else row.num_store_samples,
-            "tracking_raw_num_frames": (
-                row.tracking_raw_num_frames
-                if row.tracking_raw_num_frames is not None
-                else min(row.num_store_samples, TRACKING_MAX_FRAMES_PER_WINDOW)
-            ),
-            "model_input_length": row.num_store_samples,
-            "p_l1_passaggio": f"{float(p_l1_passaggio[i]):.8f}",
-            "p_l1_tiro": f"{float(p_l1_tiro[i]):.8f}",
-            "p_l1_noaction": f"{float(p_l1_noaction[i]):.8f}",
-            "p_l2_tiroDaDue": f"{float(p_l2_due[i]):.8f}",
-            "p_l2_tiroDaTre": f"{float(p_l2_tre[i]):.8f}",
-            "p_l2_tiroLibero": f"{float(p_l2_libero[i]):.8f}",
-            "p_l3_0": f"{float(p_l3_0[i]):.8f}",
-            "p_l3_1": f"{float(p_l3_1[i]):.8f}",
-            "l1_pred": l1_pred[i],
-            "l1_confidence": f"{float(l1_conf[i]):.8f}",
-            "l2_pred": l2_pred[i],
-            "l2_confidence": f"{float(l2_conf[i]):.8f}",
-            "l3_pred": l3_pred[i],
-            "l3_confidence": f"{float(l3_conf[i]):.8f}",
-            "pred_label": pred_labels[i],
-            "confidence": f"{float(confidences[i]):.8f}",
-        }
-        for label in FINAL_LABELS:
-            out[f"score_{label.replace('-', '')}"] = f"{float(scores[label][i]):.8f}"
-        writer.writerow(out)
+        writer.writerow(
+            {
+                "window_id": row.window_id,
+                "scale_index": row.scale_index,
+                "scale_sec": f"{row.scale_sec:.6f}",
+                "start_time": f"{row.start_time:.6f}",
+                "end_time": f"{row.end_time:.6f}",
+                "center_time": f"{row.center_time:.6f}",
+                "start_rel_sec": f"{row.start_rel_sec:.6f}",
+                "end_rel_sec": f"{row.end_rel_sec:.6f}",
+                "pred_label": pred_labels[i],
+                "confidence": f"{float(confidences[i]):.8f}",
+                "score_passaggio": f"{float(scores['passaggio'][i]):.8f}",
+                "score_tiroDaDue0": f"{float(scores['tiroDaDue0'][i]):.8f}",
+                "score_tiroDaDue1": f"{float(scores['tiroDaDue1'][i]):.8f}",
+                "score_tiroDaTre0": f"{float(scores['tiroDaTre0'][i]):.8f}",
+                "score_tiroDaTre1": f"{float(scores['tiroDaTre1'][i]):.8f}",
+                "score_tiroLibero0": f"{float(scores['tiroLibero0'][i]):.8f}",
+                "score_tiroLibero1": f"{float(scores['tiroLibero1'][i]):.8f}",
+                "score_noaction": f"{float(scores['no-action'][i]):.8f}",
+            }
+        )
 
 
 # =============================================================================
-# Main inferenza
+# Inferenza
 # =============================================================================
 
 
@@ -1323,12 +881,14 @@ def predict_batch(
     x = torch.from_numpy(x_np).to(device, non_blocking=True)
     lengths = torch.from_numpy(lengths_np.astype(np.int64)).to(device, non_blocking=True)
     amp_enabled = bool(use_amp and device.type == "cuda")
+
     with torch.inference_mode():
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             logits = model_forward_logits(model, x, lengths=lengths)
         if logits.ndim != 2:
             raise RuntimeError(f"Logits attesi [B, C], trovati {tuple(logits.shape)}")
         probs = torch.softmax(logits.float(), dim=1)
+
     return probs.detach().cpu().numpy().astype(np.float32)
 
 
@@ -1341,88 +901,63 @@ def infer_all_windows(
     output_csv: Path,
     batch_size: int,
     device: torch.device,
-    use_amp: bool,
 ) -> dict[str, Any]:
     if batch_size <= 0:
         raise ValueError(f"batch_size deve essere > 0, trovato {batch_size}")
 
-    n = len(windows)
-    num_batches = math.ceil(n / batch_size)
     label_counts: dict[str, int] = {label: 0 for label in FINAL_LABELS}
     input_lengths: list[int] = []
-    tracking_raw_lengths: list[int] = []
+    num_batches = math.ceil(len(windows) / batch_size)
 
     with output_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=output_fieldnames())
         writer.writeheader()
 
-        progress = tqdm(range(0, n, batch_size), total=num_batches, desc="Inferenza exp_46")
+        progress = tqdm(range(0, len(windows), batch_size), total=num_batches, desc="Inferenza exp_long_13")
         for start in progress:
             batch_rows = windows[start : start + batch_size]
-            x_l1, x_l2, x_l3, lengths = build_batch_inputs(
-                feature_store=feature_store,
-                rows=batch_rows,
-                l1=l1,
-                l2=l2,
-                l3=l3,
-            )
+            x_l1, x_l2, x_l3, lengths = build_batch_inputs(feature_store, batch_rows, l1, l2, l3)
 
-            p_l1 = predict_batch(x_l1, lengths, l1.model, device=device, use_amp=use_amp)
-            p_l2 = predict_batch(x_l2, lengths, l2.model, device=device, use_amp=use_amp)
-            p_l3 = predict_batch(x_l3, lengths, l3.model, device=device, use_amp=use_amp)
+            p_l1 = predict_batch(x_l1, lengths, l1.model, device=device, use_amp=True)
+            p_l2 = predict_batch(x_l2, lengths, l2.model, device=device, use_amp=True)
+            p_l3 = predict_batch(x_l3, lengths, l3.model, device=device, use_amp=True)
 
-            scores = compute_final_scores(p_l1, p_l2, p_l3, l1.labels, l2.labels, l3.labels)
-            pred_labels, _ = argmax_labels(scores)
+            scores = compute_final_scores(p_l1, p_l2, p_l3)
+            pred_labels, confidences = argmax_final_labels(scores)
+
             for label in pred_labels:
                 label_counts[label] = label_counts.get(label, 0) + 1
-
             input_lengths.extend(int(v) for v in lengths.tolist())
-            tracking_raw_lengths.extend(
-                int(min(int(v), TRACKING_MAX_FRAMES_PER_WINDOW)) for v in lengths.tolist()
-            )
 
-            write_prediction_rows(writer, batch_rows, p_l1, p_l2, p_l3, l1, l2, l3)
+            write_prediction_rows(writer, batch_rows, scores, pred_labels, confidences)
 
     input_lengths_arr = np.asarray(input_lengths, dtype=np.int64)
-    tracking_lengths_arr = np.asarray(tracking_raw_lengths, dtype=np.int64)
-
     return {
-        "num_windows": int(n),
+        "num_windows": int(len(windows)),
         "label_counts": label_counts,
         "temporal_policy": TEMPORAL_POLICY,
-        "tracking_max_frames_per_window": TRACKING_MAX_FRAMES_PER_WINDOW,
-        "tracking_normalized": {
-            "L1": bool(l1.tracking_normalized),
-            "L2": bool(l2.tracking_normalized),
-            "L3": bool(l3.tracking_normalized),
-        },
         "input_lengths": {
             "min": int(input_lengths_arr.min()) if input_lengths_arr.size else 0,
             "max": int(input_lengths_arr.max()) if input_lengths_arr.size else 0,
             "mean": float(input_lengths_arr.mean()) if input_lengths_arr.size else 0.0,
         },
-        "tracking_raw_lengths": {
-            "min": int(tracking_lengths_arr.min()) if tracking_lengths_arr.size else 0,
-            "max": int(tracking_lengths_arr.max()) if tracking_lengths_arr.size else 0,
-            "mean": float(tracking_lengths_arr.mean()) if tracking_lengths_arr.size else 0.0,
-        },
     }
+
 
 def write_inference_metadata(
     path: Path,
-    args: argparse.Namespace,
     feature_store: FeatureStore,
     windows_csv: Path,
     windows: list[WindowRow],
-    l1: LevelBundle,
-    l2: LevelBundle,
-    l3: LevelBundle,
+    batch_size: int,
+    device: torch.device,
     started_at: float,
     summary: dict[str, Any],
 ) -> None:
     metadata = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "elapsed_sec": round(time.time() - started_at, 3),
+        "experiment": "exp_long_13",
         "feature_store": {
             "dir": str(feature_store.root),
             "num_samples": int(feature_store.timestamps.shape[0]),
@@ -1438,52 +973,36 @@ def write_inference_metadata(
             "last_end_time": float(windows[-1].end_time),
         },
         "runtime": {
-            "device": str(args.device),
-            "batch_size": int(args.batch_size),
-            "amp": not args.no_amp,
-            "max_windows": args.max_windows,
+            "device": str(device),
+            "batch_size": int(batch_size),
+            "amp": True,
             "temporal_policy": TEMPORAL_POLICY,
             "dino_policy": "all_store_samples_in_window",
             "tracking_policy": "compute_temporal_sequence_features_max48_then_interpolate_then_checkpoint_zscore",
-            "tracking_max_frames_per_window": TRACKING_MAX_FRAMES_PER_WINDOW,
-            "tracking_near_threshold": TRACKING_NEAR_THRESHOLD,
-            "tracking_rim_inside_margin": TRACKING_RIM_INSIDE_MARGIN,
         },
         "levels": {
             "L1": {
-                "checkpoint": str(l1.checkpoint_path),
+                "checkpoint": str(defaults.EXP46_L1_CHECKPOINT),
                 "tracking_source": "yolo_v2",
-                "num_tracking_features": len(l1.feature_names),
-                "tracking_normalized": bool(l1.tracking_normalized),
-                "tracking_mean_len": int(l1.tracking_mean.shape[0]),
-                "tracking_std_len": int(l1.tracking_std.shape[0]),
-                "labels": l1.labels,
-                "feature_names": l1.feature_names,
+                "labels": L1_LABELS,
+                "num_tracking_features": L1_EXPECTED_TRACKING_FEATURES,
             },
             "L2": {
-                "checkpoint": str(l2.checkpoint_path),
+                "checkpoint": str(defaults.EXP46_L2_CHECKPOINT),
                 "tracking_source": "yolo_v2",
-                "num_tracking_features": len(l2.feature_names),
-                "tracking_normalized": bool(l2.tracking_normalized),
-                "tracking_mean_len": int(l2.tracking_mean.shape[0]),
-                "tracking_std_len": int(l2.tracking_std.shape[0]),
-                "labels": l2.labels,
-                "feature_names": l2.feature_names,
+                "labels": L2_LABELS,
+                "num_tracking_features": L2_EXPECTED_TRACKING_FEATURES,
             },
             "L3": {
-                "checkpoint": str(l3.checkpoint_path),
+                "checkpoint": str(defaults.EXP46_L3_CHECKPOINT),
                 "tracking_source": "yolo_v1",
-                "num_tracking_features": len(l3.feature_names),
-                "tracking_normalized": bool(l3.tracking_normalized),
-                "tracking_mean_len": int(l3.tracking_mean.shape[0]),
-                "tracking_std_len": int(l3.tracking_std.shape[0]),
-                "labels": l3.labels,
-                "feature_names": l3.feature_names,
+                "labels": L3_LABELS,
+                "num_tracking_features": L3_EXPECTED_TRACKING_FEATURES,
             },
         },
         "outputs": {
-            "window_predictions_raw": "window_predictions_raw.csv",
-            "metadata": "inference_metadata.json",
+            "window_predictions_raw": defaults.WINDOW_PREDICTIONS_FILENAME,
+            "metadata": defaults.INFERENCE_METADATA_FILENAME,
         },
         "summary": summary,
     }
@@ -1498,40 +1017,16 @@ def write_inference_metadata(
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Inferenza exp_46 dalle feature store long-video. "
-            "Costruisce finestre virtuali da DINOv3 + tracking YOLO v1/v2 e salva "
-            "le predizioni raw per il post-processing temporale."
+            "Inferenza raw per exp_long_13 da feature store long-video. "
+            "Usa i checkpoint exp_46 definiti in defaults.py e produce window_predictions_raw.csv."
         )
     )
-
     parser.add_argument("--feature-store-dir", type=Path, default=defaults.VAL_FEATURE_STORE_DIR)
-    parser.add_argument(
-        "--windows-csv",
-        type=Path,
-        default=defaults.VAL_OUTPUT_DIR / "windows_manifest.csv",
-    )
+    parser.add_argument("--windows-csv", type=Path, default=defaults.VAL_OUTPUT_DIR / defaults.WINDOWS_MANIFEST_FILENAME)
     parser.add_argument("--output-dir", type=Path, default=defaults.VAL_OUTPUT_DIR)
-
-    parser.add_argument("--l1-checkpoint", type=Path, default=defaults.EXP46_L1_CHECKPOINT)
-    parser.add_argument("--l2-checkpoint", type=Path, default=defaults.EXP46_L2_CHECKPOINT)
-    parser.add_argument("--l3-checkpoint", type=Path, default=defaults.EXP46_L3_CHECKPOINT)
-
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--device", type=str, default="0")
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--no-amp", action="store_true")
-    parser.add_argument(
-        "--strict-load",
-        action="store_true",
-        help="Usa strict=True nel load_state_dict. Default: strict=False per robustezza.",
-    )
-    parser.add_argument(
-        "--max-windows",
-        type=int,
-        default=None,
-        help="Limita il numero di finestre per debug rapido.",
-    )
-
     return parser
 
 
@@ -1542,29 +1037,21 @@ def main() -> None:
     args.feature_store_dir = as_path(args.feature_store_dir)
     args.windows_csv = as_path(args.windows_csv)
     args.output_dir = as_path(args.output_dir)
-    args.l1_checkpoint = as_path(args.l1_checkpoint)
-    args.l2_checkpoint = as_path(args.l2_checkpoint)
-    args.l3_checkpoint = as_path(args.l3_checkpoint)
-
     assert args.feature_store_dir is not None
     assert args.windows_csv is not None
     assert args.output_dir is not None
-    assert args.l1_checkpoint is not None
-    assert args.l2_checkpoint is not None
-    assert args.l3_checkpoint is not None
 
     if args.batch_size <= 0:
         raise ValueError("--batch-size deve essere > 0")
-    if args.max_windows is not None and args.max_windows <= 0:
-        raise ValueError("--max-windows deve essere > 0 se specificato")
 
     check_output_files(
         args.output_dir,
-        output_files=["window_predictions_raw.csv", "inference_metadata.json"],
-        overwrite=args.overwrite,
+        output_files=[defaults.WINDOW_PREDICTIONS_FILENAME, defaults.INFERENCE_METADATA_FILENAME],
+        overwrite=bool(args.overwrite),
+        remove_existing=True,
     )
 
-    device = parse_device(args.device)
+    device = parse_device_for_torch(args.device)
 
     print("=== Caricamento feature store ===")
     feature_store = load_feature_store(args.feature_store_dir)
@@ -1574,60 +1061,41 @@ def main() -> None:
     print(f"segmento store:     {feature_store.store_start_sec:.3f}s -> {feature_store.store_end_sec:.3f}s")
 
     print("\n=== Caricamento finestre ===")
-    windows = read_windows_csv(args.windows_csv, max_windows=args.max_windows)
+    windows = read_windows_csv(args.windows_csv)
     print(f"windows_csv:        {args.windows_csv}")
     print(f"num_windows:        {len(windows)}")
     print(f"prima finestra:     {windows[0].start_time:.3f}s -> {windows[0].end_time:.3f}s")
     print(f"ultima finestra:    {windows[-1].start_time:.3f}s -> {windows[-1].end_time:.3f}s")
 
-    print("\n=== Caricamento modelli exp_46 ===")
+    print("\n=== Caricamento modelli exp_46 per exp_long_13 ===")
     l1 = load_level_bundle(
         name="L1",
-        checkpoint_path=args.l1_checkpoint,
-        default_labels=DEFAULT_L1_LABELS,
-        expected_tracking_features=43,
+        checkpoint_path=defaults.EXP46_L1_CHECKPOINT,
+        labels=L1_LABELS,
+        expected_tracking_features=L1_EXPECTED_TRACKING_FEATURES,
         device=device,
-        strict=args.strict_load,
     )
     l2 = load_level_bundle(
         name="L2",
-        checkpoint_path=args.l2_checkpoint,
-        default_labels=DEFAULT_L2_LABELS,
-        expected_tracking_features=29,
+        checkpoint_path=defaults.EXP46_L2_CHECKPOINT,
+        labels=L2_LABELS,
+        expected_tracking_features=L2_EXPECTED_TRACKING_FEATURES,
         device=device,
-        strict=args.strict_load,
     )
     l3 = load_level_bundle(
         name="L3",
-        checkpoint_path=args.l3_checkpoint,
-        default_labels=DEFAULT_L3_LABELS,
-        expected_tracking_features=43,
+        checkpoint_path=defaults.EXP46_L3_CHECKPOINT,
+        labels=L3_LABELS,
+        expected_tracking_features=L3_EXPECTED_TRACKING_FEATURES,
         device=device,
-        strict=args.strict_load,
     )
 
-    expected_dims = {
-        "L1": feature_store.dino_dim + len(l1.feature_names),
-        "L2": feature_store.dino_dim + len(l2.feature_names),
-        "L3": feature_store.dino_dim + len(l3.feature_names),
-    }
-    print("\nInput dimension attese:")
-    print(f"L1: {feature_store.dino_dim} + {len(l1.feature_names)} = {expected_dims['L1']}")
-    print(f"L2: {feature_store.dino_dim} + {len(l2.feature_names)} = {expected_dims['L2']}")
-    print(f"L3: {feature_store.dino_dim} + {len(l3.feature_names)} = {expected_dims['L3']}")
-
-    output_csv = args.output_dir / "window_predictions_raw.csv"
+    output_csv = args.output_dir / defaults.WINDOW_PREDICTIONS_FILENAME
     print("\n=== Inferenza raw finestre ===")
     print(f"output_csv:         {output_csv}")
     print(f"device:             {device}")
     print(f"batch_size:         {args.batch_size}")
     print(f"temporal_policy:    {TEMPORAL_POLICY}")
-    print("DINO policy:        tutti i sample/frame della finestra")
-    print(f"tracking policy:    compute_temporal_sequence_features su max {TRACKING_MAX_FRAMES_PER_WINDOW} frame, poi interpolazione a T DINO")
-    print("tracking normalized:")
-    print(f"  L1: {l1.tracking_normalized}")
-    print(f"  L2: {l2.tracking_normalized}")
-    print(f"  L3: {l3.tracking_normalized}")
 
     summary = infer_all_windows(
         feature_store=feature_store,
@@ -1638,19 +1106,16 @@ def main() -> None:
         output_csv=output_csv,
         batch_size=int(args.batch_size),
         device=device,
-        use_amp=not args.no_amp,
     )
 
-    metadata_path = args.output_dir / "inference_metadata.json"
+    metadata_path = args.output_dir / defaults.INFERENCE_METADATA_FILENAME
     write_inference_metadata(
         path=metadata_path,
-        args=args,
         feature_store=feature_store,
         windows_csv=args.windows_csv,
         windows=windows,
-        l1=l1,
-        l2=l2,
-        l3=l3,
+        batch_size=int(args.batch_size),
+        device=device,
         started_at=started_at,
         summary=summary,
     )

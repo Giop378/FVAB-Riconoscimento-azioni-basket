@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import math
 from collections import defaultdict
 from dataclasses import dataclass
@@ -13,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from src.long_video import defaults
+from src.long_video.utils import as_path, check_output_files, ensure_exists, read_json, write_json
 
 
 # =============================================================================
@@ -25,53 +25,6 @@ from src.long_video import defaults
 # massimo 48 frame, come nello script clip-level extract_ball_rim_tracking_features.py.
 TRACKING_MAX_FRAMES_PER_WINDOW = 48
 DEFAULT_WINDOW_SIZES_SEC = [0.5, 0.75, 1.0, 1.5, 2.0]
-
-
-# =============================================================================
-# Utility
-# =============================================================================
-
-
-def as_path(value: str | Path | None) -> Path | None:
-    if value is None:
-        return None
-    if isinstance(value, Path):
-        return value
-    return Path(value)
-
-
-def ensure_exists(path: Path, name: str, must_be_file: bool | None = None) -> None:
-    if not path.exists():
-        raise FileNotFoundError(f"{name} non trovato: {path}")
-    if must_be_file is True and not path.is_file():
-        raise FileNotFoundError(f"{name} dovrebbe essere un file: {path}")
-    if must_be_file is False and not path.is_dir():
-        raise NotADirectoryError(f"{name} dovrebbe essere una cartella: {path}")
-
-
-def read_json(path: Path) -> dict[str, Any]:
-    ensure_exists(path, "JSON metadata", must_be_file=True)
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict):
-        raise TypeError(f"Il file JSON non contiene un oggetto: {path}")
-    return data
-
-
-def write_json(path: Path, data: dict[str, Any]) -> None:
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def check_output_files(output_dir: Path, output_files: list[str], overwrite: bool) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    existing = [output_dir / name for name in output_files if (output_dir / name).exists()]
-    if existing and not overwrite:
-        existing_str = "\n".join(f"- {p}" for p in existing)
-        raise FileExistsError(
-            "Alcuni file di output esistono già:\n"
-            f"{existing_str}\n"
-            "Usa --overwrite per sostituirli."
-        )
 
 
 # =============================================================================
