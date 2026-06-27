@@ -1,3 +1,14 @@
+"""
+Modello Transformer temporale per classificazione di clip video.
+
+Il modello riceve sequenze di feature frame-level già estratte, ad esempio
+DINOv3 o DINOv3 concatenato con feature di tracking palla/canestro, e produce
+una predizione di classe per l'intera clip.
+
+È usato sia durante il training dei singoli livelli gerarchici sia durante
+la valutazione end-to-end dell'esperimento finale.
+"""
+
 import math
 
 import torch
@@ -202,10 +213,13 @@ class TemporalTransformerActionClassifier(nn.Module):
 
         return torch.stack(pooled_outputs, dim=0)
 
-    def forward(self, features, lengths, return_attention: bool = False):
+    def forward(self, features, lengths):
         """
         features: [B, Tmax, input_dim]
         lengths: [B]
+
+        Restituisce:
+            logits: [B, num_classes]
         """
         device = features.device
         batch_size, max_len, _ = features.shape
@@ -264,10 +278,4 @@ class TemporalTransformerActionClassifier(nn.Module):
             raise ValueError(f"Pooling non supportato: {self.pooling}")
 
         logits = self.classifier(final_representation)
-
-        # Per ora non restituiamo le attention map interne.
-        # nn.TransformerEncoder non le espone direttamente.
-        if return_attention:
-            return logits, None
-
         return logits

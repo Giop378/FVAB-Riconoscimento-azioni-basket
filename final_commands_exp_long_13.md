@@ -42,7 +42,7 @@ Test video_id: psa_converted
 ```powershell
 $VAL_VIDEO = "data/datasets/dataset_basket_v1/videos/PrimaParte.mp4"
 $VAL_FEATURE_DIR = "data/features_long/primaparte_0215_1215_exp46"
-$VAL_OUTPUT_DIR = "outputs/long_video/primaparte_0215_1215_exp_long_13"
+$VAL_OUTPUT_DIR = "outputs/long_video/exp_long_13"
 $VAL_START = 135
 $VAL_END = 735
 $VAL_VIDEO_ID_MANIFEST = "prima_parte"
@@ -79,7 +79,7 @@ python -m src.long_video.extract_feature_store `
   --overwrite
 ```
 
-Versione esplicita, se vuoi indicare manualmente DINOv3 e parametri YOLO:
+Versione esplicita, con indicazioni manuali di DINOv3 e parametri YOLO:
 
 ```powershell
 python -m src.long_video.extract_feature_store `
@@ -187,7 +187,7 @@ python -m src.long_video.evaluate_events_from_manifest `
   --video-id $VAL_VIDEO_ID_MANIFEST `
   --start-sec $VAL_START `
   --end-sec $VAL_END `
-  --output-dir "$VAL_OUTPUT_DIR/eval_events" `
+  --output-dir "$VAL_OUTPUT_DIR/eval_iou020" `
   --iou-threshold 0.20 `
   --overwrite
 ```
@@ -252,12 +252,13 @@ python -m src.long_video.export_compact_event_report `
 ```powershell
 $TEST_VIDEO = "data/datasets/dataset_basket_v1/videos/PSA_converted.mp4"
 $TEST_FEATURE_DIR = "data/features_long/psa_converted_0010_1010_exp46"
-$TEST_OUTPUT_DIR = "outputs/long_video/psa_converted_0010_1010_exp_long_13"
+$TEST_OUTPUT_DIR = "outputs/long_video/test_exp_long_13"
 $TEST_START = 10
 $TEST_END = 610
 $TEST_VIDEO_ID_MANIFEST = "psa_converted"
 $MANIFEST = "data/datasets/dataset_basket_v1/manifest.csv"
 ```
+
 
 ---
 
@@ -357,7 +358,7 @@ python -m src.long_video.evaluate_events_from_manifest `
   --video-id $TEST_VIDEO_ID_MANIFEST `
   --start-sec $TEST_START `
   --end-sec $TEST_END `
-  --output-dir "$TEST_OUTPUT_DIR/eval_events" `
+  --output-dir "$TEST_OUTPUT_DIR/eval_iou020" `
   --iou-threshold 0.20 `
   --overwrite
 ```

@@ -36,14 +36,18 @@ ACTION_LABELS = [
 SHOT_LABELS = [label for label in ACTION_LABELS if label != "passaggio"]
 ALL_LABELS = ACTION_LABELS + ["no-action"]
 
-# exp_long_13: base exp_long_04 + filtro action/no-action con margine 20.0.
-MIN_CONF_PASSAGGIO = 0.65
+# exp_long_13 storico: base exp_long_04 + filtro action/no-action con margine 20.0.
+# I parametri sono fissati nel codice per mantenere riproducibile la configurazione
+# effettivamente usata negli esperimenti long-video.
+MIN_CONF_PASSAGGIO = 0.75
 MIN_CONF_TIRO = 0.40
-MIN_EVENT_DURATION_SEC = 0.25
+MIN_EVENT_DURATION_SEC = 0.70
 MERGE_GAP_SEC = 0.20
 MAX_WINDOW_SEC_PASSAGGIO = 2.00
-MAX_DURATION_PASSAGGIO = 2.00
-MAX_DURATION_TIRO = 2.00
+MIN_WINDOW_SEC_TIRO = 1.00
+MAX_WINDOW_SEC_TIRO = 3.00
+MAX_DURATION_PASSAGGIO = 1.50
+MAX_DURATION_TIRO = 3.00
 NOACTION_MARGIN = 20.0
 
 OUTPUT_COLUMNS = [
@@ -151,6 +155,8 @@ def build_candidate_windows(predictions: pd.DataFrame) -> list[dict[str, Any]]:
 
         scale_sec = safe_float(row["scale_sec"])
         if label == "passaggio" and scale_sec > MAX_WINDOW_SEC_PASSAGGIO:
+            continue
+        if label in SHOT_LABELS and not (MIN_WINDOW_SEC_TIRO <= scale_sec <= MAX_WINDOW_SEC_TIRO):
             continue
 
         score = safe_float(row["action_score"])
@@ -472,6 +478,8 @@ def main() -> None:
     print(f"merge_gap_sec:          {MERGE_GAP_SEC:.3f}")
     print(f"min_event_duration:     {MIN_EVENT_DURATION_SEC:.3f}")
     print(f"max_window_passaggio:   {MAX_WINDOW_SEC_PASSAGGIO:.3f}")
+    print(f"min_window_tiro:        {MIN_WINDOW_SEC_TIRO:.3f}")
+    print(f"max_window_tiro:        {MAX_WINDOW_SEC_TIRO:.3f}")
     print(f"max_duration_passaggio: {MAX_DURATION_PASSAGGIO:.3f}")
     print(f"max_duration_tiro:      {MAX_DURATION_TIRO:.3f}")
     print("confidence_mode:        max")

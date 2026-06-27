@@ -1,3 +1,14 @@
+"""
+Script di estrazione delle feature DINOv3 dalle clip del dataset.
+
+Legge il manifest.csv, apre ogni clip video, estrae una sequenza di feature
+frame-level con DINOv3 e salva un file .pt per ogni clip. Le feature salvate
+vengono poi caricate da FeatureDataset durante training, validazione e test.
+
+Questa versione non applica augmentation: ogni clip del manifest genera una sola
+sequenza di feature, mantenendo la pipeline più semplice e riproducibile.
+"""
+
 from pathlib import Path
 import argparse
 
@@ -29,20 +40,8 @@ LABELS = [
 LABEL_TO_IDX = {label: idx for idx, label in enumerate(LABELS)}
 
 
-# Applichiamo augmentation solo alle classi di tiro e solo nello split train.
-# Le classi passaggio, idle e non-gioco restano non augmentate perché già numerose.
-AUGMENT_LABELS = {
-    "tiroDaDue0",
-    "tiroDaDue1",
-    "tiroDaTre0",
-    "tiroDaTre1",
-    "tiroLibero0",
-    "tiroLibero1",
-}
-
-
 def parse_device(device_arg: str) -> torch.device:
-    """Accetta cpu, cuda, cuda:N oppure N."""
+    """Converte l'argomento CLI del device in torch.device."""
     device_arg = str(device_arg)
     if device_arg.lower() == "cpu":
         return torch.device("cpu")
@@ -141,18 +140,6 @@ def parse_args():
         action="store_true",
         help="Se attivo, sovrascrive feature già esistenti.",
     )
-    parser.add_argument(
-        "--augment-train-shots",
-        action="store_true",
-        help="Se attivo, applica augmentation leggera solo alle classi di tiro nello split train.",
-    )
-    parser.add_argument(
-        "--augmentations",
-        nargs="+",
-        default=["hflip", "color"],
-        choices=["hflip", "color", "hflip_color"],
-        help="Lista di augmentation da applicare alle clip di tiro nel train.",
-    )
 
     return parser.parse_args()
 
@@ -179,12 +166,8 @@ def main():
     print(f"Repo/dir DINOv3: {args.repo_or_dir}")
     print(f"Source: {args.source}")
     print(f"Weights: {args.weights}")
-    print(f"Output token DINO: x_norm_clstoken")
-    print(f"Resize policy: stretch 336x336, no center crop")
-    print(f"Augment train shots: {args.augment_train_shots}")
-    if args.augment_train_shots:
-        print(f"Augmentations: {args.augmentations}")
-        print(f"Classi augmentate: {sorted(AUGMENT_LABELS)}")
+    print("Output token DINO: x_norm_clstoken")
+    print(f"Resize policy: stretch {args.image_size}x{args.image_size}, no center crop")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest = pd.read_csv(manifest_path)
@@ -213,75 +196,54 @@ def main():
             raise ValueError(f"Label non riconosciuta: {label}")
 
         video_path = dataset_root / rel_path
+        out_path = output_dir / split / label / f"{clip_id}.pt"
 
-        variants = ["orig"]
-        if args.augment_train_shots and split == "train" and label in AUGMENT_LABELS:
-            variants.extend(args.augmentations)
-
-        if not args.overwrite:
-            existing_variants = 0
-            for augmentation in variants:
-                out_clip_id = clip_id if augmentation == "orig" else f"{clip_id}_{augmentation}"
-                out_path = output_dir / split / label / f"{out_clip_id}.pt"
-                if out_path.exists():
-                    existing_variants += 1
-
-            if existing_variants == len(variants):
-                num_skipped += len(variants)
-                continue
+        if out_path.exists() and not args.overwrite:
+            num_skipped += 1
+            continue
 
         try:
             frames = read_video_frames(video_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            for augmentation in variants:
-                out_clip_id = clip_id if augmentation == "orig" else f"{clip_id}_{augmentation}"
-                out_path = output_dir / split / label / f"{out_clip_id}.pt"
-                out_path.parent.mkdir(parents=True, exist_ok=True)
+            features = extract_clip_features(
+                frames=frames,
+                model=model,
+                transform=transform,
+                device=device,
+                chunk_size=args.chunk_size,
+            )
 
-                if out_path.exists() and not args.overwrite:
-                    num_skipped += 1
-                    continue
-
-                features = extract_clip_features(
-                    frames=frames,
-                    model=model,
-                    transform=transform,
-                    device=device,
-                    chunk_size=args.chunk_size,
-                    augmentation=augmentation,
+            if features.ndim != 2:
+                raise ValueError(f"Feature con shape non valida: {features.shape}")
+            if features.shape[1] != feature_dim:
+                raise ValueError(
+                    f"Feature dim inattesa per {args.model_name}: "
+                    f"ottenuto {features.shape[1]}, atteso {feature_dim}"
                 )
 
-                if features.ndim != 2:
-                    raise ValueError(f"Feature con shape non valida: {features.shape}")
-                if features.shape[1] != feature_dim:
-                    raise ValueError(
-                        f"Feature dim inattesa per {args.model_name}: "
-                        f"ottenuto {features.shape[1]}, atteso {feature_dim}"
-                    )
+            torch.save(
+                {
+                    "features": features,
+                    "label": LABEL_TO_IDX[label],
+                    "label_name": label,
+                    "clip_id": clip_id,
+                    "source_clip_id": clip_id,
+                    "path": str(rel_path),
+                    "split": split,
+                    "model_name": args.model_name,
+                    "weights": str(args.weights),
+                    "feature_dim": feature_dim,
+                    "image_size": args.image_size,
+                    "resize_mode": "stretch",
+                    "center_crop": False,
+                    "normalization": "imagenet",
+                    "output_token": "x_norm_clstoken",
+                },
+                out_path,
+            )
 
-                torch.save(
-                    {
-                        "features": features,
-                        "label": LABEL_TO_IDX[label],
-                        "label_name": label,
-                        "clip_id": out_clip_id,
-                        "source_clip_id": clip_id,
-                        "path": str(rel_path),
-                        "split": split,
-                        "model_name": args.model_name,
-                        "weights": str(args.weights),
-                        "feature_dim": feature_dim,
-                        "image_size": args.image_size,
-                        "resize_mode": "stretch",
-                        "center_crop": False,
-                        "normalization": "imagenet",
-                        "output_token": "x_norm_clstoken",
-                        "augmentation": augmentation,
-                    },
-                    out_path,
-                )
-
-                num_ok += 1
+            num_ok += 1
 
         except Exception as exc:  # noqa: BLE001
             num_errors += 1

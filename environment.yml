@@ -36,9 +36,13 @@ dependencies:
       - torchmetrics
       - timm
 
-      # Model utilities
+      # DINOv3 / model utilities
       - huggingface-hub
       - safetensors
+      - termcolor
+
+      # YOLO ball/rim detector
+      - ultralytics
 
       # CLI utilities
       - rich

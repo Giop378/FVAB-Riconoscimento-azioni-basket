@@ -1,23 +1,38 @@
+"""
+Training dei classificatori temporali per la gerarchia finale di BasketAR.
+
+Lo script addestra un Transformer temporale sulle feature DINOv3 già estratte
+per le clip. Supporta solo i tre livelli usati nella configurazione finale:
+
+- L1: action_noaction    -> passaggio / tiro / no-action
+- L2: shot_type_only     -> tiroDaDue / tiroDaTre / tiroLibero
+- L3: shot_outcome_only  -> tiro0 / tiro1
+
+Per exp_46 usa feature tracking temporali palla/canestro salvate in formato
+NPZ + JSON e le concatena frame-per-frame alle feature DINOv3.
+"""
+
 from pathlib import Path
 import argparse
 import random
-import sys
 import shlex
+import sys
 import traceback
-import csv
-import json
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
-from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 
-from src.data.feature_dataset import FeatureDataset, collate_features, IDX_TO_LABEL, LABEL_TO_IDX
+from src.data.feature_dataset import FeatureDataset, collate_features, IDX_TO_LABEL
 from src.models.temporal_transformer_classifier import TemporalTransformerActionClassifier
+from src.features.tracking_sequence_store import TrackingSequenceFeatureStore
 
 
 class Tee:
+    """Duplica stdout/stderr sia su terminale sia su file di log."""
+
     def __init__(self, *streams):
         self.streams = streams
 
@@ -36,53 +51,31 @@ def get_reconstructed_command() -> str:
     return " ".join(shlex.quote(str(part)) for part in parts)
 
 
-def set_seed(seed: int):
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
-
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
-def seed_worker(worker_id):
+def seed_worker(worker_id: int) -> None:
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
 
-def get_original_idx_to_label():
-    """
-    Restituisce il mapping originale idx -> label in forma di dict.
-    IDX_TO_LABEL nel progetto è già usato come mapping indicizzabile.
-    """
+def get_original_idx_to_label() -> dict[int, str]:
     return {idx: IDX_TO_LABEL[idx] for idx in range(len(IDX_TO_LABEL))}
 
 
 def build_label_mapping(label_mode: str):
     """
-    Costruisce:
-    - label_mapping: label originale -> label usata dal modello
-    - idx_to_label: indice di output del modello -> label usata dal modello
-
-    Modalità previste:
-    - original: 9 classi originali.
-    - action_noaction: passaggio / tiro / no-action.
-    - shot_type: passaggio / tipo tiro / idle / non-gioco.
-    - shot_outcome: passaggio / esito tiro / idle / non-gioco.
-    - action_group: passaggio / tiro / idle / non-gioco.
-    - shot_type_only: solo clip di tiro, classificate per tipo.
-    - shot_outcome_only: solo clip di tiro, classificate per esito.
+    Costruisce il mapping tra label originali e label usate da uno specifico
+    livello della gerarchia finale.
     """
-    original_idx_to_label = get_original_idx_to_label()
-
-    if label_mode == "original":
-        idx_to_label = original_idx_to_label
-        label_mapping = {label: label for label in original_idx_to_label.values()}
-
-    elif label_mode == "action_noaction":
+    if label_mode == "action_noaction":
         idx_to_label = {
             0: "passaggio",
             1: "tiro",
@@ -98,66 +91,6 @@ def build_label_mapping(label_mode: str):
             "tiroLibero1": "tiro",
             "idle": "no-action",
             "non-gioco": "no-action",
-        }
-
-    elif label_mode == "shot_type":
-        idx_to_label = {
-            0: "passaggio",
-            1: "tiroDaDue",
-            2: "tiroDaTre",
-            3: "tiroLibero",
-            4: "idle",
-            5: "non-gioco",
-        }
-        label_mapping = {
-            "passaggio": "passaggio",
-            "tiroDaDue0": "tiroDaDue",
-            "tiroDaDue1": "tiroDaDue",
-            "tiroDaTre0": "tiroDaTre",
-            "tiroDaTre1": "tiroDaTre",
-            "tiroLibero0": "tiroLibero",
-            "tiroLibero1": "tiroLibero",
-            "idle": "idle",
-            "non-gioco": "non-gioco",
-        }
-
-    elif label_mode == "shot_outcome":
-        idx_to_label = {
-            0: "passaggio",
-            1: "tiro0",
-            2: "tiro1",
-            3: "idle",
-            4: "non-gioco",
-        }
-        label_mapping = {
-            "passaggio": "passaggio",
-            "tiroDaDue0": "tiro0",
-            "tiroDaTre0": "tiro0",
-            "tiroLibero0": "tiro0",
-            "tiroDaDue1": "tiro1",
-            "tiroDaTre1": "tiro1",
-            "tiroLibero1": "tiro1",
-            "idle": "idle",
-            "non-gioco": "non-gioco",
-        }
-
-    elif label_mode == "action_group":
-        idx_to_label = {
-            0: "passaggio",
-            1: "tiro",
-            2: "idle",
-            3: "non-gioco",
-        }
-        label_mapping = {
-            "passaggio": "passaggio",
-            "tiroDaDue0": "tiro",
-            "tiroDaDue1": "tiro",
-            "tiroDaTre0": "tiro",
-            "tiroDaTre1": "tiro",
-            "tiroLibero0": "tiro",
-            "tiroLibero1": "tiro",
-            "idle": "idle",
-            "non-gioco": "non-gioco",
         }
 
     elif label_mode == "shot_type_only":
@@ -190,12 +123,15 @@ def build_label_mapping(label_mode: str):
         }
 
     else:
-        raise ValueError(f"Label mode non supportata: {label_mode}")
+        raise ValueError(
+            f"Label mode non supportata: {label_mode}. "
+            "Sono ammessi solo: action_noaction, shot_type_only, shot_outcome_only."
+        )
 
     return label_mapping, idx_to_label
 
 
-def get_label_to_idx(idx_to_label):
+def get_label_to_idx(idx_to_label: dict[int, str]) -> dict[str, int]:
     return {label: idx for idx, label in idx_to_label.items()}
 
 
@@ -205,10 +141,11 @@ def normalize_sample_label(label_value) -> int:
     return int(label_value)
 
 
-def infer_original_label_from_item(item):
+def infer_original_label_from_item(item) -> str:
     """
-    Cerca di ricavare la label originale senza caricare il tensore delle feature.
-    Nel FeatureDataset corrente gli item sono path e la label è il nome della cartella padre.
+    Ricava la label originale senza caricare il tensore delle feature.
+    Nel FeatureDataset corrente gli item sono path e la label coincide con
+    il nome della cartella padre.
     """
     original_idx_to_label = get_original_idx_to_label()
 
@@ -227,21 +164,14 @@ def infer_original_label_from_item(item):
 
 class LabelMappedDataset(Dataset):
     """
-    Wrapper per FeatureDataset che permette di:
-    - rimappare le label originali in label aggregate;
-    - filtrare alcune classi quando serve addestrare un sotto-modello.
-
-    Esempio:
-    - shot_type_only tiene solo le clip di tiro e le rimappa in:
-      tiroDaDue / tiroDaTre / tiroLibero.
-    - shot_outcome_only tiene solo le clip di tiro e le rimappa in:
-      tiro0 / tiro1.
+    Wrapper di FeatureDataset che rimappa le label originali nel label space
+    del livello gerarchico scelto. Per L2 e L3 filtra automaticamente le clip
+    non di tiro.
     """
 
     def __init__(self, base_dataset: Dataset, label_mode: str):
         self.base_dataset = base_dataset
         self.label_mode = label_mode
-
         self.label_mapping, self.idx_to_label = build_label_mapping(label_mode)
         self.label_to_idx = get_label_to_idx(self.idx_to_label)
         self.original_idx_to_label = get_original_idx_to_label()
@@ -270,7 +200,7 @@ class LabelMappedDataset(Dataset):
                 "Controlla mapping, nomi delle cartelle e split del dataset."
             )
 
-    def _try_add_item(self, idx: int, original_label: str):
+    def _try_add_item(self, idx: int, original_label: str) -> None:
         if original_label not in self.label_mapping:
             return
 
@@ -284,77 +214,25 @@ class LabelMappedDataset(Dataset):
     def __len__(self):
         return len(self.indices)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         base_idx = self.indices[idx]
-        sample = self.base_dataset[base_idx]
-
-        # Copia il dizionario per evitare modifiche indesiderate al sample originale.
-        sample = dict(sample)
-
-        mapped_label = self.mapped_labels[idx]
-
-        # collate_features si aspetta che item["label"] sia un Tensor,
-        # perché poi fa torch.stack([item["label"] for item in batch]).
-        sample["label"] = torch.tensor(mapped_label, dtype=torch.long)
-
+        sample = dict(self.base_dataset[base_idx])
+        sample["label"] = torch.tensor(self.mapped_labels[idx], dtype=torch.long)
         return sample
 
 
-
-TRACKING_METADATA_COLUMNS = {
-    "clip_id",
-    "split",
-    "label",
-    "path",
-    "video_frames",
-    "fps",
-    "sampled_frames",
-    "video_width",
-    "video_height",
-}
-
-
-def normalize_clip_key(path_value) -> str:
-    """
-    Normalizza il path di una clip/feature in una chiave confrontabile.
-
-    Esempi convertiti nella stessa forma:
-    - train/tiroDaDue0/clip_000001.mp4 -> train/tiroDaDue0/clip_000001
-    - data/features/.../train/tiroDaDue0/clip_000001.pt -> train/tiroDaDue0/clip_000001
-    """
-    path_str = str(path_value).replace("\\", "/")
-    parts = [p for p in Path(path_str).parts if p not in {"", "."}]
-
-    split_idx = None
-    for idx, part in enumerate(parts):
-        if part in {"train", "val", "test"}:
-            split_idx = idx
-            break
-
-    if split_idx is not None:
-        parts = parts[split_idx:]
-
-    normalized = Path(*parts).with_suffix("").as_posix()
-    return normalized
-
-
 def get_base_item_path_from_label_dataset(label_dataset, idx: int) -> str:
-    """
-    Recupera il path originale associato a un elemento di LabelMappedDataset.
-    Serve per associare ogni feature video alla riga corrispondente del CSV tracking.
-    """
+    """Recupera il path originale associato a un elemento di LabelMappedDataset."""
     if hasattr(label_dataset, "indices") and hasattr(label_dataset, "base_dataset"):
         base_idx = label_dataset.indices[idx]
         base_dataset = label_dataset.base_dataset
 
         if hasattr(base_dataset, "items"):
             item = base_dataset.items[base_idx]
-
             if isinstance(item, dict):
                 if "path" in item:
                     return str(item["path"])
                 return str(item)
-
             return str(item)
 
     if hasattr(label_dataset, "base_dataset") and hasattr(label_dataset.base_dataset, "items"):
@@ -366,382 +244,18 @@ def get_base_item_path_from_label_dataset(label_dataset, idx: int) -> str:
     return ""
 
 
-class TrackingFeatureStore:
-    def __init__(self, csv_path: str, feature_names=None):
-        self.csv_path = Path(csv_path)
-
-        if not self.csv_path.exists():
-            raise FileNotFoundError(f"CSV feature tracking non trovato: {self.csv_path}")
-
-        self.rows_by_key = {}
-        self.feature_names = feature_names
-        self.mean = None
-        self.std = None
-        self.normalized = False
-
-        self._load()
-
-    def _load(self):
-        with open(self.csv_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-
-            if reader.fieldnames is None:
-                raise ValueError(f"CSV tracking vuoto o non valido: {self.csv_path}")
-
-            if "path" not in reader.fieldnames:
-                raise ValueError(
-                    f"Il CSV tracking deve contenere la colonna 'path'. "
-                    f"Colonne presenti: {reader.fieldnames}"
-                )
-
-            if self.feature_names is None:
-                self.feature_names = [
-                    col for col in reader.fieldnames
-                    if col not in TRACKING_METADATA_COLUMNS
-                ]
-
-            if not self.feature_names:
-                raise ValueError("Nessuna feature tracking trovata nel CSV.")
-
-            for row in reader:
-                key = normalize_clip_key(row["path"])
-
-                try:
-                    vector = np.array(
-                        [float(row[name]) for name in self.feature_names],
-                        dtype=np.float32,
-                    )
-                except KeyError as exc:
-                    raise KeyError(
-                        f"Feature mancante nel CSV tracking: {exc}. "
-                        f"Feature attese: {self.feature_names}"
-                    ) from exc
-                except ValueError as exc:
-                    raise ValueError(
-                        f"Valore non numerico nel CSV tracking per path={row.get('path')}."
-                    ) from exc
-
-                self.rows_by_key[key] = vector
-
-        self.mean = np.zeros(self.num_features, dtype=np.float32)
-        self.std = np.ones(self.num_features, dtype=np.float32)
-
-    @property
-    def num_features(self) -> int:
-        return len(self.feature_names)
-
-    def has(self, path_value) -> bool:
-        return normalize_clip_key(path_value) in self.rows_by_key
-
-    def get_raw(self, path_value, missing_policy="zeros"):
-        key = normalize_clip_key(path_value)
-
-        if key in self.rows_by_key:
-            return self.rows_by_key[key].copy()
-
-        if missing_policy == "zeros":
-            return np.zeros(self.num_features, dtype=np.float32)
-
-        raise KeyError(
-            f"Feature tracking non trovate per path='{path_value}' "
-            f"con chiave normalizzata='{key}'."
-        )
-
-    def get(self, path_value, missing_policy="zeros"):
-        vector = self.get_raw(path_value, missing_policy=missing_policy)
-        if self.normalized:
-            vector = (vector - self.mean) / self.std
-        return vector.astype(np.float32)
-
-    def fit_normalizer_from_label_dataset(self, label_dataset):
-        vectors = []
-        missing = 0
-
-        for idx in range(len(label_dataset)):
-            path = get_base_item_path_from_label_dataset(label_dataset, idx)
-            if self.has(path):
-                vectors.append(self.get_raw(path, missing_policy="error"))
-            else:
-                missing += 1
-
-        if not vectors:
-            raise RuntimeError(
-                "Impossibile normalizzare le feature tracking: "
-                "nessun campione del training set ha feature tracking associate."
-            )
-
-        matrix = np.stack(vectors, axis=0).astype(np.float32)
-        self.mean = matrix.mean(axis=0).astype(np.float32)
-        self.std = matrix.std(axis=0).astype(np.float32)
-        self.std = np.where(self.std < 1e-6, 1.0, self.std).astype(np.float32)
-        self.normalized = True
-
-        print("\n# Normalizzazione feature tracking")
-        print(f"Campioni usati per stimare mean/std: {len(vectors)}")
-        print(f"Campioni train senza feature tracking: {missing}")
-
-    def get_config(self):
-        return {
-            "enabled": True,
-            "type": "aggregate",
-            "csv_path": str(self.csv_path),
-            "num_features": self.num_features,
-            "feature_names": list(self.feature_names),
-            "normalized": bool(self.normalized),
-            "mean": self.mean.tolist() if self.mean is not None else None,
-            "std": self.std.tolist() if self.std is not None else None,
-        }
-
-
-def interpolate_sequence_array(sequence: np.ndarray, target_len: int) -> np.ndarray:
+class TemporalTrackingAugmentedDataset(Dataset):
     """
-    Ridimensiona una sequenza [S, K] a [target_len, K] con interpolazione lineare.
-    Serve per allineare le feature tracking temporali alla lunghezza delle feature DINOv3.
-    """
-    target_len = int(target_len)
-
-    if target_len <= 0:
-        return np.zeros((0, sequence.shape[1] if sequence.ndim == 2 else 0), dtype=np.float32)
-
-    sequence = np.asarray(sequence, dtype=np.float32)
-
-    if sequence.ndim != 2:
-        raise ValueError(f"La sequenza tracking deve avere forma [S, K], ricevuta {sequence.shape}.")
-
-    source_len, num_features = sequence.shape
-
-    if source_len == 0:
-        return np.zeros((target_len, num_features), dtype=np.float32)
-
-    if source_len == target_len:
-        return sequence.astype(np.float32)
-
-    if source_len == 1:
-        return np.repeat(sequence, repeats=target_len, axis=0).astype(np.float32)
-
-    source_x = np.linspace(0.0, 1.0, source_len, dtype=np.float32)
-    target_x = np.linspace(0.0, 1.0, target_len, dtype=np.float32)
-
-    resized = np.empty((target_len, num_features), dtype=np.float32)
-    for feature_idx in range(num_features):
-        resized[:, feature_idx] = np.interp(target_x, source_x, sequence[:, feature_idx])
-
-    return resized.astype(np.float32)
-
-
-class TrackingSequenceFeatureStore:
-    """
-    Carica sequenze temporali di tracking palla/canestro salvate in un file NPZ.
-
-    Ogni clip è associata a una matrice [S, K], dove S è il numero di frame
-    campionati dal detector e K il numero di feature per frame. In training la
-    sequenza viene interpolata alla lunghezza reale della sequenza DINOv3 [T, D].
+    Concatena a ogni timestep DINOv3 la sequenza tracking palla/canestro
+    interpolata alla stessa lunghezza temporale.
     """
 
     def __init__(
         self,
-        npz_path: str,
-        index_path: str = None,
-        feature_names=None,
-        mean=None,
-        std=None,
-        normalized=False,
+        label_dataset: Dataset,
+        tracking_store: TrackingSequenceFeatureStore,
+        missing_policy: str = "zeros",
     ):
-        self.npz_path = Path(npz_path)
-        if not self.npz_path.exists():
-            raise FileNotFoundError(f"File NPZ tracking temporale non trovato: {self.npz_path}")
-
-        if index_path is None:
-            index_path = self.npz_path.with_name("tracking_sequence_index.json")
-
-        self.index_path = Path(index_path)
-        if not self.index_path.exists():
-            raise FileNotFoundError(
-                f"Indice tracking temporale non trovato: {self.index_path}. "
-                "Passa --tracking-sequence-index oppure genera l'indice con lo script di estrazione."
-            )
-
-        with open(self.index_path, "r", encoding="utf-8") as f:
-            index_data = json.load(f)
-
-        self.feature_names = feature_names or index_data.get("feature_names")
-        if not self.feature_names:
-            raise ValueError("Nomi feature tracking temporali non presenti nell'indice.")
-
-        self.rows_by_key = {}
-        sequences = index_data.get("sequences", {})
-        for key, value in sequences.items():
-            if isinstance(value, dict):
-                self.rows_by_key[key] = value.get("array_key")
-            else:
-                self.rows_by_key[key] = str(value)
-
-        if not self.rows_by_key:
-            raise ValueError(f"Nessuna sequenza tracking indicizzata in {self.index_path}.")
-
-        self.data = np.load(self.npz_path)
-        self.normalized = bool(normalized)
-        self.mean = None if mean is None else np.array(mean, dtype=np.float32)
-        self.std = None if std is None else np.array(std, dtype=np.float32)
-
-        if self.mean is None:
-            self.mean = np.zeros(self.num_features, dtype=np.float32)
-        if self.std is None:
-            self.std = np.ones(self.num_features, dtype=np.float32)
-
-        self.std = np.where(self.std < 1e-6, 1.0, self.std).astype(np.float32)
-
-    @property
-    def num_features(self) -> int:
-        return len(self.feature_names)
-
-    def has(self, path_value) -> bool:
-        return normalize_clip_key(path_value) in self.rows_by_key
-
-    def get_raw(self, path_value, target_len=None, missing_policy="zeros"):
-        key = normalize_clip_key(path_value)
-
-        if key in self.rows_by_key:
-            array_key = self.rows_by_key[key]
-            if array_key not in self.data:
-                raise KeyError(
-                    f"Array '{array_key}' non trovato in {self.npz_path} "
-                    f"per path='{path_value}'."
-                )
-            sequence = np.asarray(self.data[array_key], dtype=np.float32)
-        elif missing_policy == "zeros":
-            length = int(target_len) if target_len is not None else 1
-            sequence = np.zeros((max(1, length), self.num_features), dtype=np.float32)
-        else:
-            raise KeyError(
-                f"Sequenza tracking non trovata per path='{path_value}' "
-                f"con chiave normalizzata='{key}'."
-            )
-
-        if target_len is not None:
-            sequence = interpolate_sequence_array(sequence, int(target_len))
-
-        return sequence.astype(np.float32)
-
-    def get(self, path_value, target_len=None, missing_policy="zeros"):
-        sequence = self.get_raw(path_value, target_len=target_len, missing_policy=missing_policy)
-        if self.normalized:
-            sequence = (sequence - self.mean.reshape(1, -1)) / self.std.reshape(1, -1)
-        return sequence.astype(np.float32)
-
-    def fit_normalizer_from_label_dataset(self, label_dataset):
-        sequences = []
-        missing = 0
-
-        for idx in range(len(label_dataset)):
-            path = get_base_item_path_from_label_dataset(label_dataset, idx)
-            if self.has(path):
-                sequences.append(self.get_raw(path, missing_policy="error"))
-            else:
-                missing += 1
-
-        if not sequences:
-            raise RuntimeError(
-                "Impossibile normalizzare le sequenze tracking: "
-                "nessun campione del training set ha feature tracking associate."
-            )
-
-        matrix = np.concatenate(sequences, axis=0).astype(np.float32)
-        self.mean = matrix.mean(axis=0).astype(np.float32)
-        self.std = matrix.std(axis=0).astype(np.float32)
-        self.std = np.where(self.std < 1e-6, 1.0, self.std).astype(np.float32)
-        self.normalized = True
-
-        print("\n# Normalizzazione sequenze tracking")
-        print(f"Frame/sequenze usati per stimare mean/std: {matrix.shape[0]}")
-        print(f"Campioni train senza sequenze tracking: {missing}")
-
-    def get_config(self):
-        return {
-            "enabled": True,
-            "type": "temporal_sequence",
-            "npz_path": str(self.npz_path),
-            "index_path": str(self.index_path),
-            "num_features": self.num_features,
-            "feature_names": list(self.feature_names),
-            "normalized": bool(self.normalized),
-            "mean": self.mean.tolist() if self.mean is not None else None,
-            "std": self.std.tolist() if self.std is not None else None,
-        }
-
-
-class TrackingAugmentedDataset(Dataset):
-    """
-    Concatena a ogni timestep delle feature video un vettore globale di feature tracking.
-
-    Input originale:
-      features: [T, D]
-
-    Output:
-      features: [T, D + K]
-
-    dove K è il numero di feature estratte da YOLO palla/canestro.
-    """
-
-    def __init__(self, label_dataset: Dataset, tracking_store: TrackingFeatureStore, missing_policy="zeros"):
-        self.label_dataset = label_dataset
-        self.tracking_store = tracking_store
-        self.missing_policy = missing_policy
-
-        self.missing_count = 0
-        for idx in range(len(label_dataset)):
-            path = get_base_item_path_from_label_dataset(label_dataset, idx)
-            if not tracking_store.has(path):
-                self.missing_count += 1
-
-        print("\n# TrackingAugmentedDataset")
-        print(f"Campioni: {len(label_dataset)}")
-        print(f"Feature tracking: {tracking_store.num_features}")
-        print(f"Campioni senza tracking features: {self.missing_count}")
-        print(f"Missing policy: {missing_policy}")
-
-    def __len__(self):
-        return len(self.label_dataset)
-
-    def __getitem__(self, idx):
-        sample = dict(self.label_dataset[idx])
-
-        features = sample["features"]
-        if not torch.is_tensor(features):
-            features = torch.tensor(features, dtype=torch.float32)
-        else:
-            features = features.float()
-
-        path = get_base_item_path_from_label_dataset(self.label_dataset, idx)
-        tracking_vector = self.tracking_store.get(path, missing_policy=self.missing_policy)
-        tracking_tensor = torch.tensor(tracking_vector, dtype=features.dtype)
-
-        if features.ndim != 2:
-            raise ValueError(
-                f"Le feature video devono avere forma [T, D], "
-                f"ma per {path} hanno forma {tuple(features.shape)}."
-            )
-
-        tracking_sequence = tracking_tensor.unsqueeze(0).repeat(features.shape[0], 1)
-        sample["features"] = torch.cat([features, tracking_sequence], dim=1)
-
-        return sample
-
-
-class TemporalTrackingAugmentedDataset(Dataset):
-    """
-    Concatena a ogni timestep delle feature video una sequenza temporale di
-    feature palla/canestro allineata alla lunghezza della clip.
-
-    Input originale:
-      features: [T, D]
-      tracking sequence: [S, K]
-
-    Output:
-      features: [T, D + K]
-    """
-
-    def __init__(self, label_dataset: Dataset, tracking_store: TrackingSequenceFeatureStore, missing_policy="zeros"):
         self.label_dataset = label_dataset
         self.tracking_store = tracking_store
         self.missing_policy = missing_policy
@@ -761,7 +275,7 @@ class TemporalTrackingAugmentedDataset(Dataset):
     def __len__(self):
         return len(self.label_dataset)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         sample = dict(self.label_dataset[idx])
 
         features = sample["features"]
@@ -795,7 +309,7 @@ class TemporalTrackingAugmentedDataset(Dataset):
         return sample
 
 
-def get_dataset_labels_and_counts(dataset, num_classes: int):
+def get_dataset_labels_and_counts(dataset: Dataset, num_classes: int):
     labels = []
     counts = torch.zeros(num_classes, dtype=torch.float)
 
@@ -817,14 +331,12 @@ def get_dataset_labels_and_counts(dataset, num_classes: int):
         labels.append(label_idx)
         counts[label_idx] += 1
 
-    labels = torch.tensor(labels, dtype=torch.long)
-    return labels, counts
+    return torch.tensor(labels, dtype=torch.long), counts
 
 
 def compute_class_weights_from_counts(counts: torch.Tensor, power: float = 0.5):
     weights = 1.0 / torch.pow(counts.clamp(min=1.0), power)
-    weights = weights / weights.mean()
-    return weights
+    return weights / weights.mean()
 
 
 def build_weighted_sampler(labels: torch.Tensor, counts: torch.Tensor, power: float, seed: int):
@@ -842,7 +354,7 @@ def build_weighted_sampler(labels: torch.Tensor, counts: torch.Tensor, power: fl
     )
 
 
-def print_label_mode_info(label_mode: str, label_mapping, idx_to_label):
+def print_label_mode_info(label_mode: str, label_mapping, idx_to_label) -> None:
     print("\n# Label mode")
     print(f"Label mode: {label_mode}")
 
@@ -859,7 +371,7 @@ def print_label_mode_info(label_mode: str, label_mapping, idx_to_label):
             print(f"  {original_label} -> esclusa")
 
 
-def print_class_stats(counts, idx_to_label, class_weights=None):
+def print_class_stats(counts, idx_to_label, class_weights=None) -> None:
     print("Class counts:")
     for idx in range(len(counts)):
         print(f"  {idx_to_label[idx]}: {int(counts[idx].item())}")
@@ -870,13 +382,12 @@ def print_class_stats(counts, idx_to_label, class_weights=None):
             print(f"  {idx_to_label[idx]}: {class_weights[idx].item():.4f}")
 
 
-def get_current_lr(optimizer):
+def get_current_lr(optimizer) -> float:
     return optimizer.param_groups[0]["lr"]
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip: float = 1.0):
     model.train()
-
     total_loss = 0.0
     all_preds = []
     all_labels = []
@@ -887,10 +398,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip: floa
         labels = batch["labels"].to(device)
 
         optimizer.zero_grad()
-
         logits = model(features, lengths)
         loss = criterion(logits, labels)
-
         loss.backward()
 
         if grad_clip is not None and grad_clip > 0:
@@ -899,7 +408,6 @@ def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip: floa
         optimizer.step()
 
         total_loss += loss.item() * labels.size(0)
-
         preds = logits.argmax(dim=1)
         all_preds.extend(preds.detach().cpu().tolist())
         all_labels.extend(labels.detach().cpu().tolist())
@@ -908,14 +416,12 @@ def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip: floa
     acc = accuracy_score(all_labels, all_preds)
     macro_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
     weighted_f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
-
     return avg_loss, acc, macro_f1, weighted_f1
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
     model.eval()
-
     total_loss = 0.0
     all_preds = []
     all_labels = []
@@ -927,7 +433,6 @@ def evaluate(model, loader, criterion, device):
 
         logits = model(features, lengths)
         loss = criterion(logits, labels)
-
         total_loss += loss.item() * labels.size(0)
 
         preds = logits.argmax(dim=1)
@@ -938,12 +443,13 @@ def evaluate(model, loader, criterion, device):
     acc = accuracy_score(all_labels, all_preds)
     macro_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
     weighted_f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
-
     return avg_loss, acc, macro_f1, weighted_f1, all_labels, all_preds
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Training dei livelli gerarchici finali con feature DINOv3 e tracking temporale."
+    )
 
     parser.add_argument("--features-root", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="outputs/temporal_transformer")
@@ -964,41 +470,18 @@ def parse_args():
         "--last-mean-ratio",
         type=float,
         default=0.30,
-        help=(
-            "Percentuale finale della clip da usare con --pooling last_mean. "
-            "Esempio: 0.30 usa circa l'ultimo 30% dei frame reali."
-        ),
+        help="Percentuale finale della clip da usare con --pooling last_mean.",
     )
     parser.add_argument("--max-len", type=int, default=1024)
 
     parser.add_argument(
         "--label-mode",
         type=str,
-        default="original",
-        choices=[
-            "original",
-            "action_noaction",
-            "shot_type",
-            "shot_outcome",
-            "action_group",
-            "shot_type_only",
-            "shot_outcome_only",
-        ],
-        help=(
-            "Modalità di etichettatura. "
-            "Per la gerarchia usare: action_noaction, shot_type_only, shot_outcome_only."
-        ),
+        required=True,
+        choices=["action_noaction", "shot_type_only", "shot_outcome_only"],
+        help="Livello gerarchico da addestrare.",
     )
 
-    parser.add_argument(
-        "--tracking-features-csv",
-        type=str,
-        default=None,
-        help=(
-            "CSV prodotto da extract_ball_rim_tracking_features.py. "
-            "Se indicato, le feature tracking aggregate vengono concatenate alle feature video."
-        ),
-    )
     parser.add_argument(
         "--tracking-sequences-npz",
         type=str,
@@ -1006,7 +489,7 @@ def parse_args():
         help=(
             "File NPZ con sequenze temporali di tracking palla/canestro. "
             "Se indicato, ogni sequenza [S, K] viene interpolata a [T, K] "
-            "e concatenata alle feature video frame per frame."
+            "e concatenata alle feature DINOv3 frame-per-frame."
         ),
     )
     parser.add_argument(
@@ -1023,15 +506,12 @@ def parse_args():
         type=str,
         default="zeros",
         choices=["zeros", "error"],
-        help=(
-            "Comportamento se una clip non ha feature tracking: "
-            "zeros = vettore nullo, error = interrompe il training."
-        ),
+        help="Comportamento se una clip non ha feature tracking associate.",
     )
     parser.add_argument(
         "--no-normalize-tracking-features",
         action="store_true",
-        help="Disattiva la normalizzazione z-score delle feature tracking calcolata sul train set.",
+        help="Disattiva la normalizzazione z-score del tracking calcolata sul train set.",
     )
 
     parser.add_argument("--num-workers", type=int, default=2)
@@ -1095,7 +575,8 @@ def build_model(args, device, num_classes: int, tracking_dim: int = 0, tracking_
 
     return model, model_config
 
-def run_training(args):
+
+def run_training(args) -> None:
     print("# Comando utilizzato")
     print(get_reconstructed_command())
     print("\n" + "=" * 80 + "\n")
@@ -1129,13 +610,9 @@ def run_training(args):
     print(f"Val samples originali: {len(base_val_dataset)}")
     print(f"Val samples usati: {len(val_dataset)}")
 
-    train_labels, train_counts = get_dataset_labels_and_counts(
-        train_dataset,
-        num_classes=num_classes,
-    )
+    train_labels, train_counts = get_dataset_labels_and_counts(train_dataset, num_classes=num_classes)
 
     print("\n# Distribuzione classi")
-
     if args.no_class_weights:
         class_weights = None
         criterion = nn.CrossEntropyLoss()
@@ -1170,40 +647,7 @@ def run_training(args):
     tracking_dim = 0
     tracking_config = None
 
-    if args.tracking_features_csv is not None and args.tracking_sequences_npz is not None:
-        raise ValueError(
-            "Usare una sola modalità tracking: --tracking-features-csv "
-            "oppure --tracking-sequences-npz, non entrambe."
-        )
-
-    if args.tracking_features_csv is not None:
-        print("\n# Feature tracking palla/canestro aggregate")
-        tracking_store = TrackingFeatureStore(args.tracking_features_csv)
-
-        if args.no_normalize_tracking_features:
-            print("Normalizzazione feature tracking disattivata.")
-        else:
-            tracking_store.fit_normalizer_from_label_dataset(train_dataset)
-
-        tracking_dim = tracking_store.num_features
-        tracking_config = tracking_store.get_config()
-
-        train_dataset = TrackingAugmentedDataset(
-            train_dataset,
-            tracking_store,
-            missing_policy=args.tracking_missing_policy,
-        )
-        val_dataset = TrackingAugmentedDataset(
-            val_dataset,
-            tracking_store,
-            missing_policy=args.tracking_missing_policy,
-        )
-
-        print(f"Input dim feature video: {args.input_dim}")
-        print(f"Input dim feature tracking aggregate: {tracking_dim}")
-        print(f"Input dim totale modello: {args.input_dim + tracking_dim}")
-
-    elif args.tracking_sequences_npz is not None:
+    if args.tracking_sequences_npz is not None:
         print("\n# Feature tracking palla/canestro temporali")
         tracking_store = TrackingSequenceFeatureStore(
             args.tracking_sequences_npz,
@@ -1213,7 +657,11 @@ def run_training(args):
         if args.no_normalize_tracking_features:
             print("Normalizzazione sequenze tracking disattivata.")
         else:
-            tracking_store.fit_normalizer_from_label_dataset(train_dataset)
+            train_tracking_paths = [
+                get_base_item_path_from_label_dataset(train_dataset, idx)
+                for idx in range(len(train_dataset))
+            ]
+            tracking_store.fit_normalizer_from_paths(train_tracking_paths)
 
         tracking_dim = tracking_store.num_features
         tracking_config = tracking_store.get_config()
@@ -1386,6 +834,9 @@ def run_training(args):
 
             print(f"Salvato nuovo best model: {checkpoint_path}")
 
+    if best_val_labels is None or best_val_preds is None:
+        raise RuntimeError("Training completato senza salvare alcun best model.")
+
     print("\n" + "=" * 80)
     print("\nValutazione finale su validation usando il miglior modello salvato:")
     print(f"Best epoch: {best_epoch}")
@@ -1417,20 +868,8 @@ def run_training(args):
         )
     )
 
-    if args.label_mode == "original":
-        print("\nClassification report - solo 7 azioni reali:")
-        print(
-            classification_report(
-                best_val_labels,
-                best_val_preds,
-                labels=list(range(7)),
-                target_names=[IDX_TO_LABEL[i] for i in range(7)],
-                zero_division=0,
-            )
-        )
 
-
-def main():
+def main() -> None:
     args = parse_args()
 
     output_dir = Path(args.output_dir)

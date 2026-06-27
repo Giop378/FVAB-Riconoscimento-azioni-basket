@@ -1,15 +1,38 @@
+"""
+Script di estrazione delle sequenze temporali di tracking palla/canestro.
+
+Usa un detector YOLO addestrato per rilevare palla e ferro/canestro nei frame
+delle clip del dataset. A partire dalle detection calcola feature per-frame e le
+salva nei formati temporali temp29 o temp43, usati poi insieme alle feature
+DINOv3 nei modelli gerarchici L1/L2/L3.
+
+La versione è focalizzata solo sulle sequenze temporali: non produce più feature
+statiche per clip.
+"""
+
 from pathlib import Path
 import argparse
-import csv
-import json
-import math
 import sys
 import traceback
-from collections import Counter, defaultdict
+from collections import Counter
 
-import cv2
-import numpy as np
 from ultralytics import YOLO
+
+from src.features.tracking_geometry import (
+    TEMPORAL_TRACKING_FEATURE_SETS,
+    compute_pair_features,
+    compute_temporal_sequence_features,
+    parse_yolo_result,
+)
+from src.features.tracking_io import (
+    Tee,
+    build_frame_indices,
+    get_video_metadata,
+    read_frames,
+    read_manifest,
+    write_csv,
+    write_temporal_sequences,
+)
 
 
 SHOT_LABELS = {
@@ -36,315 +59,50 @@ DEFAULT_YOLO_WEIGHTS = (
     "runs/detect/outputs/ball_rim_detector/"
     "yolo11m_1280_v2/weights/best.pt"
 )
-DEFAULT_OUTPUT_DIR = "data/features/ball_rim_tracking_features_clip_complete"
+DEFAULT_OUTPUT_DIR = "data/features/ball_rim_tracking_temporal_clip_complete"
 
 
-TRACKING_FEATURE_NAMES = [
-    # Detection quality / visibility.
-    "ball_detect_rate",
-    "rim_detect_rate",
-    "both_detect_rate",
-    "ball_conf_mean",
-    "ball_conf_max",
-    "rim_conf_mean",
-    "rim_conf_max",
-    "ball_area_mean",
-    "ball_area_max",
-    "rim_area_mean",
-    "rim_area_max",
-
-    # Ball-rim geometry.
-    "ball_rim_dist_min",
-    "ball_rim_dist_mean",
-    "ball_rim_dist_std",
-    "ball_rim_dist_last",
-    "ball_rim_dist_last_third_min",
-    "ball_rim_dist_last_third_mean",
-    "ball_near_rim_rate",
-    "ball_near_rim_last_third_rate",
-    "ball_above_rim_rate",
-    "ball_below_rim_rate",
-    "ball_above_rim_last",
-    "dx_mean",
-    "dx_std",
-    "dx_last",
-    "dy_mean",
-    "dy_std",
-    "dy_last",
-    "abs_dx_min",
-    "abs_dy_min",
-
-    # Absolute ball motion.
-    "ball_velocity_mean",
-    "ball_velocity_max",
-    "ball_velocity_last_third_mean",
-    "ball_vx_mean",
-    "ball_vy_mean",
-    "ball_vy_last_third_mean",
-    "ball_abs_vx_mean",
-    "ball_abs_vy_mean",
-    "ball_horizontal_motion_ratio",
-    "ball_vertical_motion_ratio",
-    "ball_motion_path_length",
-    "ball_motion_net_displacement",
-    "ball_motion_straightness",
-    "ball_displacement_x",
-    "ball_displacement_y",
-
-    # Rim stability / camera motion proxy.
-    "rim_center_std",
-    "rim_area_std",
-
-    # Rim interaction proxies for shot outcome.
-    "ball_crosses_rim_y",
-    "ball_crosses_rim_y_downward",
-    "ball_crosses_rim_y_upward",
-    "ball_center_inside_rim_rate",
-    "ball_center_inside_rim_last_third_rate",
-    "ball_center_inside_rim_any",
-    "ball_center_inside_rim_last",
-    "ball_center_inside_expanded_rim_rate",
-    "ball_center_inside_expanded_rim_last_third_rate",
-    "ball_center_inside_expanded_rim_any",
-    "ball_center_inside_expanded_rim_last",
-    "ball_rim_iou_mean",
-    "ball_rim_iou_max",
-    "ball_rim_iou_last_third_max",
-    "ball_passes_close_to_rim_rate",
-
-    # Relative ball-rim motion, more robust when the camera moves.
-    "ball_relative_speed_mean",
-    "ball_relative_speed_max",
-    "ball_relative_vx_mean",
-    "ball_relative_vy_mean",
-    "ball_rim_approach_speed_mean",
-    "ball_rim_approach_speed_max",
-    "ball_rim_departure_speed_mean",
-    "ball_rim_departure_speed_max",
-]
-
-
-TEMPORAL_TRACKING_FEATURE_NAMES = [
-    # Detection quality / visibility.
+PER_FRAME_FIELDS = [
+    "clip_id",
+    "split",
+    "label",
+    "path",
+    "frame_order",
+    "frame_idx",
+    "time_sec",
     "t_rel",
+    "width",
+    "height",
     "ball_detected",
-    "rim_detected",
-    "both_detected",
     "ball_conf",
-    "rim_conf",
     "ball_xc",
     "ball_yc",
     "ball_w",
     "ball_h",
     "ball_area",
+    "rim_detected",
+    "rim_conf",
     "rim_xc",
     "rim_yc",
     "rim_w",
     "rim_h",
     "rim_area",
-
-    # Ball-rim geometry.
+    "both_detected",
     "dx",
     "dy",
     "ball_rim_dist",
-    "ball_near_rim",
     "ball_above_rim",
     "ball_below_rim",
+    "ball_near_rim",
     "ball_center_inside_rim",
     "ball_center_inside_expanded_rim",
     "ball_rim_iou",
     "ball_passes_close_to_rim",
-
-    # Absolute ball motion.
-    "ball_vx",
-    "ball_vy",
-    "ball_speed",
-    "ball_ax",
-    "ball_ay",
-    "ball_acceleration",
-    "ball_motion_horizontal_ratio",
-    "ball_motion_vertical_ratio",
-
-    # Relative ball-rim motion and rim crossing events.
-    "ball_rim_dist_delta",
-    "ball_relative_vx",
-    "ball_relative_vy",
-    "ball_relative_speed",
-    "ball_rim_approach_speed",
-    "ball_rim_departure_speed",
-    "ball_crosses_rim_y_frame",
-    "ball_crosses_rim_y_downward_frame",
-    "ball_crosses_rim_y_upward_frame",
 ]
-
-
-# Set storico a 29 feature usato dai checkpoint temporali "temp29".
-# L'ordine deve restare identico a quello salvato nei checkpoint.
-TEMPORAL_TRACKING_FEATURE_NAMES_TEMP29 = [
-    "t_rel",
-    "ball_detected",
-    "rim_detected",
-    "both_detected",
-    "ball_conf",
-    "rim_conf",
-    "ball_xc",
-    "ball_yc",
-    "ball_w",
-    "ball_h",
-    "ball_area",
-    "rim_xc",
-    "rim_yc",
-    "rim_w",
-    "rim_h",
-    "rim_area",
-    "dx",
-    "dy",
-    "ball_rim_dist",
-    "ball_near_rim",
-    "ball_above_rim",
-    "ball_below_rim",
-    "ball_vx",
-    "ball_vy",
-    "ball_speed",
-    "ball_ax",
-    "ball_ay",
-    "ball_acceleration",
-    "ball_rim_dist_delta",
-]
-
-# Set esteso a 43 feature usato dai checkpoint "temp43".
-TEMPORAL_TRACKING_FEATURE_NAMES_TEMP43 = TEMPORAL_TRACKING_FEATURE_NAMES
-
-TEMPORAL_TRACKING_FEATURE_SETS = {
-    "temp29": TEMPORAL_TRACKING_FEATURE_NAMES_TEMP29,
-    "temp43": TEMPORAL_TRACKING_FEATURE_NAMES_TEMP43,
-}
-
-
-class Tee:
-    def __init__(self, *streams):
-        self.streams = streams
-
-    def write(self, text):
-        for stream in self.streams:
-            stream.write(text)
-            stream.flush()
-
-    def flush(self):
-        for stream in self.streams:
-            stream.flush()
-
-
-def safe_float(value, default=0.0):
-    if value is None:
-        return default
-    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-        return default
-    return float(value)
-
-
-def mean_or_default(values, default=0.0):
-    values = [safe_float(v) for v in values if v is not None]
-    if not values:
-        return default
-    return float(np.mean(values))
-
-
-def std_or_default(values, default=0.0):
-    values = [safe_float(v) for v in values if v is not None]
-    if len(values) <= 1:
-        return default
-    return float(np.std(values))
-
-
-def min_or_default(values, default=1.0):
-    values = [safe_float(v) for v in values if v is not None]
-    if not values:
-        return default
-    return float(np.min(values))
-
-
-def max_or_default(values, default=0.0):
-    values = [safe_float(v) for v in values if v is not None]
-    if not values:
-        return default
-    return float(np.max(values))
-
-
-def last_or_default(values, default=0.0):
-    values = [v for v in values if v is not None]
-    if not values:
-        return default
-    return safe_float(values[-1], default=default)
-
-
-def normalize_clip_key(path_value) -> str:
-    """
-    Normalizza il path di una clip in una chiave stabile per associare
-    feature video, feature aggregate e sequenze temporali.
-    """
-    path_str = str(path_value).replace("\\", "/")
-    parts = [p for p in Path(path_str).parts if p not in {"", "."}]
-
-    split_idx = None
-    for idx, part in enumerate(parts):
-        if part in {"train", "val", "test"}:
-            split_idx = idx
-            break
-
-    if split_idx is not None:
-        parts = parts[split_idx:]
-
-    return Path(*parts).with_suffix("").as_posix()
-
-
-def read_manifest(manifest_path: Path, dataset_root: Path, splits, labels, max_clips=None):
-    rows = []
-
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-
-        required_columns = {"path", "label", "split"}
-        missing_columns = required_columns - set(reader.fieldnames or [])
-
-        if missing_columns:
-            raise ValueError(
-                f"Il manifest non contiene le colonne richieste: {sorted(missing_columns)}. "
-                f"Colonne presenti: {reader.fieldnames}"
-            )
-
-        for row in reader:
-            split = row["split"].strip()
-            label = row["label"].strip()
-            rel_path = row["path"].strip()
-
-            if split not in splits:
-                continue
-
-            if label not in labels:
-                continue
-
-            video_path = dataset_root / rel_path
-
-            rows.append(
-                {
-                    "clip_id": row.get("clip_id", Path(rel_path).stem),
-                    "split": split,
-                    "label": label,
-                    "path": rel_path,
-                    "video_path": video_path,
-                }
-            )
-
-    rows = sorted(rows, key=lambda x: (x["split"], x["label"], x["path"]))
-
-    if max_clips is not None and max_clips > 0:
-        rows = rows[:max_clips]
-
-    return rows
 
 
 def get_model_names(model):
+    """Restituisce il dizionario class_id -> class_name del modello YOLO."""
     names = model.names
 
     if isinstance(names, dict):
@@ -357,6 +115,7 @@ def get_model_names(model):
 
 
 def resolve_class_id(model, class_name, explicit_id=None):
+    """Trova l'id di una classe YOLO dal nome o da un id esplicito."""
     names = get_model_names(model)
 
     if explicit_id is not None:
@@ -381,665 +140,9 @@ def resolve_class_id(model, class_name, explicit_id=None):
     return normalized[class_name_lower]
 
 
-def get_video_metadata(video_path: Path):
-    cap = cv2.VideoCapture(str(video_path))
-
-    if not cap.isOpened():
-        raise RuntimeError(f"Impossibile aprire il video: {video_path}")
-
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = float(cap.get(cv2.CAP_PROP_FPS))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    cap.release()
-
-    if fps <= 0:
-        fps = 25.0
-
-    return frame_count, fps, width, height
-
-
-def build_frame_indices(frame_count: int, num_frames: int, sample_mode: str, last_ratio: float):
-    if frame_count <= 0:
-        return []
-
-    if num_frames <= 0 or num_frames >= frame_count:
-        return list(range(frame_count))
-
-    if sample_mode == "uniform":
-        start = 0
-        end = frame_count - 1
-
-    elif sample_mode == "last":
-        start = int(max(0, math.floor(frame_count * (1.0 - last_ratio))))
-        end = frame_count - 1
-
-    else:
-        raise ValueError(f"sample_mode non supportato: {sample_mode}")
-
-    if end < start:
-        start = 0
-        end = frame_count - 1
-
-    indices = np.linspace(start, end, num_frames)
-    indices = sorted({int(round(x)) for x in indices})
-    indices = [min(max(0, idx), frame_count - 1) for idx in indices]
-
-    return indices
-
-
-def read_frames(video_path: Path, frame_indices):
-    cap = cv2.VideoCapture(str(video_path))
-
-    if not cap.isOpened():
-        raise RuntimeError(f"Impossibile aprire il video: {video_path}")
-
-    frames = []
-    valid_indices = []
-
-    for frame_idx in frame_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame = cap.read()
-
-        if not ok and frame_idx > 0:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx - 1)
-            ok, frame = cap.read()
-
-        if not ok or frame is None:
-            continue
-
-        frames.append(frame)
-        valid_indices.append(frame_idx)
-
-    cap.release()
-
-    return frames, valid_indices
-
-
-def detection_to_dict(box_xyxy, conf, frame_width, frame_height):
-    x1, y1, x2, y2 = [float(v) for v in box_xyxy]
-
-    x1 = max(0.0, min(x1, frame_width - 1))
-    x2 = max(0.0, min(x2, frame_width - 1))
-    y1 = max(0.0, min(y1, frame_height - 1))
-    y2 = max(0.0, min(y2, frame_height - 1))
-
-    bw = max(0.0, x2 - x1)
-    bh = max(0.0, y2 - y1)
-
-    xc = x1 + bw / 2.0
-    yc = y1 + bh / 2.0
-
-    return {
-        "detected": 1,
-        "conf": float(conf),
-        "xc": xc / frame_width if frame_width > 0 else 0.0,
-        "yc": yc / frame_height if frame_height > 0 else 0.0,
-        "w": bw / frame_width if frame_width > 0 else 0.0,
-        "h": bh / frame_height if frame_height > 0 else 0.0,
-        "area": (bw * bh) / (frame_width * frame_height) if frame_width > 0 and frame_height > 0 else 0.0,
-    }
-
-
-def empty_detection():
-    return {
-        "detected": 0,
-        "conf": 0.0,
-        "xc": 0.0,
-        "yc": 0.0,
-        "w": 0.0,
-        "h": 0.0,
-        "area": 0.0,
-    }
-
-
-def detection_bbox(det, margin: float = 0.0):
-    """
-    Restituisce il bbox normalizzato [x1, y1, x2, y2].
-
-    margin espande il bbox di margin * w e margin * h per lato. Questo è utile
-    perché il bbox del rim non coincide perfettamente con il cilindro del ferro,
-    quindi una piccola espansione rende il proxy di ingresso palla-canestro meno
-    fragile rispetto a detection leggermente rumorose.
-    """
-    xc = float(det.get("xc", 0.0))
-    yc = float(det.get("yc", 0.0))
-    w = float(det.get("w", 0.0))
-    h = float(det.get("h", 0.0))
-
-    half_w = w * (0.5 + margin)
-    half_h = h * (0.5 + margin)
-
-    x1 = max(0.0, xc - half_w)
-    y1 = max(0.0, yc - half_h)
-    x2 = min(1.0, xc + half_w)
-    y2 = min(1.0, yc + half_h)
-
-    return x1, y1, x2, y2
-
-
-def point_inside_bbox(x: float, y: float, bbox) -> int:
-    x1, y1, x2, y2 = bbox
-    return int(x1 <= float(x) <= x2 and y1 <= float(y) <= y2)
-
-
-def detection_iou(det_a, det_b) -> float:
-    ax1, ay1, ax2, ay2 = detection_bbox(det_a, margin=0.0)
-    bx1, by1, bx2, by2 = detection_bbox(det_b, margin=0.0)
-
-    inter_x1 = max(ax1, bx1)
-    inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2)
-    inter_y2 = min(ay2, by2)
-
-    inter_w = max(0.0, inter_x2 - inter_x1)
-    inter_h = max(0.0, inter_y2 - inter_y1)
-    inter_area = inter_w * inter_h
-
-    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    union = area_a + area_b - inter_area
-
-    if union <= 1e-12:
-        return 0.0
-
-    return float(inter_area / union)
-
-
-def parse_yolo_result(result, ball_class_id, rim_class_id, frame_width, frame_height):
-    best = {
-        "ball": None,
-        "rim": None,
-    }
-
-    boxes = result.boxes
-
-    if boxes is None or len(boxes) == 0:
-        return empty_detection(), empty_detection()
-
-    xyxy = boxes.xyxy.detach().cpu().numpy()
-    confs = boxes.conf.detach().cpu().numpy()
-    classes = boxes.cls.detach().cpu().numpy().astype(int)
-
-    for box, conf, class_id in zip(xyxy, confs, classes):
-        if class_id == ball_class_id:
-            current = best["ball"]
-            if current is None or conf > current["conf"]:
-                best["ball"] = detection_to_dict(box, conf, frame_width, frame_height)
-
-        elif class_id == rim_class_id:
-            current = best["rim"]
-            if current is None or conf > current["conf"]:
-                best["rim"] = detection_to_dict(box, conf, frame_width, frame_height)
-
-    ball = best["ball"] if best["ball"] is not None else empty_detection()
-    rim = best["rim"] if best["rim"] is not None else empty_detection()
-
-    return ball, rim
-
-
-def compute_pair_features(ball, rim, near_threshold, rim_inside_margin=0.15):
-    both_detected = int(ball["detected"] == 1 and rim["detected"] == 1)
-
-    if not both_detected:
-        return {
-            "both_detected": 0,
-            "dx": 0.0,
-            "dy": 0.0,
-            "dist": 1.0,
-            "ball_above_rim": 0,
-            "ball_below_rim": 0,
-            "ball_near_rim": 0,
-            "ball_center_inside_rim": 0,
-            "ball_center_inside_expanded_rim": 0,
-            "ball_rim_iou": 0.0,
-            "ball_passes_close_to_rim": 0,
-        }
-
-    dx = ball["xc"] - rim["xc"]
-    dy = ball["yc"] - rim["yc"]
-    dist = math.sqrt(dx * dx + dy * dy)
-
-    rim_bbox = detection_bbox(rim, margin=0.0)
-    expanded_rim_bbox = detection_bbox(rim, margin=rim_inside_margin)
-
-    center_inside_rim = point_inside_bbox(ball["xc"], ball["yc"], rim_bbox)
-    center_inside_expanded_rim = point_inside_bbox(ball["xc"], ball["yc"], expanded_rim_bbox)
-    ball_rim_iou = detection_iou(ball, rim)
-
-    # Proxy leggero per frame in cui la palla passa davvero nella zona del ferro:
-    # vicino al rim e orizzontalmente compatibile con la larghezza del bbox del rim.
-    horizontal_gate = max(float(rim.get("w", 0.0)), near_threshold * 0.50, 1e-6)
-    ball_passes_close_to_rim = int(dist <= near_threshold and abs(dx) <= horizontal_gate)
-
-    return {
-        "both_detected": 1,
-        "dx": dx,
-        "dy": dy,
-        "dist": dist,
-        "ball_above_rim": int(ball["yc"] < rim["yc"]),
-        "ball_below_rim": int(ball["yc"] > rim["yc"]),
-        "ball_near_rim": int(dist <= near_threshold),
-        "ball_center_inside_rim": center_inside_rim,
-        "ball_center_inside_expanded_rim": center_inside_expanded_rim,
-        "ball_rim_iou": ball_rim_iou,
-        "ball_passes_close_to_rim": ball_passes_close_to_rim,
-    }
-
-
-def compute_velocities(frame_rows, fps):
-    detected = [
-        row
-        for row in frame_rows
-        if int(row["ball_detected"]) == 1
-    ]
-
-    velocities = []
-    vx_values = []
-    vy_values = []
-
-    for prev, curr in zip(detected[:-1], detected[1:]):
-        delta_frames = int(curr["frame_idx"]) - int(prev["frame_idx"])
-
-        if delta_frames <= 0:
-            continue
-
-        dt = delta_frames / fps if fps > 0 else float(delta_frames)
-        if dt <= 0:
-            continue
-
-        step_dx = float(curr["ball_xc"]) - float(prev["ball_xc"])
-        step_dy = float(curr["ball_yc"]) - float(prev["ball_yc"])
-
-        vx = step_dx / dt
-        vy = step_dy / dt
-        v = math.sqrt(vx * vx + vy * vy)
-
-        rel_vx = 0.0
-        rel_vy = 0.0
-        rel_speed = 0.0
-        dist_delta = 0.0
-        rel_valid = False
-
-        if int(curr.get("both_detected", 0)) == 1 and int(prev.get("both_detected", 0)) == 1:
-            rel_vx = (float(curr["dx"]) - float(prev["dx"])) / dt
-            rel_vy = (float(curr["dy"]) - float(prev["dy"])) / dt
-            rel_speed = math.sqrt(rel_vx * rel_vx + rel_vy * rel_vy)
-            dist_delta = (float(curr["ball_rim_dist"]) - float(prev["ball_rim_dist"])) / dt
-            rel_valid = True
-
-        velocities.append(
-            {
-                "frame_order": int(curr["frame_order"]),
-                "v": v,
-                "vx": vx,
-                "vy": vy,
-                "step_dx": step_dx,
-                "step_dy": step_dy,
-                "step_dist": math.sqrt(step_dx * step_dx + step_dy * step_dy),
-                "rel_valid": rel_valid,
-                "rel_vx": rel_vx,
-                "rel_vy": rel_vy,
-                "rel_speed": rel_speed,
-                "dist_delta": dist_delta,
-                "approach_speed": max(0.0, -dist_delta) if rel_valid else 0.0,
-                "departure_speed": max(0.0, dist_delta) if rel_valid else 0.0,
-            }
-        )
-
-        vx_values.append(vx)
-        vy_values.append(vy)
-
-    return velocities, vx_values, vy_values
-
-
-def aggregate_clip_features(frame_rows, fps, near_threshold):
-    n = len(frame_rows)
-
-    if n == 0:
-        return {name: 0.0 for name in TRACKING_FEATURE_NAMES}
-
-    last_third_start = int(math.floor(n * 2.0 / 3.0))
-
-    ball_rows = [r for r in frame_rows if int(r["ball_detected"]) == 1]
-    rim_rows = [r for r in frame_rows if int(r["rim_detected"]) == 1]
-    both_rows = [r for r in frame_rows if int(r["both_detected"]) == 1]
-    both_last_rows = [r for r in both_rows if int(r["frame_order"]) >= last_third_start]
-
-    ball_conf = [float(r["ball_conf"]) for r in ball_rows]
-    rim_conf = [float(r["rim_conf"]) for r in rim_rows]
-    ball_area = [float(r["ball_area"]) for r in ball_rows]
-    rim_area = [float(r["rim_area"]) for r in rim_rows]
-
-    distances = [float(r["ball_rim_dist"]) for r in both_rows]
-    distances_last = [float(r["ball_rim_dist"]) for r in both_last_rows]
-
-    dx_values = [float(r["dx"]) for r in both_rows]
-    dy_values = [float(r["dy"]) for r in both_rows]
-    abs_dx_values = [abs(float(r["dx"])) for r in both_rows]
-    abs_dy_values = [abs(float(r["dy"])) for r in both_rows]
-
-    near_values = [int(r["ball_near_rim"]) for r in both_rows]
-    near_last_values = [int(r["ball_near_rim"]) for r in both_last_rows]
-
-    above_values = [int(r["ball_above_rim"]) for r in both_rows]
-    below_values = [int(r["ball_below_rim"]) for r in both_rows]
-
-    center_inside_values = [int(r.get("ball_center_inside_rim", 0)) for r in both_rows]
-    center_inside_last_values = [int(r.get("ball_center_inside_rim", 0)) for r in both_last_rows]
-    center_inside_expanded_values = [int(r.get("ball_center_inside_expanded_rim", 0)) for r in both_rows]
-    center_inside_expanded_last_values = [int(r.get("ball_center_inside_expanded_rim", 0)) for r in both_last_rows]
-    iou_values = [float(r.get("ball_rim_iou", 0.0)) for r in both_rows]
-    iou_last_values = [float(r.get("ball_rim_iou", 0.0)) for r in both_last_rows]
-    close_values = [int(r.get("ball_passes_close_to_rim", 0)) for r in both_rows]
-
-    rim_x = [float(r["rim_xc"]) for r in rim_rows]
-    rim_y = [float(r["rim_yc"]) for r in rim_rows]
-    rim_center_std = math.sqrt(
-        std_or_default(rim_x, default=0.0) ** 2
-        + std_or_default(rim_y, default=0.0) ** 2
-    )
-
-    velocities, vx_values, vy_values = compute_velocities(frame_rows, fps)
-    v_values = [v["v"] for v in velocities]
-    v_last_values = [v["v"] for v in velocities if int(v["frame_order"]) >= last_third_start]
-    vy_last_values = [v["vy"] for v in velocities if int(v["frame_order"]) >= last_third_start]
-
-    abs_vx_values = [abs(v["vx"]) for v in velocities]
-    abs_vy_values = [abs(v["vy"]) for v in velocities]
-    abs_vx_mean = mean_or_default(abs_vx_values, default=0.0)
-    abs_vy_mean = mean_or_default(abs_vy_values, default=0.0)
-    motion_den = abs_vx_mean + abs_vy_mean
-    horizontal_motion_ratio = abs_vx_mean / motion_den if motion_den > 1e-12 else 0.0
-    vertical_motion_ratio = abs_vy_mean / motion_den if motion_den > 1e-12 else 0.0
-
-    ball_motion_path_length = sum(float(v.get("step_dist", 0.0)) for v in velocities)
-    ball_motion_net_displacement = 0.0
-    ball_displacement_x = 0.0
-    ball_displacement_y = 0.0
-    if len(ball_rows) >= 2:
-        sorted_ball_rows = sorted(ball_rows, key=lambda r: int(r["frame_order"]))
-        first_ball = sorted_ball_rows[0]
-        last_ball = sorted_ball_rows[-1]
-        ball_displacement_x = float(last_ball["ball_xc"]) - float(first_ball["ball_xc"])
-        ball_displacement_y = float(last_ball["ball_yc"]) - float(first_ball["ball_yc"])
-        ball_motion_net_displacement = math.sqrt(
-            ball_displacement_x * ball_displacement_x
-            + ball_displacement_y * ball_displacement_y
-        )
-
-    ball_motion_straightness = (
-        ball_motion_net_displacement / ball_motion_path_length
-        if ball_motion_path_length > 1e-12
-        else 0.0
-    )
-
-    relative_rows = [v for v in velocities if bool(v.get("rel_valid", False))]
-    rel_speed_values = [float(v["rel_speed"]) for v in relative_rows]
-    rel_vx_values = [float(v["rel_vx"]) for v in relative_rows]
-    rel_vy_values = [float(v["rel_vy"]) for v in relative_rows]
-    approach_values = [float(v["approach_speed"]) for v in relative_rows]
-    departure_values = [float(v["departure_speed"]) for v in relative_rows]
-
-    # Attraversamento verticale rispetto al rim:
-    # dy < 0 significa palla sopra il rim, dy > 0 significa palla sotto il rim
-    # nel sistema di coordinate immagine. Il crossing downward è quindi il caso
-    # sopra -> sotto, più rilevante per l'esito del tiro.
-    crosses_rim_y = 0
-    crosses_rim_y_downward = 0
-    crosses_rim_y_upward = 0
-    if len(dy_values) >= 2:
-        signs = [np.sign(v) for v in dy_values if abs(v) > 1e-6]
-        for a, b in zip(signs[:-1], signs[1:]):
-            if a != b:
-                crosses_rim_y = 1
-            if a < 0 and b > 0:
-                crosses_rim_y_downward = 1
-            elif a > 0 and b < 0:
-                crosses_rim_y_upward = 1
-
-    features = {
-        "ball_detect_rate": len(ball_rows) / n,
-        "rim_detect_rate": len(rim_rows) / n,
-        "both_detect_rate": len(both_rows) / n,
-
-        "ball_conf_mean": mean_or_default(ball_conf, default=0.0),
-        "ball_conf_max": max_or_default(ball_conf, default=0.0),
-        "rim_conf_mean": mean_or_default(rim_conf, default=0.0),
-        "rim_conf_max": max_or_default(rim_conf, default=0.0),
-
-        "ball_area_mean": mean_or_default(ball_area, default=0.0),
-        "ball_area_max": max_or_default(ball_area, default=0.0),
-        "rim_area_mean": mean_or_default(rim_area, default=0.0),
-        "rim_area_max": max_or_default(rim_area, default=0.0),
-
-        "ball_rim_dist_min": min_or_default(distances, default=1.0),
-        "ball_rim_dist_mean": mean_or_default(distances, default=1.0),
-        "ball_rim_dist_std": std_or_default(distances, default=0.0),
-        "ball_rim_dist_last": last_or_default(distances, default=1.0),
-        "ball_rim_dist_last_third_min": min_or_default(distances_last, default=1.0),
-        "ball_rim_dist_last_third_mean": mean_or_default(distances_last, default=1.0),
-
-        "ball_near_rim_rate": mean_or_default(near_values, default=0.0),
-        "ball_near_rim_last_third_rate": mean_or_default(near_last_values, default=0.0),
-
-        "ball_above_rim_rate": mean_or_default(above_values, default=0.0),
-        "ball_below_rim_rate": mean_or_default(below_values, default=0.0),
-        "ball_above_rim_last": last_or_default(above_values, default=0.0),
-
-        "dx_mean": mean_or_default(dx_values, default=0.0),
-        "dx_std": std_or_default(dx_values, default=0.0),
-        "dx_last": last_or_default(dx_values, default=0.0),
-
-        "dy_mean": mean_or_default(dy_values, default=0.0),
-        "dy_std": std_or_default(dy_values, default=0.0),
-        "dy_last": last_or_default(dy_values, default=0.0),
-
-        "abs_dx_min": min_or_default(abs_dx_values, default=1.0),
-        "abs_dy_min": min_or_default(abs_dy_values, default=1.0),
-
-        "ball_velocity_mean": mean_or_default(v_values, default=0.0),
-        "ball_velocity_max": max_or_default(v_values, default=0.0),
-        "ball_velocity_last_third_mean": mean_or_default(v_last_values, default=0.0),
-        "ball_vx_mean": mean_or_default(vx_values, default=0.0),
-        "ball_vy_mean": mean_or_default(vy_values, default=0.0),
-        "ball_vy_last_third_mean": mean_or_default(vy_last_values, default=0.0),
-        "ball_abs_vx_mean": abs_vx_mean,
-        "ball_abs_vy_mean": abs_vy_mean,
-        "ball_horizontal_motion_ratio": horizontal_motion_ratio,
-        "ball_vertical_motion_ratio": vertical_motion_ratio,
-        "ball_motion_path_length": ball_motion_path_length,
-        "ball_motion_net_displacement": ball_motion_net_displacement,
-        "ball_motion_straightness": ball_motion_straightness,
-        "ball_displacement_x": ball_displacement_x,
-        "ball_displacement_y": ball_displacement_y,
-
-        "rim_center_std": rim_center_std,
-        "rim_area_std": std_or_default(rim_area, default=0.0),
-
-        "ball_crosses_rim_y": float(crosses_rim_y),
-        "ball_crosses_rim_y_downward": float(crosses_rim_y_downward),
-        "ball_crosses_rim_y_upward": float(crosses_rim_y_upward),
-        "ball_center_inside_rim_rate": mean_or_default(center_inside_values, default=0.0),
-        "ball_center_inside_rim_last_third_rate": mean_or_default(center_inside_last_values, default=0.0),
-        "ball_center_inside_rim_any": float(max(center_inside_values) if center_inside_values else 0.0),
-        "ball_center_inside_rim_last": last_or_default(center_inside_values, default=0.0),
-        "ball_center_inside_expanded_rim_rate": mean_or_default(center_inside_expanded_values, default=0.0),
-        "ball_center_inside_expanded_rim_last_third_rate": mean_or_default(center_inside_expanded_last_values, default=0.0),
-        "ball_center_inside_expanded_rim_any": float(max(center_inside_expanded_values) if center_inside_expanded_values else 0.0),
-        "ball_center_inside_expanded_rim_last": last_or_default(center_inside_expanded_values, default=0.0),
-        "ball_rim_iou_mean": mean_or_default(iou_values, default=0.0),
-        "ball_rim_iou_max": max_or_default(iou_values, default=0.0),
-        "ball_rim_iou_last_third_max": max_or_default(iou_last_values, default=0.0),
-        "ball_passes_close_to_rim_rate": mean_or_default(close_values, default=0.0),
-
-        "ball_relative_speed_mean": mean_or_default(rel_speed_values, default=0.0),
-        "ball_relative_speed_max": max_or_default(rel_speed_values, default=0.0),
-        "ball_relative_vx_mean": mean_or_default(rel_vx_values, default=0.0),
-        "ball_relative_vy_mean": mean_or_default(rel_vy_values, default=0.0),
-        "ball_rim_approach_speed_mean": mean_or_default(approach_values, default=0.0),
-        "ball_rim_approach_speed_max": max_or_default(approach_values, default=0.0),
-        "ball_rim_departure_speed_mean": mean_or_default(departure_values, default=0.0),
-        "ball_rim_departure_speed_max": max_or_default(departure_values, default=0.0),
-    }
-
-    return {name: safe_float(features.get(name, 0.0), default=0.0) for name in TRACKING_FEATURE_NAMES}
-
-def compute_temporal_sequence_features(frame_rows, fps, temporal_feature_names=None):
-    """
-    Converte le detection per-frame in una sequenza [S, K] di feature temporali.
-
-    A differenza delle feature aggregate per clip, questa rappresentazione
-    conserva l'ordine temporale. Include feature di visibilità, geometria
-    palla-canestro, velocità assoluta, velocità relativa palla-rim e proxy
-    dell'ingresso della palla nel ferro.
-    """
-    if temporal_feature_names is None:
-        temporal_feature_names = TEMPORAL_TRACKING_FEATURE_NAMES_TEMP43
-
-    rows = sorted(frame_rows, key=lambda r: int(r["frame_order"]))
-
-    if not rows:
-        return np.zeros((0, len(temporal_feature_names)), dtype=np.float32)
-
-    sequence_rows = []
-    prev_row = None
-    prev_vx = None
-    prev_vy = None
-    prev_speed = None
-
-    for row in rows:
-        ball_detected = int(row["ball_detected"]) == 1
-        rim_detected = int(row["rim_detected"]) == 1
-        both_detected = int(row["both_detected"]) == 1
-
-        ball_vx = 0.0
-        ball_vy = 0.0
-        ball_speed = 0.0
-        ball_ax = 0.0
-        ball_ay = 0.0
-        ball_acceleration = 0.0
-        dist_delta = 0.0
-        rel_vx = 0.0
-        rel_vy = 0.0
-        rel_speed = 0.0
-        approach_speed = 0.0
-        departure_speed = 0.0
-        horizontal_ratio = 0.0
-        vertical_ratio = 0.0
-        crosses_rim_y_frame = 0.0
-        crosses_rim_y_downward_frame = 0.0
-        crosses_rim_y_upward_frame = 0.0
-        current_velocity_valid = False
-
-        if prev_row is not None:
-            delta_frames = int(row["frame_idx"]) - int(prev_row["frame_idx"])
-            dt = delta_frames / fps if fps > 0 and delta_frames > 0 else 0.0
-
-            prev_ball_detected = int(prev_row["ball_detected"]) == 1
-            prev_both_detected = int(prev_row["both_detected"]) == 1
-
-            if dt > 0 and ball_detected and prev_ball_detected:
-                ball_vx = (float(row["ball_xc"]) - float(prev_row["ball_xc"])) / dt
-                ball_vy = (float(row["ball_yc"]) - float(prev_row["ball_yc"])) / dt
-                ball_speed = math.sqrt(ball_vx * ball_vx + ball_vy * ball_vy)
-                den = abs(ball_vx) + abs(ball_vy)
-                horizontal_ratio = abs(ball_vx) / den if den > 1e-12 else 0.0
-                vertical_ratio = abs(ball_vy) / den if den > 1e-12 else 0.0
-                current_velocity_valid = True
-
-                if prev_vx is not None and prev_vy is not None and prev_speed is not None:
-                    ball_ax = (ball_vx - prev_vx) / dt
-                    ball_ay = (ball_vy - prev_vy) / dt
-                    ball_acceleration = (ball_speed - prev_speed) / dt
-
-            if dt > 0 and both_detected and prev_both_detected:
-                dist_delta = (float(row["ball_rim_dist"]) - float(prev_row["ball_rim_dist"])) / dt
-                rel_vx = (float(row["dx"]) - float(prev_row["dx"])) / dt
-                rel_vy = (float(row["dy"]) - float(prev_row["dy"])) / dt
-                rel_speed = math.sqrt(rel_vx * rel_vx + rel_vy * rel_vy)
-                approach_speed = max(0.0, -dist_delta)
-                departure_speed = max(0.0, dist_delta)
-
-                prev_dy = float(prev_row["dy"])
-                curr_dy = float(row["dy"])
-                if abs(prev_dy) > 1e-6 and abs(curr_dy) > 1e-6 and np.sign(prev_dy) != np.sign(curr_dy):
-                    crosses_rim_y_frame = 1.0
-                    if prev_dy < 0 and curr_dy > 0:
-                        crosses_rim_y_downward_frame = 1.0
-                    elif prev_dy > 0 and curr_dy < 0:
-                        crosses_rim_y_upward_frame = 1.0
-
-        feature_values = {
-            "t_rel": float(row["t_rel"]),
-            "ball_detected": float(row["ball_detected"]),
-            "rim_detected": float(row["rim_detected"]),
-            "both_detected": float(row["both_detected"]),
-            "ball_conf": float(row["ball_conf"]),
-            "rim_conf": float(row["rim_conf"]),
-            "ball_xc": float(row["ball_xc"]),
-            "ball_yc": float(row["ball_yc"]),
-            "ball_w": float(row["ball_w"]),
-            "ball_h": float(row["ball_h"]),
-            "ball_area": float(row["ball_area"]),
-            "rim_xc": float(row["rim_xc"]),
-            "rim_yc": float(row["rim_yc"]),
-            "rim_w": float(row["rim_w"]),
-            "rim_h": float(row["rim_h"]),
-            "rim_area": float(row["rim_area"]),
-            "dx": float(row["dx"]),
-            "dy": float(row["dy"]),
-            "ball_rim_dist": float(row["ball_rim_dist"]),
-            "ball_near_rim": float(row["ball_near_rim"]),
-            "ball_above_rim": float(row["ball_above_rim"]),
-            "ball_below_rim": float(row["ball_below_rim"]),
-            "ball_center_inside_rim": float(row.get("ball_center_inside_rim", 0.0)),
-            "ball_center_inside_expanded_rim": float(row.get("ball_center_inside_expanded_rim", 0.0)),
-            "ball_rim_iou": float(row.get("ball_rim_iou", 0.0)),
-            "ball_passes_close_to_rim": float(row.get("ball_passes_close_to_rim", 0.0)),
-            "ball_vx": ball_vx,
-            "ball_vy": ball_vy,
-            "ball_speed": ball_speed,
-            "ball_ax": ball_ax,
-            "ball_ay": ball_ay,
-            "ball_acceleration": ball_acceleration,
-            "ball_motion_horizontal_ratio": horizontal_ratio,
-            "ball_motion_vertical_ratio": vertical_ratio,
-            "ball_rim_dist_delta": dist_delta,
-            "ball_relative_vx": rel_vx,
-            "ball_relative_vy": rel_vy,
-            "ball_relative_speed": rel_speed,
-            "ball_rim_approach_speed": approach_speed,
-            "ball_rim_departure_speed": departure_speed,
-            "ball_crosses_rim_y_frame": crosses_rim_y_frame,
-            "ball_crosses_rim_y_downward_frame": crosses_rim_y_downward_frame,
-            "ball_crosses_rim_y_upward_frame": crosses_rim_y_upward_frame,
-        }
-
-        sequence_rows.append([
-            safe_float(feature_values[name], default=0.0)
-            for name in temporal_feature_names
-        ])
-
-        if current_velocity_valid:
-            prev_vx = ball_vx
-            prev_vy = ball_vy
-            prev_speed = ball_speed
-
-        prev_row = row
-
-    return np.asarray(sequence_rows, dtype=np.float32)
-
-def process_clip(
-    row,
-    model,
-    ball_class_id,
-    rim_class_id,
-    args,
-):
+def process_clip(row, model, ball_class_id, rim_class_id, args):
+    """Estrae detection e sequenza temporale di tracking da una singola clip."""
     video_path = row["video_path"]
-
     frame_count, fps, width, height = get_video_metadata(video_path)
 
     frame_indices = build_frame_indices(
@@ -1048,7 +151,6 @@ def process_clip(
         sample_mode=args.sample_mode,
         last_ratio=args.last_ratio,
     )
-
     frames, valid_indices = read_frames(video_path, frame_indices)
 
     if not frames:
@@ -1073,7 +175,6 @@ def process_clip(
         for local_idx, result in enumerate(results):
             frame_order = start + local_idx
             frame_idx = int(batch_indices[local_idx])
-
             frame_height, frame_width = batch_frames[local_idx].shape[:2]
 
             ball, rim = parse_yolo_result(
@@ -1083,7 +184,6 @@ def process_clip(
                 frame_width=frame_width,
                 frame_height=frame_height,
             )
-
             pair = compute_pair_features(
                 ball=ball,
                 rim=rim,
@@ -1091,59 +191,62 @@ def process_clip(
                 rim_inside_margin=args.rim_inside_margin,
             )
 
-            time_sec = frame_idx / fps if fps > 0 else 0.0
-            t_rel = frame_idx / max(1, frame_count - 1)
+            frame_rows.append(
+                {
+                    "clip_id": row["clip_id"],
+                    "split": row["split"],
+                    "label": row["label"],
+                    "path": row["path"],
+                    "frame_order": frame_order,
+                    "frame_idx": frame_idx,
+                    "time_sec": frame_idx / fps if fps > 0 else 0.0,
+                    "t_rel": frame_idx / max(1, frame_count - 1),
+                    "width": frame_width,
+                    "height": frame_height,
+                    "ball_detected": ball["detected"],
+                    "ball_conf": ball["conf"],
+                    "ball_xc": ball["xc"],
+                    "ball_yc": ball["yc"],
+                    "ball_w": ball["w"],
+                    "ball_h": ball["h"],
+                    "ball_area": ball["area"],
+                    "rim_detected": rim["detected"],
+                    "rim_conf": rim["conf"],
+                    "rim_xc": rim["xc"],
+                    "rim_yc": rim["yc"],
+                    "rim_w": rim["w"],
+                    "rim_h": rim["h"],
+                    "rim_area": rim["area"],
+                    "both_detected": pair["both_detected"],
+                    "dx": pair["dx"],
+                    "dy": pair["dy"],
+                    "ball_rim_dist": pair["dist"],
+                    "ball_above_rim": pair["ball_above_rim"],
+                    "ball_below_rim": pair["ball_below_rim"],
+                    "ball_near_rim": pair["ball_near_rim"],
+                    "ball_center_inside_rim": pair["ball_center_inside_rim"],
+                    "ball_center_inside_expanded_rim": pair["ball_center_inside_expanded_rim"],
+                    "ball_rim_iou": pair["ball_rim_iou"],
+                    "ball_passes_close_to_rim": pair["ball_passes_close_to_rim"],
+                }
+            )
 
-            frame_row = {
-                "clip_id": row["clip_id"],
-                "split": row["split"],
-                "label": row["label"],
-                "path": row["path"],
-                "frame_order": frame_order,
-                "frame_idx": frame_idx,
-                "time_sec": time_sec,
-                "t_rel": t_rel,
-                "width": frame_width,
-                "height": frame_height,
-
-                "ball_detected": ball["detected"],
-                "ball_conf": ball["conf"],
-                "ball_xc": ball["xc"],
-                "ball_yc": ball["yc"],
-                "ball_w": ball["w"],
-                "ball_h": ball["h"],
-                "ball_area": ball["area"],
-
-                "rim_detected": rim["detected"],
-                "rim_conf": rim["conf"],
-                "rim_xc": rim["xc"],
-                "rim_yc": rim["yc"],
-                "rim_w": rim["w"],
-                "rim_h": rim["h"],
-                "rim_area": rim["area"],
-
-                "both_detected": pair["both_detected"],
-                "dx": pair["dx"],
-                "dy": pair["dy"],
-                "ball_rim_dist": pair["dist"],
-                "ball_above_rim": pair["ball_above_rim"],
-                "ball_below_rim": pair["ball_below_rim"],
-                "ball_near_rim": pair["ball_near_rim"],
-                "ball_center_inside_rim": pair["ball_center_inside_rim"],
-                "ball_center_inside_expanded_rim": pair["ball_center_inside_expanded_rim"],
-                "ball_rim_iou": pair["ball_rim_iou"],
-                "ball_passes_close_to_rim": pair["ball_passes_close_to_rim"],
-            }
-
-            frame_rows.append(frame_row)
-
-    clip_features = aggregate_clip_features(
+    temporal_feature_names = TEMPORAL_TRACKING_FEATURE_SETS[args.temporal_feature_set]
+    sequence = compute_temporal_sequence_features(
         frame_rows=frame_rows,
         fps=fps,
-        near_threshold=args.near_threshold,
+        temporal_feature_names=temporal_feature_names,
     )
 
-    clip_row = {
+    sequence_entry = {
+        "clip_id": row["clip_id"],
+        "split": row["split"],
+        "label": row["label"],
+        "path": row["path"],
+        "sequence": sequence,
+    }
+
+    metadata = {
         "clip_id": row["clip_id"],
         "split": row["split"],
         "label": row["label"],
@@ -1155,300 +258,69 @@ def process_clip(
         "video_height": height,
     }
 
-    clip_row.update(clip_features)
-
-    return clip_row, frame_rows
-
-
-def write_csv(path: Path, rows, fieldnames):
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for row in rows:
-            cleaned = {}
-            for key in fieldnames:
-                value = row.get(key, "")
-
-                if isinstance(value, float):
-                    cleaned[key] = f"{value:.8f}"
-                else:
-                    cleaned[key] = value
-
-            writer.writerow(cleaned)
-
-
-def write_temporal_sequences(output_dir: Path, sequence_entries, temporal_feature_names=None):
-    """
-    Salva le sequenze tracking in formato NPZ più un indice JSON path -> array.
-    """
-    if temporal_feature_names is None:
-        temporal_feature_names = TEMPORAL_TRACKING_FEATURE_NAMES_TEMP43
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    npz_path = output_dir / "tracking_sequences.npz"
-    index_path = output_dir / "tracking_sequence_index.json"
-    feature_names_path = output_dir / "tracking_sequence_feature_names.json"
-
-    arrays = {}
-    index = {
-        "type": "temporal_sequence",
-        "npz_path": str(npz_path),
-        "feature_names": temporal_feature_names,
-        "num_features": len(temporal_feature_names),
-        "sequences": {},
-    }
-
-    for array_idx, entry in enumerate(sequence_entries):
-        array_key = f"seq_{array_idx:06d}"
-        arrays[array_key] = entry["sequence"].astype(np.float32)
-
-        normalized_key = normalize_clip_key(entry["path"])
-        index["sequences"][normalized_key] = {
-            "array_key": array_key,
-            "clip_id": entry.get("clip_id", ""),
-            "split": entry.get("split", ""),
-            "label": entry.get("label", ""),
-            "path": entry.get("path", ""),
-            "sampled_frames": int(entry["sequence"].shape[0]),
-        }
-
-    np.savez_compressed(npz_path, **arrays)
-
-    with open(index_path, "w", encoding="utf-8") as f:
-        json.dump(index, f, indent=2, ensure_ascii=False)
-
-    with open(feature_names_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "feature_names": temporal_feature_names,
-                "num_features": len(temporal_feature_names),
-            },
-            f,
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    return npz_path, index_path, feature_names_path
+    return sequence_entry, frame_rows, metadata
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Estrae feature di tracking palla/canestro da tutte le clip del dataset "
-            "usando un detector YOLO addestrato su ball/rim. Di default processa "
-            "train, val e test e tutte le 9 classi."
+            "Estrae sequenze temporali di tracking palla/canestro da tutte le clip "
+            "del dataset usando un detector YOLO addestrato su ball/rim."
         )
     )
 
-    parser.add_argument(
-        "--dataset-root",
-        type=str,
-        default=DEFAULT_DATASET_ROOT,
-        help="Root del dataset video.",
-    )
-
-    parser.add_argument(
-        "--manifest",
-        type=str,
-        default=DEFAULT_MANIFEST,
-        help="Path al manifest.csv del dataset.",
-    )
-
-    parser.add_argument(
-        "--yolo-weights",
-        type=str,
-        default=DEFAULT_YOLO_WEIGHTS,
-        help="Path al best.pt del detector ball/rim.",
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Cartella in cui salvare tracking_features.csv e gli altri output.",
-    )
-
-    parser.add_argument(
-        "--splits",
-        nargs="+",
-        default=ALL_SPLITS,
-        choices=["train", "val", "test"],
-        help="Split da processare. Default: train val test.",
-    )
-
-    parser.add_argument(
-        "--labels",
-        nargs="+",
-        default=ALL_LABELS,
-        help="Label da includere. Default: tutte le 9 classi del dataset.",
-    )
-
+    parser.add_argument("--dataset-root", type=str, default=DEFAULT_DATASET_ROOT)
+    parser.add_argument("--manifest", type=str, default=DEFAULT_MANIFEST)
+    parser.add_argument("--yolo-weights", type=str, default=DEFAULT_YOLO_WEIGHTS)
+    parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--splits", nargs="+", default=ALL_SPLITS, choices=ALL_SPLITS)
+    parser.add_argument("--labels", nargs="+", default=ALL_LABELS)
     parser.add_argument(
         "--num-frames",
         type=int,
         default=48,
-        help=(
-            "Numero di frame campionati per clip. "
-            "Default: 48. Usa 0 per processare tutti i frame di ogni clip."
-        ),
+        help="Numero di frame campionati per clip. Usa 0 per processare tutti i frame.",
     )
-
     parser.add_argument(
         "--sample-mode",
         type=str,
         default="uniform",
         choices=["uniform", "last"],
-        help=(
-            "uniform = campiona su tutta la clip; "
-            "last = campiona solo nella parte finale definita da --last-ratio."
-        ),
+        help="uniform = tutta la clip; last = solo la parte finale definita da --last-ratio.",
     )
-
-    parser.add_argument(
-        "--last-ratio",
-        type=float,
-        default=0.50,
-        help="Usato solo con --sample-mode last. 0.50 = usa l'ultima metà della clip.",
-    )
-
-    parser.add_argument(
-        "--imgsz",
-        type=int,
-        default=1280,
-        help="Risoluzione YOLO in inferenza.",
-    )
-
-    parser.add_argument(
-        "--conf",
-        type=float,
-        default=0.10,
-        help="Soglia di confidenza YOLO. Bassa per non perdere la palla.",
-    )
-
-    parser.add_argument(
-        "--iou",
-        type=float,
-        default=0.50,
-        help="Soglia IoU per NMS.",
-    )
-
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="0",
-        help="Device YOLO. Esempio: 0 oppure cpu.",
-    )
-
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=16,
-        help="Numero di frame processati insieme da YOLO.",
-    )
-
-    parser.add_argument(
-        "--ball-class-name",
-        type=str,
-        default="ball",
-        help="Nome classe palla nel modello YOLO.",
-    )
-
-    parser.add_argument(
-        "--rim-class-name",
-        type=str,
-        default="rim",
-        help="Nome classe canestro/ferro nel modello YOLO.",
-    )
-
-    parser.add_argument(
-        "--ball-class-id",
-        type=int,
-        default=None,
-        help="ID classe ball. Se non indicato, viene ricavato dal nome.",
-    )
-
-    parser.add_argument(
-        "--rim-class-id",
-        type=int,
-        default=None,
-        help="ID classe rim. Se non indicato, viene ricavato dal nome.",
-    )
-
-    parser.add_argument(
-        "--near-threshold",
-        type=float,
-        default=0.12,
-        help=(
-            "Distanza normalizzata sotto cui la palla è considerata vicina al rim. "
-            "La distanza è calcolata sui centri normalizzati."
-        ),
-    )
-
-    parser.add_argument(
-        "--rim-inside-margin",
-        type=float,
-        default=0.15,
-        help=(
-            "Margine relativo usato per espandere il bbox del rim quando si calcola "
-            "il proxy ball_center_inside_expanded_rim. 0.15 = espansione del 15% "
-            "della larghezza/altezza del bbox per lato."
-        ),
-    )
-
-    parser.add_argument(
-        "--max-clips",
-        type=int,
-        default=None,
-        help="Limita il numero di clip processate. Utile per test rapido.",
-    )
-
+    parser.add_argument("--last-ratio", type=float, default=0.50)
+    parser.add_argument("--imgsz", type=int, default=1280)
+    parser.add_argument("--conf", type=float, default=0.10)
+    parser.add_argument("--iou", type=float, default=0.50)
+    parser.add_argument("--device", type=str, default="0")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--ball-class-name", type=str, default="ball")
+    parser.add_argument("--rim-class-name", type=str, default="rim")
+    parser.add_argument("--ball-class-id", type=int, default=None)
+    parser.add_argument("--rim-class-id", type=int, default=None)
+    parser.add_argument("--near-threshold", type=float, default=0.12)
+    parser.add_argument("--rim-inside-margin", type=float, default=0.15)
+    parser.add_argument("--max-clips", type=int, default=None)
     parser.add_argument(
         "--save-per-frame",
         action="store_true",
-        help="Salva anche per_frame_detections.csv. Può essere grande.",
+        help="Salva anche per_frame_detections.csv. Utile per debug, ma può essere grande.",
     )
-
-    temporal_group = parser.add_mutually_exclusive_group()
-    temporal_group.add_argument(
-        "--save-temporal-sequences",
-        dest="save_temporal_sequences",
-        action="store_true",
-        help=(
-            "Salva tracking_sequences.npz e tracking_sequence_index.json, "
-            "cioè feature palla/canestro per-frame utilizzabili come tracking temporale."
-        ),
-    )
-    temporal_group.add_argument(
-        "--no-save-temporal-sequences",
-        dest="save_temporal_sequences",
-        action="store_false",
-        help="Disabilita il salvataggio delle sequenze temporali.",
-    )
-    parser.set_defaults(save_temporal_sequences=True)
-
     parser.add_argument(
         "--temporal-feature-set",
         type=str,
         default="temp43",
         choices=sorted(TEMPORAL_TRACKING_FEATURE_SETS.keys()),
-        help=(
-            "Set di feature temporali da salvare. "
-            "temp29 mantiene la compatibilita' con i checkpoint storici; "
-            "temp43 usa la versione estesa corrente."
-        ),
+        help="Set di feature temporali da salvare: temp29 o temp43.",
     )
+    parser.add_argument("--overwrite", action="store_true")
 
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Permette di sovrascrivere file già esistenti.",
-    )
+    # Opzione mantenuta solo per compatibilità con i comandi vecchi: ora le
+    # sequenze temporali vengono sempre salvate.
+    parser.add_argument("--save-temporal-sequences", action="store_true", help=argparse.SUPPRESS)
 
     return parser.parse_args()
+
 
 def main():
     args = parse_args()
@@ -1462,19 +334,10 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     results_path = output_dir / "extract_tracking_results.txt"
-    tracking_csv_path = output_dir / "tracking_features.csv"
     per_frame_csv_path = output_dir / "per_frame_detections.csv"
-    feature_names_path = output_dir / "tracking_feature_names.json"
     tracking_sequences_npz_path = output_dir / "tracking_sequences.npz"
-    tracking_sequence_index_path = output_dir / "tracking_sequence_index.json"
 
-    if tracking_csv_path.exists() and not args.overwrite:
-        raise FileExistsError(
-            f"File già esistente: {tracking_csv_path}. "
-            "Usa --overwrite per rigenerarlo."
-        )
-
-    if args.save_temporal_sequences and tracking_sequences_npz_path.exists() and not args.overwrite:
+    if tracking_sequences_npz_path.exists() and not args.overwrite:
         raise FileExistsError(
             f"File già esistente: {tracking_sequences_npz_path}. "
             "Usa --overwrite per rigenerarlo."
@@ -1491,7 +354,8 @@ def main():
             print(f"File log: {results_path}")
             print("\n# Configurazione")
             for key, value in vars(args).items():
-                print(f"{key}: {value}")
+                if key != "save_temporal_sequences":
+                    print(f"{key}: {value}")
             print(f"temporal_feature_count: {len(temporal_feature_names)}")
 
             print("\n# Controllo path")
@@ -1502,30 +366,18 @@ def main():
 
             if not dataset_root.exists():
                 raise FileNotFoundError(f"Dataset root non trovato: {dataset_root}")
-
             if not manifest_path.exists():
                 raise FileNotFoundError(f"Manifest non trovato: {manifest_path}")
-
             if not yolo_weights.exists():
                 raise FileNotFoundError(f"Pesi YOLO non trovati: {yolo_weights}")
 
             print("\n# Caricamento YOLO")
             model = YOLO(str(yolo_weights))
-
             model_names = get_model_names(model)
             print(f"Classi YOLO: {model_names}")
 
-            ball_class_id = resolve_class_id(
-                model,
-                class_name=args.ball_class_name,
-                explicit_id=args.ball_class_id,
-            )
-            rim_class_id = resolve_class_id(
-                model,
-                class_name=args.rim_class_name,
-                explicit_id=args.rim_class_id,
-            )
-
+            ball_class_id = resolve_class_id(model, args.ball_class_name, args.ball_class_id)
+            rim_class_id = resolve_class_id(model, args.rim_class_name, args.rim_class_id)
             print(f"ball_class_id: {ball_class_id}")
             print(f"rim_class_id: {rim_class_id}")
 
@@ -1537,7 +389,6 @@ def main():
                 labels=set(args.labels),
                 max_clips=args.max_clips,
             )
-
             print(f"Clip selezionate: {len(rows)}")
 
             if not rows:
@@ -1548,185 +399,89 @@ def main():
             for (split, label), count in sorted(counts.items()):
                 print(f"{split:5s} | {label:12s} | {count}")
 
-            clip_rows = []
+            sequence_entries = []
             all_frame_rows = []
-            temporal_sequence_entries = []
+            processed_metadata = []
             errors = []
 
-            print("\n# Estrazione feature")
+            print("\n# Estrazione sequenze temporali")
             for idx, row in enumerate(rows, start=1):
-                print(
-                    f"[{idx}/{len(rows)}] "
-                    f"{row['split']} | {row['label']} | {row['path']}"
-                )
+                print(f"[{idx}/{len(rows)}] {row['split']} | {row['label']} | {row['path']}")
 
                 if not row["video_path"].exists():
                     msg = f"Video non trovato: {row['video_path']}"
                     print(f"[WARN] {msg}")
                     errors.append(
-                        {
-                            "path": row["path"],
-                            "label": row["label"],
-                            "split": row["split"],
-                            "error": msg,
-                        }
+                        {"path": row["path"], "label": row["label"], "split": row["split"], "error": msg}
                     )
                     continue
 
                 try:
-                    clip_row, frame_rows = process_clip(
+                    sequence_entry, frame_rows, metadata = process_clip(
                         row=row,
                         model=model,
                         ball_class_id=ball_class_id,
                         rim_class_id=rim_class_id,
                         args=args,
                     )
-
-                    clip_rows.append(clip_row)
+                    sequence_entries.append(sequence_entry)
+                    processed_metadata.append(metadata)
 
                     if args.save_per_frame:
                         all_frame_rows.extend(frame_rows)
 
-                    if args.save_temporal_sequences:
-                        temporal_sequence = compute_temporal_sequence_features(
-                            frame_rows=frame_rows,
-                            fps=float(clip_row.get("fps", 25.0)),
-                            temporal_feature_names=temporal_feature_names,
-                        )
-                        temporal_sequence_entries.append(
-                            {
-                                "clip_id": clip_row["clip_id"],
-                                "split": clip_row["split"],
-                                "label": clip_row["label"],
-                                "path": clip_row["path"],
-                                "sequence": temporal_sequence,
-                            }
-                        )
-
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     msg = f"{type(exc).__name__}: {exc}"
                     print(f"[WARN] Errore su clip {row['path']}: {msg}")
                     errors.append(
-                        {
-                            "path": row["path"],
-                            "label": row["label"],
-                            "split": row["split"],
-                            "error": msg,
-                        }
+                        {"path": row["path"], "label": row["label"], "split": row["split"], "error": msg}
                     )
 
-            if not clip_rows:
-                raise RuntimeError("Nessuna feature estratta correttamente.")
+            if not sequence_entries:
+                raise RuntimeError("Nessuna sequenza temporale estratta correttamente.")
 
             print("\n# Salvataggio output")
-
-            metadata_fields = [
-                "clip_id",
-                "split",
-                "label",
-                "path",
-                "video_frames",
-                "fps",
-                "sampled_frames",
-                "video_width",
-                "video_height",
-            ]
-
-            write_csv(
-                path=tracking_csv_path,
-                rows=clip_rows,
-                fieldnames=metadata_fields + TRACKING_FEATURE_NAMES,
+            npz_path, index_path, sequence_feature_names_path = write_temporal_sequences(
+                output_dir=output_dir,
+                sequence_entries=sequence_entries,
+                temporal_feature_names=temporal_feature_names,
             )
+            print(f"Sequenze tracking temporali salvate in: {npz_path}")
+            print(f"Indice sequenze tracking salvato in: {index_path}")
+            print(f"Nomi feature tracking temporali salvati in: {sequence_feature_names_path}")
 
-            print(f"Feature per clip salvate in: {tracking_csv_path}")
-
-            with open(feature_names_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "feature_names": TRACKING_FEATURE_NAMES,
-                        "num_features": len(TRACKING_FEATURE_NAMES),
-                    },
-                    f,
-                    indent=2,
-                    ensure_ascii=False,
-                )
-
-            print(f"Nomi feature salvati in: {feature_names_path}")
-
-            if args.save_per_frame:
-                frame_fields = [
+            metadata_path = output_dir / "processed_clips.csv"
+            write_csv(
+                path=metadata_path,
+                rows=processed_metadata,
+                fieldnames=[
                     "clip_id",
                     "split",
                     "label",
                     "path",
-                    "frame_order",
-                    "frame_idx",
-                    "time_sec",
-                    "t_rel",
-                    "width",
-                    "height",
-                    "ball_detected",
-                    "ball_conf",
-                    "ball_xc",
-                    "ball_yc",
-                    "ball_w",
-                    "ball_h",
-                    "ball_area",
-                    "rim_detected",
-                    "rim_conf",
-                    "rim_xc",
-                    "rim_yc",
-                    "rim_w",
-                    "rim_h",
-                    "rim_area",
-                    "both_detected",
-                    "dx",
-                    "dy",
-                    "ball_rim_dist",
-                    "ball_above_rim",
-                    "ball_below_rim",
-                    "ball_near_rim",
-                    "ball_center_inside_rim",
-                    "ball_center_inside_expanded_rim",
-                    "ball_rim_iou",
-                    "ball_passes_close_to_rim",
-                ]
+                    "video_frames",
+                    "fps",
+                    "sampled_frames",
+                    "video_width",
+                    "video_height",
+                ],
+            )
+            print(f"Metadata clip processate salvati in: {metadata_path}")
 
-                write_csv(
-                    path=per_frame_csv_path,
-                    rows=all_frame_rows,
-                    fieldnames=frame_fields,
-                )
-
+            if args.save_per_frame:
+                write_csv(path=per_frame_csv_path, rows=all_frame_rows, fieldnames=PER_FRAME_FIELDS)
                 print(f"Detection per frame salvate in: {per_frame_csv_path}")
-
-            if args.save_temporal_sequences:
-                npz_path, index_path, sequence_feature_names_path = write_temporal_sequences(
-                    output_dir=output_dir,
-                    sequence_entries=temporal_sequence_entries,
-                    temporal_feature_names=temporal_feature_names,
-                )
-                print(f"Sequenze tracking temporali salvate in: {npz_path}")
-                print(f"Indice sequenze tracking salvato in: {index_path}")
-                print(f"Nomi feature tracking temporali salvati in: {sequence_feature_names_path}")
 
             if errors:
                 errors_path = output_dir / "errors.csv"
-                write_csv(
-                    path=errors_path,
-                    rows=errors,
-                    fieldnames=["split", "label", "path", "error"],
-                )
+                write_csv(path=errors_path, rows=errors, fieldnames=["split", "label", "path", "error"])
                 print(f"Errori salvati in: {errors_path}")
 
             print("\n# Riepilogo")
-            print(f"Clip processate correttamente: {len(clip_rows)}")
+            print(f"Clip processate correttamente: {len(sequence_entries)}")
             print(f"Clip con errore: {len(errors)}")
-            print(f"Numero feature tracking aggregate: {len(TRACKING_FEATURE_NAMES)}")
-            if args.save_temporal_sequences:
-                print(f"Set feature tracking temporali: {args.temporal_feature_set}")
-                print(f"Numero feature tracking temporali per frame: {len(temporal_feature_names)}")
-                print(f"Sequenze temporali salvate: {len(temporal_sequence_entries)}")
+            print(f"Set feature tracking temporali: {args.temporal_feature_set}")
+            print(f"Numero feature tracking temporali per frame: {len(temporal_feature_names)}")
 
         except Exception:
             print("\nERRORE DURANTE L'ESECUZIONE:", file=sys.stderr)

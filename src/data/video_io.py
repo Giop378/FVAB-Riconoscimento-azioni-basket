@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import cv2
-import torch  # Attualmente non usato in questo file; può essere rimosso se non serve altrove.
 from PIL import Image
 
 
