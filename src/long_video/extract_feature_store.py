@@ -1,3 +1,21 @@
+# =============================================================================
+# Questo script crea la feature store utilizzata dalla pipeline long-video
+# exp_long_13/exp_46 a partire da un segmento di video continuo. In pratica:
+# 1) apre il video e seleziona tutti i frame reali compresi in [start_sec, end_sec);
+# 2) salva timestamp e indici frame, così gli step successivi possono ricostruire
+#    finestre temporali senza dover rieseguire la decodifica video;
+# 3) estrae per ogni frame una feature DINOv3 frame-level, compatibile con il
+#    modello gerarchico usato nelle clip;
+# 4) esegue YOLO v1 e YOLO v2 sugli stessi frame per salvare primitive normalizzate
+#    di palla e canestro;
+# 5) scrive file .npy/.npz e metadata.json in output, che saranno poi letti da
+#    build_windows_from_store.py e dall'inferenza long-video.
+#
+# Lo script non produce eventi finali: prepara soltanto le rappresentazioni
+# intermedie pesanti, in modo che l'inferenza e il post-processing possano essere
+# rieseguiti più volte senza ripetere DINOv3/YOLO.
+# =============================================================================
+
 from __future__ import annotations
 
 import argparse
@@ -64,6 +82,9 @@ PRIMITIVE_FIELDS = [
 # =============================================================================
 
 
+# Costruisce la corrispondenza frame <-> timestamp del segmento da processare.
+# La scelta train-like è usare tutti i frame sorgente, senza ricampionamento.
+
 def make_source_frame_grid(
     start_sec: float,
     end_sec: float,
@@ -101,6 +122,9 @@ def make_source_frame_grid(
     timestamps = frame_indices.astype(np.float64) / float(source_fps)
     return timestamps.astype(np.float64), frame_indices.astype(np.int64)
 
+
+# Decodifica il video in batch seguendo gli indici reali calcolati prima.
+# Questo evita di caricare l'intero segmento in RAM e mantiene l'ordine temporale.
 
 def iter_frame_batches(
     video_path: Path,
@@ -170,6 +194,8 @@ def iter_frame_batches(
 # =============================================================================
 
 
+# Inizializza gli array delle primitive YOLO per tutti i frame del segmento.
+
 def init_primitives(num_samples: int) -> dict[str, np.ndarray]:
     data: dict[str, np.ndarray] = {}
     for field in PRIMITIVE_FIELDS:
@@ -179,6 +205,10 @@ def init_primitives(num_samples: int) -> dict[str, np.ndarray]:
             data[field] = np.zeros((num_samples,), dtype=np.float32)
     return data
 
+
+# Salva la migliore detection di una classe YOLO in formato normalizzato.
+# Le coordinate xyxy vengono limitate ai bordi del frame e convertite in
+# centro/larghezza/altezza relativi alla dimensione dell'immagine.
 
 def update_detection_for_class(
     primitives: dict[str, np.ndarray],
@@ -211,6 +241,9 @@ def update_detection_for_class(
     primitives[f"{prefix}_h"][global_pos] = h_px / fh
 
 
+# Carica un modello YOLO Ultralytics dai pesi indicati e controlla che il file
+# esista prima dell'inizializzazione, così gli errori di configurazione emergono subito.
+
 def load_yolo_model(weights_path: Path) -> Any:
     ensure_exists(weights_path, "Pesi YOLO", must_be_file=True)
     try:
@@ -221,6 +254,9 @@ def load_yolo_model(weights_path: Path) -> Any:
         ) from exc
     return YOLO(str(weights_path))
 
+
+# Esegue YOLO su un batch di frame e aggiorna le primitive palla/canestro.
+# Per ogni frame e per ogni classe viene mantenuta solo la detection con confidence più alta.
 
 def run_yolo_on_frames(
     model: Any,
@@ -295,6 +331,9 @@ def run_yolo_on_frames(
 # =============================================================================
 
 
+# Scrive su disco le primitive YOLO insieme a timestamp e indici frame.
+# Il formato compresso .npz riduce lo spazio occupato mantenendo accesso semplice tramite NumPy.
+
 def save_primitives_npz(
     path: Path,
     primitives: dict[str, np.ndarray],
@@ -308,6 +347,9 @@ def save_primitives_npz(
         **primitives,
     )
 
+
+# Raccoglie in metadata.json le informazioni necessarie a riprodurre e verificare
+# la feature store: video sorgente, campionamento, modelli, parametri runtime e file creati.
 
 def write_metadata(
     output_dir: Path,
@@ -390,6 +432,9 @@ def write_metadata(
 # =============================================================================
 
 
+# Definisce l'interfaccia da riga di comando, includendo path, segmento video,
+# batch size, device e parametri dei modelli DINOv3/YOLO.
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -445,6 +490,9 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Normalizza e valida gli argomenti prima di avviare operazioni costose.
+# Controlla esistenza dei file, range temporale, batch size e coerenza della dimensione DINOv3.
+
 def validate_args(args: argparse.Namespace) -> None:
     args.input_video = as_path(args.input_video)
     args.output_dir = as_path(args.output_dir)
@@ -481,13 +529,18 @@ def validate_args(args: argparse.Namespace) -> None:
         )
 
 
+# Coordina l'intera pipeline: validazione input, preparazione output, estrazione
+# DINOv3/YOLO frame-level, salvataggio degli artefatti e stampa del riepilogo finale.
+
 def main() -> None:
     args = make_parser().parse_args()
     started_at = time.time()
     validate_args(args)
 
+    # Prepara la cartella di output e, se richiesto, elimina risultati precedenti.
     prepare_output_dir(args.output_dir, overwrite=args.overwrite, clear_if_exists=True)
 
+    # Legge metadati del video per validare il segmento e costruire la griglia frame.
     video_info = get_video_info(args.input_video)
     if args.end_sec > video_info.duration_sec:
         raise ValueError(
@@ -495,6 +548,7 @@ def main() -> None:
             f"durata={video_info.duration_sec:.3f}"
         )
 
+    # Crea timestamp e indici dei frame reali da processare nel segmento richiesto.
     timestamps, frame_indices = make_source_frame_grid(
         start_sec=float(args.start_sec),
         end_sec=float(args.end_sec),
@@ -502,6 +556,7 @@ def main() -> None:
         num_video_frames=int(video_info.num_frames),
     )
 
+    # Salva subito la base temporale della feature store, usata dagli step successivi.
     np.save(args.output_dir / "timestamps.npy", timestamps)
     np.save(args.output_dir / "frame_indices.npy", frame_indices)
 
@@ -515,6 +570,7 @@ def main() -> None:
     print(f"num samples: {len(timestamps)}")
     print(f"output_dir: {args.output_dir}")
 
+    # Converte lo stesso argomento --device nei formati richiesti da PyTorch e YOLO.
     torch_device = parse_device_for_torch(args.device)
     yolo_device = parse_device_for_yolo(args.device)
 
@@ -528,6 +584,7 @@ def main() -> None:
     print("output:      x_norm_clstoken")
     print(f"amp:         {USE_AMP_DINO}")
 
+    # Inizializza DINOv3 e crea il memmap delle feature per scrivere progressivamente su disco.
     dino_model = DINOv3FeatureExtractor(
         model_name=args.dino_model_name,
         weights=args.dino_weights,
@@ -548,11 +605,13 @@ def main() -> None:
     print(f"YOLO v2 weights: {args.yolo_v2_weights}")
     print(f"imgsz/conf/iou:  {args.imgsz} / {args.conf} / {args.iou}")
 
+    # Carica entrambi i detector YOLO e prepara array separati per le rispettive primitive.
     yolo_v1_model = load_yolo_model(args.yolo_v1_weights)
     yolo_v2_model = load_yolo_model(args.yolo_v2_weights)
     yolo_v1_primitives = init_primitives(len(timestamps))
     yolo_v2_primitives = init_primitives(len(timestamps))
 
+    # Crea un iteratore batch-wise dei frame e una progress bar per monitorare l'estrazione.
     iterator = iter_frame_batches(
         video_path=args.input_video,
         frame_indices=frame_indices,
@@ -564,7 +623,9 @@ def main() -> None:
         desc="Feature store exp_long_13",
     )
 
+    # Per ogni batch decodificato, le stesse immagini alimentano DINOv3 e i due YOLO.
     for batch_positions, frames_bgr in progress:
+        # Estrae feature DINOv3 frame-level e le scrive nelle righe corrispondenti del memmap.
         feats = extract_dino_features_for_frames(
             frames_bgr=frames_bgr,
             model=dino_model,
@@ -580,6 +641,7 @@ def main() -> None:
             )
         dino_features[batch_positions] = feats
 
+        # Estrae primitive palla/canestro con YOLO v1 per tutti i frame del batch.
         run_yolo_on_frames(
             model=yolo_v1_model,
             frames_bgr=frames_bgr,
@@ -594,6 +656,7 @@ def main() -> None:
             ball_class_id=int(args.ball_class_id),
             rim_class_id=int(args.rim_class_id),
         )
+        # Estrae primitive palla/canestro con YOLO v2 sugli stessi frame, per supportare L1/L2.
         run_yolo_on_frames(
             model=yolo_v2_model,
             frames_bgr=frames_bgr,
@@ -609,9 +672,11 @@ def main() -> None:
             rim_class_id=int(args.rim_class_id),
         )
 
+    # Forza la scrittura su disco del memmap DINO prima di chiudere il riferimento.
     dino_features.flush()
     del dino_features
 
+    # Salva le primitive YOLO v1/v2 in file separati, mantenendo timestamp e frame_indices comuni.
     save_primitives_npz(
         args.output_dir / "yolo_v1_primitives.npz",
         yolo_v1_primitives,
@@ -625,6 +690,7 @@ def main() -> None:
         frame_indices=frame_indices,
     )
 
+    # Scrive il riepilogo completo della feature store per tracciabilità e debugging.
     write_metadata(
         output_dir=args.output_dir,
         args=args,

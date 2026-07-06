@@ -1,3 +1,16 @@
+# =============================================================================
+# Questo modulo raccoglie funzioni di utilità condivise dalla pipeline long-video
+# BasketAR. Il file non implementa direttamente feature extraction, inferenza o
+# valutazione, ma fornisce mattoni comuni usati dagli altri script: gestione dei
+# path, controlli sugli output, lettura/scrittura JSON, conversioni numeriche
+# robuste, lettura dei metadati video, selezione del device e metriche temporali.
+#
+# L'obiettivo è evitare duplicazione di codice tra gli script principali e
+# rendere più sicura la pipeline: ogni funzione esegue controlli espliciti sugli
+# input, produce errori leggibili e mantiene coerenti le convenzioni usate negli
+# esperimenti exp_long_13 / exp_46.
+# =============================================================================
+
 from __future__ import annotations
 
 import json
@@ -13,8 +26,13 @@ import numpy as np
 # =============================================================================
 # Path e file system
 # =============================================================================
+# Funzioni dedicate alla normalizzazione dei path e alla gestione sicura degli
+# artefatti prodotti dalla pipeline. Sono usate per evitare errori silenziosi
+# quando mancano file/cartelle o quando un output rischia di essere sovrascritto.
 
 
+# Converte gli argomenti CLI o di default in Path, mantenendo None quando un
+# parametro è opzionale.
 def as_path(value: str | Path | None) -> Path | None:
     """Converte stringhe/path in pathlib.Path, lasciando None invariato."""
     if value is None:
@@ -24,6 +42,8 @@ def as_path(value: str | Path | None) -> Path | None:
     return Path(value)
 
 
+# Centralizza i controlli di esistenza e tipo del path: file, cartella o path
+# generico. In questo modo gli script falliscono subito con messaggi chiari.
 def ensure_exists(path: Path, name: str, must_be_file: bool | None = None) -> None:
     """Verifica che un path esista e, opzionalmente, che sia file o cartella."""
     if not path.exists():
@@ -34,6 +54,9 @@ def ensure_exists(path: Path, name: str, must_be_file: bool | None = None) -> No
         raise NotADirectoryError(f"{name} dovrebbe essere una cartella: {path}")
 
 
+# Prepara directory di output per step che producono blocchi completi di file.
+# Le opzioni permettono sia di richiedere cartelle vuote sia di ricrearle da zero
+# quando viene passato --overwrite.
 def prepare_output_dir(
     output_dir: Path,
     overwrite: bool = False,
@@ -76,6 +99,8 @@ def prepare_output_dir(
     output_dir.mkdir(parents=True, exist_ok=True)
 
 
+# Controlla solo specifici file di output, utile quando una cartella contiene
+# più artefatti storici ma lo script deve proteggere solo i file che genererà.
 def check_output_files(
     output_dir: Path,
     output_files: Iterable[str | Path],
@@ -109,6 +134,8 @@ def check_output_files(
                 path.unlink()
 
 
+# Variante per un singolo file: crea la cartella padre e impedisce overwrite
+# accidentali se l'utente non lo richiede esplicitamente.
 def prepare_output_file(output_path: Path, overwrite: bool = False) -> None:
     """Prepara un singolo file di output, creando la cartella padre se necessario."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,8 +151,12 @@ def prepare_output_file(output_path: Path, overwrite: bool = False) -> None:
 # =============================================================================
 # JSON e conversioni sicure
 # =============================================================================
+# Utility per rendere serializzabili gli oggetti prodotti da NumPy/Pandas e per
+# convertire valori potenzialmente sporchi senza interrompere l'intera pipeline.
 
 
+# Normalizza ricorsivamente strutture contenenti ndarray, scalari NumPy, NaN e
+# Inf prima della scrittura dei metadati JSON.
 def json_sanitize(value: Any) -> Any:
     """Converte oggetti NumPy/NaN/Inf in valori compatibili con JSON."""
     if isinstance(value, dict):
@@ -145,6 +176,8 @@ def json_sanitize(value: Any) -> Any:
     return value
 
 
+# Lettura JSON con validazione del tipo atteso: nella pipeline i metadati sono
+# sempre dizionari, quindi altri formati vengono segnalati come errore.
 def read_json(path: Path) -> dict[str, Any]:
     """Legge un JSON e verifica che il contenuto sia un dizionario."""
     ensure_exists(path, "JSON", must_be_file=True)
@@ -155,6 +188,8 @@ def read_json(path: Path) -> dict[str, Any]:
     return data
 
 
+# Scrittura JSON robusta: crea la directory padre e applica json_sanitize per
+# evitare errori dovuti a tipi NumPy o valori non finiti.
 def write_json(path: Path, data: dict[str, Any], *, indent: int = 2) -> None:
     """Scrive un dizionario JSON gestendo automaticamente valori NumPy e NaN."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,6 +199,8 @@ def write_json(path: Path, data: dict[str, Any], *, indent: int = 2) -> None:
     )
 
 
+# Conversione numerica difensiva usata nei punti in cui CSV e metadati possono
+# contenere valori mancanti, stringhe non valide o NaN/Inf.
 def safe_float(value: Any, default: float = 0.0) -> float:
     """Converte un valore in float, tornando default in caso di errore o valore non finito."""
     try:
@@ -175,6 +212,7 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     return float(out)
 
 
+# Conversione a intero con fallback, utile per id di eventi/frame letti da CSV.
 def safe_int(value: Any, default: int = 0) -> int:
     """Converte un valore in int, tornando default in caso di errore."""
     try:
@@ -183,11 +221,15 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+# Combina conversione sicura e arrotondamento per avere output CSV/diagnostici
+# più stabili e leggibili.
 def round_float(value: Any, ndigits: int = 6, default: float = 0.0) -> float:
     """Converte un valore in float sicuro e lo arrotonda."""
     return round(safe_float(value, default=default), ndigits)
 
 
+# Parser CLI per parametri temporali opzionali: consente di passare valori
+# testuali come 'none' quando si vuole usare un default calcolato a runtime.
 def parse_optional_float(value: str | None) -> float | None:
     """Parsing CLI per float opzionali: '', 'none' e 'null' diventano None."""
     if value is None:
@@ -201,8 +243,12 @@ def parse_optional_float(value: str | None) -> float | None:
 # =============================================================================
 # Video
 # =============================================================================
+# Utility per leggere informazioni minime sui video senza duplicare codice OpenCV
+# negli script che estraggono feature o renderizzano preview.
 
 
+# Struttura immutabile con i metadati video necessari alla pipeline: fps, numero
+# di frame, risoluzione e durata.
 @dataclass(frozen=True)
 class VideoInfo:
     fps: float
@@ -212,6 +258,8 @@ class VideoInfo:
     duration_sec: float
 
 
+# Apre il video con OpenCV, legge i metadati principali e li valida per evitare
+# divisioni per zero o segmenti temporali non coerenti.
 def get_video_info(video_path: Path) -> VideoInfo:
     """Legge metadati base di un video con OpenCV."""
     ensure_exists(video_path, "Video", must_be_file=True)
@@ -244,6 +292,7 @@ def get_video_info(video_path: Path) -> VideoInfo:
     )
 
 
+# Formattazione compatta usata nei log e negli overlay della preview video.
 def format_time(seconds: float) -> str:
     """Formatta secondi in mm:ss.xx."""
     seconds = max(float(seconds), 0.0)
@@ -255,8 +304,12 @@ def format_time(seconds: float) -> str:
 # =============================================================================
 # Device e riproducibilità artefatti
 # =============================================================================
+# Funzioni per interpretare in modo uniforme il device indicato da CLI e, quando
+# serve, calcolare hash dei file per debug/riproducibilità degli artefatti.
 
 
+# Traduce la stringa passata da CLI nel torch.device corretto. Se CUDA non è
+# disponibile, passa automaticamente alla CPU con un warning esplicito.
 def parse_device_for_torch(device: str):
     """Restituisce torch.device da stringa CLI: 'cpu', 'cuda', 'cuda:0' oppure '0'."""
     import torch  # import locale per non obbligare PyTorch negli script leggeri
@@ -274,6 +327,8 @@ def parse_device_for_torch(device: str):
     return torch.device("cpu")
 
 
+# Adatta il formato del device a quello richiesto da Ultralytics YOLO, che usa
+# ad esempio '0' invece di 'cuda:0'.
 def parse_device_for_yolo(device: str) -> str:
     """Converte il device CLI nel formato atteso da ultralytics YOLO."""
     device = str(device)
@@ -282,6 +337,8 @@ def parse_device_for_yolo(device: str) -> str:
     return device.replace("cuda:", "")
 
 
+# Calcola un digest del file a blocchi, così può gestire anche checkpoint o
+# artefatti grandi senza caricarli interamente in memoria.
 def file_sha256(path: Path | None, chunk_size: int = 1024 * 1024) -> str | None:
     """Calcola SHA256 di un file. Utile per metadati/debug, ma non necessario alla pipeline."""
     if path is None or not path.exists() or not path.is_file():
@@ -302,8 +359,12 @@ def file_sha256(path: Path | None, chunk_size: int = 1024 * 1024) -> str | None:
 # =============================================================================
 # Metriche temporali e label
 # =============================================================================
+# Funzioni condivise per rendere coerenti le label tra dataset, predizioni e
+# report, e per calcolare le metriche temporali usate nella valutazione event-level.
 
 
+# Uniforma alias e varianti testuali delle classi, così i diversi step della
+# pipeline parlano lo stesso vocabolario.
 def normalize_label(label: Any) -> str:
     """Normalizza alias comuni delle label usate nella pipeline BasketAR."""
     text = str(label).strip()
@@ -325,11 +386,15 @@ def normalize_label(label: Any) -> str:
     return aliases.get(text, text)
 
 
+# Calcola l'intersezione tra due intervalli temporali; è la base per overlap e
+# soppressione di eventi sovrapposti.
 def overlap_duration(start_a: float, end_a: float, start_b: float, end_b: float) -> float:
     """Durata dell'intersezione temporale tra due intervalli."""
     return float(max(0.0, min(end_a, end_b) - max(start_a, start_b)))
 
 
+# Metrica di similarità temporale tra evento predetto e ground truth: più è alta,
+# più i due intervalli coincidono.
 def temporal_iou(start_a: float, end_a: float, start_b: float, end_b: float) -> float:
     """Intersection over Union temporale tra due intervalli."""
     inter = overlap_duration(start_a, end_a, start_b, end_b)
@@ -339,6 +404,8 @@ def temporal_iou(start_a: float, end_a: float, start_b: float, end_b: float) -> 
     return float(inter / union)
 
 
+# Calcola la media armonica tra precision e recall gestendo correttamente NaN e
+# casi senza predizioni/ground truth utili.
 def f1_score(precision: float, recall: float) -> float:
     """Calcola F1 a partire da precision e recall."""
     if not np.isfinite(precision) or not np.isfinite(recall):
@@ -348,6 +415,8 @@ def f1_score(precision: float, recall: float) -> float:
     return float(2.0 * precision * recall / (precision + recall))
 
 
+# Media robusta per metriche macro: ignora valori non finiti e segnala NaN se non
+# esistono classi/valori validi da mediare.
 def nanmean(values: Iterable[float]) -> float:
     """Media ignorando NaN/Inf. Ritorna NaN se non ci sono valori validi."""
     arr = np.asarray(list(values), dtype=np.float64)

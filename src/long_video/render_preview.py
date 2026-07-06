@@ -1,3 +1,25 @@
+# =============================================================================
+# Questo script genera una preview video annotata a partire:
+# - dal video originale;
+# - dal CSV degli eventi post-processati prodotto dalla pipeline long-video;
+# - da un intervallo temporale da renderizzare.
+#
+# Gli eventi sono interpretati con timestamp assoluti del video, coerentemente
+# con exp_long_13. Per ogni frame del segmento richiesto lo script controlla
+# se esiste un evento attivo in quell'istante e disegna un overlay informativo:
+# tempo corrente, azione riconosciuta, confidence e barra di avanzamento.
+#
+# Il file non modifica le predizioni e non ricalcola eventi: serve solo per
+# visualizzare qualitativamente il risultato finale della pipeline, producendo
+# un video .mp4 più leggibile da usare per controllo, demo o presentazione.
+#
+# Flusso principale:
+# 1. legge e valida il CSV eventi;
+# 2. mantiene solo le 7 classi azione reali;
+# 3. filtra gli eventi che intersecano il segmento richiesto;
+# 4. apre il video sorgente e crea il VideoWriter di output;
+# 5. scorre i frame del segmento, disegna l'overlay e salva la preview.
+#
 from __future__ import annotations
 
 import argparse
@@ -26,11 +48,18 @@ from src.long_video.utils import (
 # Configurazione exp_long_13
 # =============================================================================
 
+# Parametri globali della preview: indicano che gli eventi sono in tempo
+# assoluto rispetto al video originale, definiscono il codec di output e
+# fissano le classi/colonne minime attese nel CSV degli eventi.
+
 # La pipeline finale exp_long_13 salva eventi con tempi assoluti del video.
 EVENTS_TIME_MODE = "absolute"
 DEFAULT_CODEC = "mp4v"
 
 REQUIRED_EVENT_COLUMNS = ["label", "start_time", "end_time"]
+
+# Le classi mostrate nella preview sono solo le 7 azioni reali valutate nel
+# progetto; eventuali classi di background/no-action vengono ignorate.
 
 ACTION_LABELS = [
     "passaggio",
@@ -42,6 +71,8 @@ ACTION_LABELS = [
     "tiroLibero1",
 ]
 
+# Colori OpenCV in formato BGR associati alle etichette: servono solo per
+# rendere più leggibile l'overlay e distinguere rapidamente i tipi di azione.
 LABEL_COLORS_BGR: dict[str, tuple[int, int, int]] = {
     "passaggio": (64, 200, 255),
     "tiroDaDue0": (80, 120, 255),
@@ -58,6 +89,9 @@ LABEL_COLORS_BGR: dict[str, tuple[int, int, int]] = {
 # =============================================================================
 
 
+# Carica il CSV degli eventi, controlla che abbia le colonne minime richieste,
+# normalizza label e tipi numerici, rimuove eventi non validi e mantiene solo
+# le azioni reali da visualizzare.
 def load_events(events_csv: Path) -> pd.DataFrame:
     ensure_exists(events_csv, "CSV eventi", must_be_file=True)
     df = pd.read_csv(events_csv)
@@ -91,6 +125,8 @@ def load_events(events_csv: Path) -> pd.DataFrame:
     return out.sort_values(["start_time", "end_time", "event_id"]).reset_index(drop=True)
 
 
+# Seleziona gli eventi che intersecano il segmento renderizzato e crea anche
+# i tempi clippati al segmento, utili per evitare eventi fuori dai limiti della preview.
 def filter_events_to_segment(events: pd.DataFrame, start_sec: float, end_sec: float) -> pd.DataFrame:
     """Filtra eventi exp_long_13 assumendo tempi assoluti del video."""
     if events.empty:
@@ -108,6 +144,9 @@ def filter_events_to_segment(events: pd.DataFrame, start_sec: float, end_sec: fl
 # =============================================================================
 
 
+# Funzioni di supporto grafico: recuperano il colore dell'etichetta, disegnano
+# rettangoli semitrasparenti e scritte con ombra per mantenere leggibile
+# l'informazione anche su frame con sfondo variabile.
 def get_label_color(label: str) -> tuple[int, int, int]:
     return LABEL_COLORS_BGR.get(str(label), (220, 220, 220))
 
@@ -167,6 +206,8 @@ def put_text_with_shadow(
     )
 
 
+# Converte la confidence in testo compatto; se il valore non è disponibile
+# mostra una stringa neutra invece di interrompere il rendering.
 def confidence_to_text(confidence: Any) -> str:
     value = safe_float(confidence, default=float("nan"))
     if not np.isfinite(value):
@@ -174,6 +215,8 @@ def confidence_to_text(confidence: Any) -> str:
     return f"conf {value:.2f}"
 
 
+# Riduce opzionalmente la risoluzione del frame mantenendo le proporzioni:
+# utile per ottenere preview più leggere senza cambiare la logica degli eventi.
 def resize_frame_if_needed(frame: np.ndarray, max_width: int | None) -> np.ndarray:
     if max_width is None or max_width <= 0:
         return frame
@@ -186,6 +229,8 @@ def resize_frame_if_needed(frame: np.ndarray, max_width: int | None) -> np.ndarr
     return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
+# Trova l'evento attivo nel frame corrente. Se più eventi si sovrappongono,
+# viene mostrato quello con confidence più alta.
 def active_event_at_time(events: pd.DataFrame, current_time: float) -> pd.Series | None:
     if events.empty:
         return None
@@ -197,6 +242,8 @@ def active_event_at_time(events: pd.DataFrame, current_time: float) -> pd.Series
     return active.iloc[0]
 
 
+# Disegna l'overlay principale sul frame: tempo video, tempo relativo al
+# segmento, azione attiva, confidence e barra di avanzamento dell'evento.
 def draw_overlay(
     frame: np.ndarray,
     current_time: float,
@@ -250,6 +297,7 @@ def draw_overlay(
     draw_segment_progress_bar(frame, current_time=current_time, start_sec=start_sec, end_sec=end_sec)
 
 
+# Aggiunge in basso una barra di avanzamento dell'intero segmento renderizzato.
 def draw_segment_progress_bar(frame: np.ndarray, current_time: float, start_sec: float, end_sec: float) -> None:
     h, w = frame.shape[:2]
     duration = max(end_sec - start_sec, 1e-6)
@@ -267,6 +315,8 @@ def draw_segment_progress_bar(frame: np.ndarray, current_time: float, start_sec:
 # =============================================================================
 
 
+# Funzioni di supporto al rendering: validano il codec e calcolano la dimensione
+# finale del video in base all'eventuale limite di larghezza.
 def get_fourcc(codec: str) -> int:
     if len(str(codec)) != 4:
         raise ValueError(f"Il codec deve avere 4 caratteri, trovato: {codec}")
@@ -280,6 +330,8 @@ def compute_output_size(video_width: int, video_height: int, max_width: int | No
     return int(round(video_width * scale)), int(round(video_height * scale))
 
 
+# Funzione principale di rendering: apre video ed eventi, valida il segmento,
+# inizializza il writer e scorre i frame disegnando l'overlay prima di salvarli.
 def render_preview(
     input_video: Path,
     events_csv: Path,
@@ -304,6 +356,8 @@ def render_preview(
             f"{video_info.duration_sec:.2f}s: {input_video}"
         )
 
+    # Lettura eventi e filtro sul segmento richiesto: da qui in poi il rendering
+    # lavora solo sugli eventi temporalmente rilevanti per la preview.
     events_all = load_events(events_csv)
     events_segment = filter_events_to_segment(events_all, start_sec=start_sec, end_sec=end_sec)
 
@@ -314,6 +368,8 @@ def render_preview(
 
     out_w, out_h = compute_output_size(video_info.width, video_info.height, max_width=max_width)
 
+    # Apertura del video sorgente e del writer di output. Il codec è fisso per
+    # mantenere semplice e riproducibile la generazione del file .mp4.
     cap = cv2.VideoCapture(str(input_video))
     if not cap.isOpened():
         raise RuntimeError(f"Impossibile aprire il video: {input_video}")
@@ -328,11 +384,15 @@ def render_preview(
         cap.release()
         raise RuntimeError(f"Impossibile creare VideoWriter per {output_video} con codec {DEFAULT_CODEC}.")
 
+    # Conversione dell'intervallo temporale in indici frame: il ciclo seguente
+    # renderizza solo il segmento richiesto.
     start_frame = max(0, int(round(start_sec * video_info.fps)))
     end_frame = min(video_info.num_frames, int(round(end_sec * video_info.fps)))
     total_frames = max(0, end_frame - start_frame)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
+    # Ciclo sui frame: per ogni istante cerca l'evento attivo, disegna le
+    # informazioni grafiche e scrive il frame nel video di output.
     frames_written = 0
     with tqdm(total=total_frames, desc="Rendering preview", unit="frame") as pbar:
         for frame_idx in range(start_frame, end_frame):
@@ -359,6 +419,7 @@ def render_preview(
     cap.release()
     writer.release()
 
+    # Statistiche finali restituite al chiamante e stampate dalla CLI.
     return {
         "input_video": str(input_video),
         "events_csv": str(events_csv),
@@ -380,6 +441,8 @@ def render_preview(
 # =============================================================================
 
 
+# Definisce l'interfaccia da riga di comando con path di input/output,
+# segmento temporale, ridimensionamento opzionale e gestione overwrite.
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Renderizza la preview annotata per la pipeline finale exp_long_13."
@@ -399,6 +462,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Entry point CLI: risolve end_sec quando omesso, prepara max_width e invoca
+# il rendering vero e proprio, stampando poi un riepilogo dell'output generato.
 def main() -> None:
     args = build_parser().parse_args()
 

@@ -1,3 +1,21 @@
+# =============================================================================
+# Questo script costruisce il manifest delle finestre temporali usate per
+# applicare il modello clip-level su un video lungo già trasformato in feature
+# store. In input riceve una directory contenente almeno timestamps.npy e, se
+# disponibile, metadata.json; da questi file ricava il range temporale del
+# segmento e gli indici dei campioni già estratti.
+#
+# Il funzionamento è volutamente train-like: non vengono create nuove clip .mp4,
+# ma solo finestre virtuali multi-scala con start/end time e indici nella feature
+# store. In questo modo l'inferenza successiva può recuperare direttamente le
+# feature DINOv3 e ricostruire le feature ball/rim usando una logica coerente con
+# quella usata sulle clip annotate.
+#
+# Output principali:
+# - windows_manifest.csv: una riga per ogni finestra temporale generata;
+# - windows_metadata.json: configurazione, statistiche e riepilogo delle finestre.
+# =============================================================================
+
 from __future__ import annotations
 
 import argparse
@@ -32,6 +50,8 @@ DEFAULT_WINDOW_SIZES_SEC = [0.5, 0.75, 1.0, 1.5, 2.0]
 # =============================================================================
 
 
+# Struttura immutabile che raggruppa path, timestamp e metadati della feature store.
+# Viene usata per passare in modo ordinato le informazioni lette da disco.
 @dataclass(frozen=True)
 class FeatureStoreInfo:
     feature_store_dir: Path
@@ -44,6 +64,8 @@ class FeatureStoreInfo:
     feature_fps: float | None
 
 
+# Rappresenta una singola finestra temporale generata sul video lungo.
+# Contiene sia informazioni temporali sia indici per recuperare i sample dalla feature store.
 @dataclass(frozen=True)
 class WindowRow:
     window_id: str
@@ -63,6 +85,8 @@ class WindowRow:
     last_sample_time: float | None
 
 
+# Colonne esportate nel CSV: devono rimanere coerenti con i campi di WindowRow
+# usati dallo step di inferenza successivo.
 CSV_FIELDNAMES = [
     "window_id",
     "scale_index",
@@ -82,6 +106,8 @@ CSV_FIELDNAMES = [
 ]
 
 
+# Stima il frame-rate effettivo della feature store usando la distanza mediana
+# tra timestamp consecutivi validi. Serve come fallback se metadata.json non lo contiene.
 def estimate_feature_fps(timestamps: np.ndarray) -> float | None:
     if timestamps.size < 2:
         return None
@@ -95,6 +121,8 @@ def estimate_feature_fps(timestamps: np.ndarray) -> float | None:
     return float(1.0 / median_dt)
 
 
+# Carica e valida la feature store: controlla la presenza dei file necessari,
+# verifica i timestamp e ricava start/end/fps da metadata.json o dai timestamp stessi.
 def load_feature_store(feature_store_dir: Path) -> FeatureStoreInfo:
     ensure_exists(feature_store_dir, "Feature store", must_be_file=False)
 
@@ -162,11 +190,15 @@ def load_feature_store(feature_store_dir: Path) -> FeatureStoreInfo:
 # =============================================================================
 
 
+# Converte una durata float in una stringa sicura per costruire window_id leggibili
+# evitando punti o segni meno nei nomi.
 def format_float_for_id(value: float) -> str:
     text = f"{value:.3f}".rstrip("0").rstrip(".")
     return text.replace("-", "m").replace(".", "p")
 
 
+# Esegue controlli preventivi sui parametri temporali e di generazione.
+# Ferma qui input incoerenti evita manifest vuoti o finestre non valide.
 def validate_args_values(
     start_sec: float,
     end_sec: float,
@@ -189,6 +221,8 @@ def validate_args_values(
         raise ValueError(f"min_store_samples deve essere >= 1, trovato {min_store_samples}")
 
 
+# Genera tutti gli istanti di inizio per una data scala temporale.
+# Mantiene solo finestre completamente contenute nel segmento richiesto.
 def make_start_times(segment_start: float, segment_end: float, window_sec: float, stride_sec: float) -> np.ndarray:
     available = segment_end - segment_start - window_sec
     eps = 1e-9
@@ -214,6 +248,9 @@ def compute_tracking_raw_num_frames(num_store_samples: int) -> int:
     return int(min(int(num_store_samples), TRACKING_MAX_FRAMES_PER_WINDOW))
 
 
+# Costruisce il set completo di finestre multi-scala.
+# Per ogni durata applica uno sliding window, traduce i tempi in indici della feature store
+# e scarta le finestre con pochi sample.
 def build_windows(
     timestamps: np.ndarray,
     segment_start: float,
@@ -225,6 +262,8 @@ def build_windows(
     rows: list[WindowRow] = []
     global_index = 0
 
+    # Ogni window size produce una scala distinta: questo permette di coprire
+    # azioni brevi, come passaggi, e azioni più lunghe, come tiri.
     for scale_index, window_sec in enumerate(window_sizes):
         starts = make_start_times(segment_start, segment_end, window_sec, stride_sec)
         scale_id = format_float_for_id(window_sec)
@@ -237,6 +276,8 @@ def build_windows(
             store_end_index = int(np.searchsorted(timestamps, end_time, side="left"))
             num_store_samples = int(store_end_index - store_start_index)
 
+            # Le finestre troppo povere di campioni non sono informative per DINO/tracking
+            # e vengono eliminate prima dell'inferenza.
             if num_store_samples < min_store_samples:
                 continue
 
@@ -245,6 +286,8 @@ def build_windows(
             dino_num_frames = int(num_store_samples)
             tracking_raw_num_frames = compute_tracking_raw_num_frames(num_store_samples)
 
+            # Salva nel manifest solo riferimenti temporali e indici, le feature restano
+            # nella feature store e saranno lette dallo step di inferenza.
             rows.append(
                 WindowRow(
                     window_id=f"win_{global_index:07d}_s{scale_id}",
@@ -270,6 +313,8 @@ def build_windows(
     return rows
 
 
+# Esporta il manifest CSV usato dall'inferenza, ogni riga identifica una finestra
+# e gli indici necessari per recuperare le feature corrispondenti.
 def write_windows_csv(path: Path, rows: list[WindowRow]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
@@ -296,6 +341,8 @@ def write_windows_csv(path: Path, rows: list[WindowRow]) -> None:
             )
 
 
+# Calcola statistiche aggregate e per scala. Il riepilogo serve sia per controllo
+# rapido da terminale sia per documentare la configurazione in windows_metadata.json.
 def summarize_rows(rows: list[WindowRow]) -> dict[str, Any]:
     by_scale: dict[str, dict[str, Any]] = {}
     scale_counts: dict[float, list[WindowRow]] = defaultdict(list)
@@ -338,6 +385,8 @@ def summarize_rows(rows: list[WindowRow]) -> dict[str, Any]:
     }
 
 
+# Scrive un JSON descrittivo con input, parametri, policy temporali e statistiche.
+# È utile per rendere riproducibile l'esperimento e controllare cosa è stato generato.
 def write_windows_metadata(
     path: Path,
     feature_store: FeatureStoreInfo,
@@ -386,6 +435,8 @@ def write_windows_metadata(
 # =============================================================================
 
 
+# Definisce l'interfaccia CLI dello script, inclusi path, segmento temporale,
+# durate delle finestre, stride e comportamento di overwrite.
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -438,7 +489,10 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Orchestratore della pipeline: legge argomenti, carica feature store, valida range,
+# genera finestre, salva CSV/JSON e stampa un riepilogo operativo.
 def main() -> None:
+    # Parsing e normalizzazione dei path in input.
     args = make_parser().parse_args()
 
     args.feature_store_dir = as_path(args.feature_store_dir)
@@ -446,11 +500,13 @@ def main() -> None:
     assert args.feature_store_dir is not None
     assert args.output_dir is not None
 
+    # Lettura della feature store e recupero del range temporale disponibile.
     feature_store = load_feature_store(args.feature_store_dir)
 
     segment_start = float(feature_store.store_start_sec if args.start_sec is None else args.start_sec)
     segment_end = float(feature_store.store_end_sec if args.end_sec is None else args.end_sec)
 
+    # Validazione dei parametri prima di costruire il manifest.
     validate_args_values(
         start_sec=segment_start,
         end_sec=segment_end,
@@ -459,6 +515,7 @@ def main() -> None:
         min_store_samples=args.min_store_samples,
     )
 
+    # Controlla che il segmento richiesto sia interamente coperto dalla feature store.
     eps = 1e-6
     if segment_start < feature_store.store_start_sec - eps:
         raise ValueError(
@@ -471,12 +528,14 @@ def main() -> None:
             f"({feature_store.store_end_sec:.6f})."
         )
 
+    # Evita overwrite accidentali degli output, salvo uso esplicito di --overwrite.
     check_output_files(
         args.output_dir,
         output_files=["windows_manifest.csv", "windows_metadata.json"],
         overwrite=args.overwrite,
     )
 
+    # Generazione effettiva delle finestre virtuali.
     rows = build_windows(
         timestamps=feature_store.timestamps,
         segment_start=segment_start,
@@ -495,6 +554,7 @@ def main() -> None:
     windows_csv = args.output_dir / "windows_manifest.csv"
     windows_metadata = args.output_dir / "windows_metadata.json"
 
+    # Persistenza degli output: CSV operativo e JSON di documentazione/riepilogo.
     write_windows_csv(windows_csv, rows)
     write_windows_metadata(
         path=windows_metadata,
@@ -507,6 +567,7 @@ def main() -> None:
 
     summary = summarize_rows(rows)
 
+    # Riepilogo console per verificare rapidamente numero di finestre e frame per scala.
     print("=== Build windows da feature store ===")
     print(f"feature_store_dir: {args.feature_store_dir}")
     print(f"output_dir:        {args.output_dir}")

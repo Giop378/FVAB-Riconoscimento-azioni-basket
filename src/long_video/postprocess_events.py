@@ -1,3 +1,23 @@
+# =============================================================================
+
+# Questo script trasforma le predizioni raw prodotte dalla pipeline long-video
+# exp_long_13, cioè le classificazioni finestra-per-finestra contenute in
+# window_predictions_raw.csv, in una lista compatta di eventi finali.
+#
+# Il flusso è:
+# 1. leggere e validare il CSV delle finestre predette;
+# 2. selezionare solo le finestre candidate appartenenti alle 7 azioni reali;
+# 3. applicare soglie di confidenza, vincoli sulla durata delle finestre e
+#    margine rispetto alla classe no-action;
+# 4. raggruppare finestre temporalmente vicine della stessa classe in eventi;
+# 5. spezzare eventi troppo lunghi, rimuovere quelli troppo brevi e sopprimere
+#    overlap mantenendo l'evento più affidabile;
+# 6. salvare events_postprocessed.csv, cioè il report eventi usato dagli step di
+#    valutazione e visualizzazione.
+#
+# Tutti i parametri principali sono fissati nel codice per rendere riproducibile
+# la configurazione storica dell'esperimento finale exp_long_13.
+#
 from __future__ import annotations
 
 import argparse
@@ -23,6 +43,10 @@ from src.long_video.utils import (
 # =============================================================================
 # Configurazione fissa exp_long_13
 # =============================================================================
+
+# Definisce le classi considerate dal post-processing e i parametri fissi
+# dell'esperimento. In questa fase vengono escluse le classi di background
+# dal report finale e viene usata no-action solo come filtro di affidabilità.
 
 ACTION_LABELS = [
     "passaggio",
@@ -50,6 +74,9 @@ MAX_DURATION_PASSAGGIO = 1.50
 MAX_DURATION_TIRO = 3.00
 NOACTION_MARGIN = 20.0
 
+# Schema del CSV finale: ogni riga rappresenta un evento temporale già
+# filtrato, aggregato e ordinato, con statistiche sulle finestre che lo hanno
+# generato.
 OUTPUT_COLUMNS = [
     "event_id",
     "label",
@@ -75,6 +102,8 @@ OUTPUT_COLUMNS = [
 # =============================================================================
 
 
+# Associa ciascuna label finale alla colonna di score corrispondente nel CSV
+# raw. La classe no-action usa un nome colonna leggermente diverso.
 def score_column_for_label(label: str) -> str:
     """Restituisce il nome colonna prodotto da infer_exp46_from_store.py."""
     if label == "no-action":
@@ -82,16 +111,22 @@ def score_column_for_label(label: str) -> str:
     return f"score_{label}"
 
 
+# Restituisce la soglia minima di confidenza specifica per la classe: più alta
+# per i passaggi, più permissiva per i tiri.
 def threshold_for_label(label: str) -> float:
     return MIN_CONF_PASSAGGIO if label == "passaggio" else MIN_CONF_TIRO
 
 
+# Carica le predizioni finestra-per-finestra e prepara una tabella pulita,
+# ordinata temporalmente e pronta per la selezione delle candidate.
 def load_predictions(predictions_csv: Path) -> pd.DataFrame:
     ensure_exists(predictions_csv, "Predizioni finestre", must_be_file=True)
     df = pd.read_csv(predictions_csv)
     if df.empty:
         raise ValueError(f"Il file predizioni è vuoto: {predictions_csv}")
 
+    # Verifica che il file provenga davvero dall'inferenza exp_long_13 e che
+    # contenga sia la label predetta sia tutti gli score per classe.
     required = ["window_id", "start_time", "end_time", "pred_label", "confidence"]
     required += [score_column_for_label(label) for label in ALL_LABELS]
     missing = [col for col in required if col not in df.columns]
@@ -102,6 +137,8 @@ def load_predictions(predictions_csv: Path) -> pd.DataFrame:
             "di infer_exp46_from_store.py."
         )
 
+    # Lavora su una copia per non modificare direttamente il DataFrame letto
+    # da disco e normalizza label e campi numerici.
     out = df.copy()
     out["window_id"] = out["window_id"].astype(str)
     out["pred_label"] = out["pred_label"].apply(normalize_label)
@@ -130,7 +167,11 @@ def load_predictions(predictions_csv: Path) -> pd.DataFrame:
 
     out["noaction_score"] = out[score_column_for_label("no-action")].clip(lower=0.0)
 
+    # Per ogni finestra recupera lo score della classe effettivamente predetta;
+    # se la label non è prevista, usa la confidence già salvata nel CSV.
     def action_score(row: pd.Series) -> float:
+        # Scarta subito background/no-action e qualunque label non appartenente
+        # alle 7 azioni del report.
         label = normalize_label(row["pred_label"])
         if label in ALL_LABELS:
             return safe_float(row[score_column_for_label(label)])
@@ -145,6 +186,9 @@ def load_predictions(predictions_csv: Path) -> pd.DataFrame:
 # =============================================================================
 
 
+# Seleziona le finestre che possono diventare eventi: mantiene solo azioni
+# reali, rispetta i range temporali previsti per passaggi/tiri e richiede che
+# lo score dell'azione superi sia la soglia sia il margine su no-action.
 def build_candidate_windows(predictions: pd.DataFrame) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
 
@@ -153,12 +197,16 @@ def build_candidate_windows(predictions: pd.DataFrame) -> list[dict[str, Any]]:
         if label == "no-action" or label not in ACTION_LABELS:
             continue
 
+        # Applica vincoli diversi sulla durata della finestra: finestre troppo
+        # lunghe per i passaggi o troppo corte/lunghe per i tiri vengono ignorate.
         scale_sec = safe_float(row["scale_sec"])
         if label == "passaggio" and scale_sec > MAX_WINDOW_SEC_PASSAGGIO:
             continue
         if label in SHOT_LABELS and not (MIN_WINDOW_SEC_TIRO <= scale_sec <= MAX_WINDOW_SEC_TIRO):
             continue
 
+        # Applica il doppio filtro di affidabilità: soglia assoluta della classe
+        # e vantaggio netto rispetto allo score no-action.
         score = safe_float(row["action_score"])
         noaction_score = safe_float(row["noaction_score"])
         threshold = threshold_for_label(label)
@@ -185,6 +233,8 @@ def build_candidate_windows(predictions: pd.DataFrame) -> list[dict[str, Any]]:
     return sorted(candidates, key=lambda r: (r["label"], r["start_time"], r["end_time"], r["scale_sec"]))
 
 
+# Spezza un gruppo temporale quando la sua estensione supera la durata massima
+# ammessa per la classe, evitando eventi finali irrealisticamente lunghi.
 def split_group_by_max_duration(
     rows: list[dict[str, Any]],
     max_duration: float,
@@ -194,6 +244,8 @@ def split_group_by_max_duration(
     if max_duration <= 0:
         return [(rows, None, None)]
 
+    # Calcola l'intervallo coperto dal gruppo e decide se può restare un singolo
+    # evento oppure se deve essere diviso in chunk temporali.
     group_start = min(safe_float(r["start_time"]) for r in rows)
     group_end = max(safe_float(r["end_time"]) for r in rows)
     duration = group_end - group_start
@@ -223,6 +275,8 @@ def split_group_by_max_duration(
     return chunks
 
 
+# Converte un gruppo di finestre omogenee in un singolo evento aggregando tempi,
+# confidence, soglie, numero di finestre e scale temporali utilizzate.
 def aggregate_rows_to_event(
     rows: list[dict[str, Any]],
     event_id: int,
@@ -239,6 +293,8 @@ def aggregate_rows_to_event(
     if end_time <= start_time:
         end_time = start_time + 1e-6
 
+    # Le statistiche di confidenza descrivono quanto è solido il gruppo di
+    # finestre; la confidence finale storica di exp_long_13 è il massimo.
     scores = np.asarray([safe_float(r["confidence"]) for r in ordered], dtype=np.float64)
     noaction_scores = np.asarray([safe_float(r["noaction_score"]) for r in ordered], dtype=np.float64)
     thresholds = np.asarray([safe_float(r["threshold"]) for r in ordered], dtype=np.float64)
@@ -265,6 +321,8 @@ def aggregate_rows_to_event(
     }
 
 
+# Aggiunge alla lista finale gli eventi ricavati da un gruppo, dopo eventuale
+# split per durata massima e filtro sulla durata minima.
 def append_group_events(
     events: list[dict[str, Any]],
     rows: list[dict[str, Any]],
@@ -291,6 +349,8 @@ def append_group_events(
     return next_event_id
 
 
+# Raggruppa le finestre candidate classe per classe: finestre consecutive o
+# quasi consecutive vengono fuse se la distanza temporale è entro MERGE_GAP_SEC.
 def group_candidates_to_events(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not candidates:
         return []
@@ -303,6 +363,8 @@ def group_candidates_to_events(candidates: list[dict[str, Any]]) -> list[dict[st
         if not label_rows:
             continue
 
+        # current contiene il gruppo temporale in costruzione per la label
+        # corrente; viene chiuso quando il gap dalla finestra successiva è alto.
         current: list[dict[str, Any]] = []
         current_end: float | None = None
 
@@ -328,8 +390,12 @@ def group_candidates_to_events(candidates: list[dict[str, Any]]) -> list[dict[st
     return sorted(events, key=lambda r: (r["start_time"], r["end_time"], r["label"]))
 
 
+# Risolve conflitti temporali tra eventi di qualunque classe: ordina per
+# affidabilità e conserva solo eventi che non si sovrappongono a quelli già scelti.
 def suppress_overlaps(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """exp_long_13 non permette overlap: mantiene l'evento più confidente."""
+    # Priorità: confidence più alta, poi durata maggiore e infine ordinamento
+    # temporale/lessicografico per rendere deterministico il risultato.
     order = sorted(
         range(len(events)),
         key=lambda i: (
@@ -372,6 +438,8 @@ def suppress_overlaps(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # =============================================================================
 
 
+# Converte gli eventi in un DataFrame con colonne stabili e valori numerici
+# arrotondati, così il CSV prodotto resta leggibile e confrontabile tra run.
 def events_to_dataframe(events: list[dict[str, Any]]) -> pd.DataFrame:
     if not events:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
@@ -399,6 +467,8 @@ def events_to_dataframe(events: list[dict[str, Any]]) -> pd.DataFrame:
     return df[OUTPUT_COLUMNS]
 
 
+# Conta gli elementi per label; viene usato solo per il riepilogo stampato a
+# console durante il post-processing.
 def count_by_label(records: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for record in records:
@@ -407,6 +477,8 @@ def count_by_label(records: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+# Esegue l'intera pipeline: controllo output, lettura predizioni, costruzione
+# candidate, aggregazione eventi, soppressione overlap e salvataggio CSV.
 def run_postprocess(predictions_csv: Path, output_dir: Path, overwrite: bool) -> pd.DataFrame:
     check_output_files(
         output_dir,
@@ -414,6 +486,8 @@ def run_postprocess(predictions_csv: Path, output_dir: Path, overwrite: bool) ->
         overwrite=overwrite,
     )
 
+    # Sequenza principale del post-processing: ogni step riduce o struttura
+    # progressivamente le predizioni raw fino agli eventi finali.
     predictions = load_predictions(predictions_csv)
     candidates = build_candidate_windows(predictions)
     raw_events = group_candidates_to_events(candidates)
@@ -437,6 +511,8 @@ def run_postprocess(predictions_csv: Path, output_dir: Path, overwrite: bool) ->
 # =============================================================================
 
 
+# Definisce gli argomenti esposti all'utente. Le soglie dell'esperimento non
+# sono parametri CLI perché devono restare fisse per riproducibilità.
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -461,6 +537,8 @@ def build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
+# Punto di ingresso dello script: legge gli argomenti, stampa la configurazione
+# fissa usata e avvia il post-processing.
 def main() -> None:
     args = build_argparser().parse_args()
     args.predictions_csv = as_path(args.predictions_csv)

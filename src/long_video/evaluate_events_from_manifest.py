@@ -1,3 +1,19 @@
+# =============================================================================
+# Questo script valuta le predizioni event-level prodotte dalla pipeline
+# long-video dell'esperimento exp_long_13 confrontandole con le annotazioni
+# presenti nel manifest.csv del dataset BasketAR. La valutazione considera
+# esclusivamente le 7 classi di azione reali, ignorando no-action, idle e
+# non-gioco perché sono classi di supporto/background e non eventi da
+# riportare nel report finale.
+#
+# Funzionamento sintetico:
+# 1. carica dal manifest gli eventi ground truth del video e del segmento scelti;
+# 2. carica gli eventi predetti dal file events_postprocessed.csv;
+# 3. normalizza e filtra entrambe le sorgenti sulle sole 7 azioni valutabili;
+# 4. associa predizioni e ground truth della stessa classe tramite Temporal IoU;
+# 5. calcola TP, FP, FN, precision, recall, F1 e diagnostiche temporali;
+# 6. salva CSV diagnostici, metriche JSON e report Markdown nella cartella output.
+
 from __future__ import annotations
 
 import argparse
@@ -28,6 +44,8 @@ from src.long_video.utils import (
 
 # Exp_long_13 viene valutato solo sulle 7 classi azione reali.
 # no-action / idle / non-gioco sono ignorate nella valutazione event-level.
+# Elenco chiuso delle classi considerate nella valutazione finale: ogni altro
+# label viene filtrato prima del matching per evitare di misurare il background.
 ACTION_LABELS_7 = [
     "passaggio",
     "tiroDaDue0",
@@ -38,6 +56,8 @@ ACTION_LABELS_7 = [
     "tiroLibero1",
 ]
 
+# Colonne minime attese nei file di input: il controllo anticipato rende più
+# chiari gli errori quando manifest o predizioni hanno formato inatteso.
 REQUIRED_MANIFEST_COLUMNS = ["clip_id", "video_id", "start_time", "end_time", "label", "split"]
 REQUIRED_PRED_COLUMNS = ["start_time", "end_time", "label"]
 
@@ -46,6 +66,8 @@ DEFAULT_IOU_THRESHOLD = 0.20
 PRED_TIME_MODE = "absolute"
 
 
+# Configurazione serializzabile dell'esperimento: viene salvata nei risultati
+# per rendere riproducibile la valutazione eseguita.
 @dataclass(frozen=True)
 class EvalConfig:
     manifest: str
@@ -65,10 +87,13 @@ class EvalConfig:
 # =============================================================================
 
 
+# Recupera il manifest dai default di progetto, con fallback esplicito nel caso
+# in cui la costante non sia definita in defaults.py
 def fallback_manifest_path() -> Path:
     return Path(getattr(defaults, "MANIFEST_PATH", Path("data/datasets/dataset_basket_v1/manifest.csv")))
 
 
+# Percorso di default per le predizioni di validazione post-processate.
 def fallback_val_pred_events_path() -> Path:
     return Path(getattr(defaults, "VAL_OUTPUT_DIR", Path("outputs/long_video/primaparte_0215_1215_exp46"))) / "events_postprocessed.csv"
 
@@ -78,6 +103,8 @@ def fallback_val_pred_events_path() -> Path:
 # =============================================================================
 
 
+# Estrae gli eventi annotati dal manifest, li limita al segmento temporale
+# valutato e conserva solo le classi azione ammesse.
 def load_manifest_events(
     manifest_path: Path,
     video_id: str,
@@ -108,7 +135,7 @@ def load_manifest_events(
     df["start_time"] = df["start_time"].astype(float)
     df["end_time"] = df["end_time"].astype(float)
 
-    # Tieni solo eventi del video richiesto che intersecano il segmento.
+    # Mantieni solo eventi del video richiesto che intersecano il segmento.
     df = df[
         (df["video_id"].astype(str) == str(video_id))
         & (df["end_time"] > float(start_sec))
@@ -152,6 +179,8 @@ def load_manifest_events(
     return df[keep_cols].copy()
 
 
+# Carica le predizioni già post-processate assumendo timestamp assoluti sul
+# video sorgente, poi applica gli stessi filtri usati per il ground truth.
 def load_prediction_events_absolute(
     pred_events_path: Path,
     start_sec: float,
@@ -217,6 +246,8 @@ def load_prediction_events_absolute(
 # =============================================================================
 
 
+# Genera tutte le possibili coppie GT-predizione della stessa classe e calcola
+# la sovrapposizione temporale, base del successivo matching greedy.
 def compute_candidate_matches(gt: pd.DataFrame, pred: pd.DataFrame, label: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     gt_l = gt[gt["label"] == label]
@@ -253,6 +284,8 @@ def compute_candidate_matches(gt: pd.DataFrame, pred: pd.DataFrame, label: str) 
     return candidates
 
 
+# Seleziona una sola predizione per ogni evento GT e viceversa, privilegiando
+# le coppie con IoU più alta sopra la soglia configurata.
 def greedy_match_events(
     gt: pd.DataFrame,
     pred: pd.DataFrame,
@@ -294,6 +327,8 @@ def greedy_match_events(
     return match_df, false_positives, false_negatives
 
 
+# Aggrega TP, FP e FN per singola classe e ricava precision, recall e F1, così
+# da capire quali azioni sono riconosciute meglio o peggio.
 def compute_per_class_metrics(
     gt: pd.DataFrame,
     pred: pd.DataFrame,
@@ -329,6 +364,8 @@ def compute_per_class_metrics(
     return pd.DataFrame(rows)
 
 
+# Calcola le metriche complessive micro/macro e gli errori temporali medi sui
+# match validi, riassumendo la qualità event-level dell'esperimento.
 def compute_global_metrics(
     gt: pd.DataFrame,
     pred: pd.DataFrame,
@@ -393,6 +430,8 @@ def compute_global_metrics(
 # =============================================================================
 
 
+# Converte i valori numerici in stringhe leggibili nel report, gestendo anche
+# NaN e valori mancanti con la dicitura n/d.
 def format_metric(value: Any, digits: int = 4) -> str:
     try:
         value_f = float(value)
@@ -403,6 +442,8 @@ def format_metric(value: Any, digits: int = 4) -> str:
     return f"{value_f:.{digits}f}"
 
 
+# Costruisce il report Markdown finale con configurazione, metriche globali e
+# tabella per classe, pronto per essere consultato o allegato al tracking.
 def build_text_report(config: EvalConfig, global_metrics: dict[str, Any], per_class: pd.DataFrame) -> str:
     lines: list[str] = []
     lines.append("# Event-level evaluation long-video - exp_long_13")
@@ -467,6 +508,8 @@ def build_text_report(config: EvalConfig, global_metrics: dict[str, Any], per_cl
 # =============================================================================
 
 
+# Orchestratore della valutazione: prepara output, carica dati, esegue il
+# matching, calcola metriche e scrive tutti gli artefatti finali.
 def evaluate(
     manifest: Path,
     pred_events_csv: Path,
@@ -482,8 +525,11 @@ def evaluate(
     if not (0.0 <= iou_threshold <= 1.0):
         raise ValueError(f"iou_threshold deve stare in [0, 1], trovato {iou_threshold}")
 
+    # Inizializza la cartella di output e, se richiesto, la pulisce per evitare
+    # residui di valutazioni precedenti.
     prepare_output_dir(output_dir, overwrite=overwrite, clear_if_exists=True)
 
+    # Lettura e filtraggio del ground truth sul segmento e sulle 7 classi azione.
     gt = load_manifest_events(
         manifest_path=manifest,
         video_id=video_id,
@@ -491,6 +537,7 @@ def evaluate(
         end_sec=end_sec,
         labels=ACTION_LABELS_7,
     )
+    # Lettura e filtraggio delle predizioni post-processate nello stesso intervallo.
     pred = load_prediction_events_absolute(
         pred_events_path=pred_events_csv,
         start_sec=start_sec,
@@ -498,6 +545,7 @@ def evaluate(
         labels=ACTION_LABELS_7,
     )
 
+    # Matching event-level: produce veri positivi e separa predizioni extra e GT mancati.
     matches, false_positives, false_negatives = greedy_match_events(
         gt=gt,
         pred=pred,
@@ -505,6 +553,7 @@ def evaluate(
         iou_threshold=iou_threshold,
     )
 
+    # Metriche granulari per classe, utili per analizzare errori specifici.
     per_class = compute_per_class_metrics(
         gt=gt,
         pred=pred,
@@ -513,6 +562,7 @@ def evaluate(
         false_negatives=false_negatives,
         labels=ACTION_LABELS_7,
     )
+    # Metriche aggregate e diagnostiche temporali sui match corretti.
     global_metrics = compute_global_metrics(
         gt=gt,
         pred=pred,
@@ -522,6 +572,7 @@ def evaluate(
         per_class=per_class,
     )
 
+    # Snapshot della configurazione usata, salvato insieme ai risultati.
     config = EvalConfig(
         manifest=str(manifest),
         pred_events_csv=str(pred_events_csv),
@@ -543,6 +594,7 @@ def evaluate(
     false_negatives.to_csv(output_dir / "false_negatives.csv", index=False)
     per_class.to_csv(output_dir / "per_class_metrics.csv", index=False)
 
+    # Struttura JSON principale: contiene configurazione, metriche globali e per classe.
     results = {
         "config": asdict(config),
         "global_metrics": global_metrics,
@@ -550,6 +602,7 @@ def evaluate(
     }
     write_json(output_dir / "event_metrics.json", results)
 
+    # Versione Markdown delle metriche per una lettura rapida dei risultati.
     report = build_text_report(config, global_metrics, per_class)
     (output_dir / "event_metrics.md").write_text(report, encoding="utf-8")
 
@@ -561,6 +614,8 @@ def evaluate(
 # =============================================================================
 
 
+# Definisce l'interfaccia da riga di comando, inclusi input, segmento video,
+# soglia IoU e gestione dell'overwrite degli output.
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -589,9 +644,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Entry point CLI: legge gli argomenti, avvia la valutazione e stampa un
+# riepilogo compatto delle metriche principali.
 def main() -> None:
     args = build_parser().parse_args()
 
+    # Esecuzione completa della valutazione con i parametri passati da terminale.
     results = evaluate(
         manifest=args.manifest,
         pred_events_csv=args.pred_events_csv,
@@ -603,6 +661,7 @@ def main() -> None:
         overwrite=bool(args.overwrite),
     )
 
+    # Riepilogo testuale pensato per controllare subito l'esito dal terminale.
     gm = results["global_metrics"]
     print("\n=== Valutazione event-level exp_long_13 completata ===")
     print(f"GT events 7 azioni:      {gm['num_gt_events']}")

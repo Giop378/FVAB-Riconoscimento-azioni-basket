@@ -1,3 +1,26 @@
+# =============================================================================
+# Questo script esegue l'inferenza raw long-video dell'esperimento exp_long_13
+# partendo da una feature store già estratta e da un manifest di finestre
+# temporali. Non decodifica nuovamente il video: legge feature DINOv3 frame-level,
+# primitive YOLO v1/v2 per palla e canestro e intervalli temporali delle finestre
+# già costruiti in precedenza.
+#
+# Per ogni finestra temporale ricostruisce input train-like compatibili con i
+# checkpoint exp_46:
+# - L1 usa DINOv3 + tracking YOLO v2 per distinguere passaggio / tiro / no-action;
+# - L2 usa DINOv3 + tracking YOLO v2 per distinguere tiro da due / tre / libero;
+# - L3 usa DINOv3 + tracking YOLO v1 per distinguere tiro sbagliato / segnato.
+#
+# Le probabilità dei tre livelli gerarchici vengono poi combinate per ottenere
+# una distribuzione finale sulle 7 azioni reali più la classe no-action. L'output
+# principale è window_predictions_raw.csv, cioè una predizione per ogni finestra,
+# accompagnato da inference_metadata.json con configurazione, policy temporali e
+# riepilogo dell'esecuzione.
+#
+# Il file è pensato per essere eseguito dopo:
+# 1. extract_feature_store.py, che crea la feature store long-video;
+# 2. build_windows_from_store.py, che crea windows_manifest.csv.
+#
 from __future__ import annotations
 
 import argparse
@@ -31,6 +54,9 @@ from src.long_video.utils import (
 from src.models.temporal_transformer_classifier import TemporalTransformerActionClassifier
 
 
+# Label dei tre livelli gerarchici e label finali usate nel CSV di output.
+# La gerarchia replica exp_46: prima azione/tiro/no-action, poi tipo di tiro,
+# infine esito del tiro.
 # =============================================================================
 # Configurazione fissa exp_long_13 / exp_46
 # =============================================================================
@@ -50,7 +76,6 @@ FINAL_LABELS = [
     "no-action",
 ]
 
-# Coerente con gli esperimenti clip-level exp_46 usati dalla pipeline long-video.
 TRACKING_MAX_FRAMES_PER_WINDOW = 48
 TRACKING_NEAR_THRESHOLD = 0.12
 TRACKING_RIM_INSIDE_MARGIN = 0.15
@@ -62,6 +87,8 @@ L2_EXPECTED_TRACKING_FEATURES = 29  # YOLO v2, temp29
 L3_EXPECTED_TRACKING_FEATURES = 43  # YOLO v1, temp43
 
 
+# Le dataclass rendono espliciti i blocchi dati principali passati tra le fasi:
+# una riga finestra, un bundle modello/checkpoint per livello e la feature store.
 # =============================================================================
 # Dataclass
 # =============================================================================
@@ -115,6 +142,8 @@ class FeatureStore:
 # =============================================================================
 
 
+# Caricamento checkpoint compatibile con versioni diverse di PyTorch:
+# usa weights_only=False quando disponibile, altrimenti ricade sulla chiamata classica.
 def safe_torch_load(path: Path) -> Any:
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
@@ -122,12 +151,16 @@ def safe_torch_load(path: Path) -> Any:
         return torch.load(path, map_location="cpu")
 
 
+# Conversione dei file .npz YOLO in dizionari NumPy, così le primitive possono
+# essere indicizzate rapidamente durante la costruzione delle sequenze.
 def npz_to_dict(npz_path: Path) -> dict[str, np.ndarray]:
     ensure_exists(npz_path, npz_path.name, must_be_file=True)
     with np.load(npz_path) as data:
         return {k: data[k] for k in data.files}
 
 
+# Lettura e validazione della feature store: controlla la presenza dei file
+# necessari, la coerenza tra timestamp/DINO/primitive YOLO e ricava il range video.
 def load_feature_store(feature_store_dir: Path) -> FeatureStore:
     ensure_exists(feature_store_dir, "Feature store", must_be_file=False)
 
@@ -208,6 +241,8 @@ def load_feature_store(feature_store_dir: Path) -> FeatureStore:
     )
 
 
+# Lettura del manifest delle finestre: ogni riga contiene tempi assoluti,
+# indici nella feature store e numero di sample usati dalla finestra.
 def read_windows_csv(path: Path) -> list[WindowRow]:
     ensure_exists(path, "windows_manifest.csv", must_be_file=True)
     rows: list[WindowRow] = []
@@ -259,11 +294,14 @@ def read_windows_csv(path: Path) -> list[WindowRow]:
 # =============================================================================
 
 
+# Estrae la configurazione architetturale del modello, se salvata nel checkpoint.
 def find_model_config(ckpt: dict[str, Any]) -> dict[str, Any]:
     value = ckpt.get("model_config")
     return dict(value) if isinstance(value, dict) else {}
 
 
+# Recupera la configurazione delle feature di tracking e la relativa normalizzazione.
+# Viene cercata sia al livello principale del checkpoint sia dentro model_config.
 def find_tracking_config(ckpt: dict[str, Any]) -> dict[str, Any]:
     tracking_config = ckpt.get("tracking_config")
     if isinstance(tracking_config, dict):
@@ -277,6 +315,8 @@ def find_tracking_config(ckpt: dict[str, Any]) -> dict[str, Any]:
     raise KeyError("tracking_config non trovato nel checkpoint")
 
 
+# Trova lo state_dict del modello supportando più nomi di chiave possibili,
+# utile perché i checkpoint possono essere stati salvati da script differenti.
 def get_state_dict_from_checkpoint(ckpt: dict[str, Any]) -> dict[str, torch.Tensor]:
     for key in ["model_state_dict", "state_dict", "model_state", "net_state_dict"]:
         value = ckpt.get(key)
@@ -286,6 +326,8 @@ def get_state_dict_from_checkpoint(ckpt: dict[str, Any]) -> dict[str, torch.Tens
     raise KeyError("State dict del modello non trovato nel checkpoint exp_46")
 
 
+# Rimuove prefissi comuni aggiunti da wrapper di training come DataParallel
+# o contenitori model/net, evitando mismatch durante load_state_dict.
 def strip_state_dict_prefixes(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     prefixes = ["module.", "model.", "net."]
     cleaned: dict[str, torch.Tensor] = {}
@@ -304,6 +346,8 @@ def strip_state_dict_prefixes(state_dict: dict[str, torch.Tensor]) -> dict[str, 
     return cleaned
 
 
+# Uniforma alias equivalenti della configurazione e forza il numero di classi
+# corretto per il livello gerarchico caricato.
 def normalize_model_config(model_config: dict[str, Any], num_classes: int) -> dict[str, Any]:
     config = dict(model_config)
 
@@ -318,6 +362,8 @@ def normalize_model_config(model_config: dict[str, Any], num_classes: int) -> di
     return config
 
 
+# Istanzia il classificatore usando solo gli argomenti accettati dalla firma
+# della classe, così il caricamento resta robusto a piccole differenze di config.
 def instantiate_model(model_config: dict[str, Any], num_classes: int) -> nn.Module:
     config = normalize_model_config(model_config, num_classes=num_classes)
     cls = TemporalTransformerActionClassifier
@@ -356,6 +402,8 @@ def instantiate_model(model_config: dict[str, Any], num_classes: int) -> nn.Modu
     return cls(**kwargs)
 
 
+# Ricostruisce media e deviazione standard usate in training per normalizzare
+# le feature di tracking; se il checkpoint non richiede normalizzazione usa identità.
 def get_tracking_normalizer(
     name: str,
     tracking_config: dict[str, Any],
@@ -388,6 +436,8 @@ def get_tracking_normalizer(
     return normalized, mean.astype(np.float32), std.astype(np.float32)
 
 
+# Carica completamente un livello della gerarchia: checkpoint, feature tracking
+# attese, modello, pesi e statistiche di normalizzazione.
 def load_level_bundle(
     name: str,
     checkpoint_path: Path,
@@ -454,6 +504,8 @@ def load_level_bundle(
     )
 
 
+# Converte output di modello eterogenei in logits [B, C], supportando tensori,
+# tuple/list e dizionari con chiavi comuni.
 def output_to_logits(output: Any) -> torch.Tensor:
     if isinstance(output, dict):
         for key in ["logits", "out", "output", "pred", "prediction"]:
@@ -476,6 +528,8 @@ def output_to_logits(output: Any) -> torch.Tensor:
     raise TypeError(f"Output modello non supportato: {type(output)}")
 
 
+# Esegue il forward gestendo modelli con firme diverse: prova lengths,
+# padding mask o chiamata semplice, restituendo sempre i logits.
 def model_forward_logits(model: nn.Module, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     if lengths.ndim != 1 or lengths.shape[0] != x.shape[0]:
         raise ValueError(
@@ -509,6 +563,8 @@ def model_forward_logits(model: nn.Module, x: torch.Tensor, lengths: torch.Tenso
 # =============================================================================
 
 
+# Se la finestra contiene più frame del limite, seleziona indici uniformi;
+# altrimenti conserva tutti i frame disponibili.
 def select_uniform_local_indices(num_items: int, max_items: int) -> np.ndarray:
     if num_items <= 0:
         return np.empty((0,), dtype=np.int64)
@@ -521,6 +577,8 @@ def select_uniform_local_indices(num_items: int, max_items: int) -> np.ndarray:
     return np.asarray(indices, dtype=np.int64)
 
 
+# Porta una sequenza tracking di lunghezza variabile alla lunghezza DINO della
+# finestra, mantenendo l'allineamento temporale tramite interpolazione lineare.
 def interpolate_sequence_array(sequence: np.ndarray, target_len: int) -> np.ndarray:
     target_len = int(target_len)
     sequence = np.asarray(sequence, dtype=np.float32)
@@ -546,6 +604,8 @@ def interpolate_sequence_array(sequence: np.ndarray, target_len: int) -> np.ndar
     return resized.astype(np.float32)
 
 
+# Accesso sicuro a una primitiva YOLO: se il campo manca viene usato un valore
+# di default, evitando errori in fase di inferenza.
 def primitive_value(primitives: dict[str, np.ndarray], name: str, idx: int, default: float = 0.0) -> float:
     values = primitives.get(name)
     if values is None:
@@ -553,6 +613,8 @@ def primitive_value(primitives: dict[str, np.ndarray], name: str, idx: int, defa
     return float(values[int(idx)])
 
 
+# Ricostruisce la detection normalizzata di palla o canestro per un frame:
+# flag, confidence, centro, dimensioni e area.
 def primitive_detection(primitives: dict[str, np.ndarray], prefix: str, idx: int) -> dict[str, float | int]:
     detected = int(primitive_value(primitives, f"{prefix}_detected", idx, 0.0) >= 0.5)
     conf = primitive_value(primitives, f"{prefix}_conf", idx, 0.0) if detected else 0.0
@@ -572,6 +634,8 @@ def primitive_detection(primitives: dict[str, np.ndarray], prefix: str, idx: int
     }
 
 
+# Converte le primitive YOLO selezionate in righe frame-level compatibili con
+# compute_temporal_sequence_features, includendo anche feature geometriche palla-canestro.
 def build_frame_rows_trainlike(
     feature_store: FeatureStore,
     row: WindowRow,
@@ -641,6 +705,8 @@ def build_frame_rows_trainlike(
     return frame_rows
 
 
+# Calcola la sequenza di feature temporali richiesta dal checkpoint del livello
+# usando gli stessi nomi feature salvati in tracking_config.
 def build_tracking_sequence_trainlike(
     feature_store: FeatureStore,
     row: WindowRow,
@@ -668,6 +734,8 @@ def build_tracking_sequence_trainlike(
     return sequence.astype(np.float32)
 
 
+# Applica, quando prevista, la z-score normalization salvata nel checkpoint
+# del livello specifico.
 def apply_tracking_normalization(tracking_seq: np.ndarray, level: LevelBundle) -> np.ndarray:
     tracking_seq = np.asarray(tracking_seq, dtype=np.float32)
     if tracking_seq.ndim != 2:
@@ -685,6 +753,8 @@ def apply_tracking_normalization(tracking_seq: np.ndarray, level: LevelBundle) -
     ).astype(np.float32)
 
 
+# Costruisce l'input finale di una finestra per un livello: concatena DINOv3
+# frame-level e tracking temporale allineato frame-per-frame.
 def build_input_for_window(
     feature_store: FeatureStore,
     row: WindowRow,
@@ -722,6 +792,8 @@ def build_input_for_window(
     return np.concatenate([dino_seq, tracking_seq], axis=1).astype(np.float32)
 
 
+# Padda le sequenze di un batch alla stessa lunghezza temporale e restituisce
+# anche le lunghezze reali, necessarie per mascherare il padding nel modello.
 def pad_sequences(sequences: list[np.ndarray], expected_dim: int) -> tuple[np.ndarray, np.ndarray]:
     if not sequences:
         raise ValueError("Batch vuoto: nessuna sequenza da paddare")
@@ -740,6 +812,8 @@ def pad_sequences(sequences: list[np.ndarray], expected_dim: int) -> tuple[np.nd
     return padded, lengths
 
 
+# Prepara gli input batch per L1, L2 e L3 usando le corrette sorgenti YOLO:
+# v2 per L1/L2 e v1 per L3, come nella configurazione exp_46 finale.
 def build_batch_inputs(
     feature_store: FeatureStore,
     rows: list[WindowRow],
@@ -779,6 +853,8 @@ def build_batch_inputs(
 # =============================================================================
 
 
+# Combina le probabilità gerarchiche: passaggio e no-action arrivano da L1,
+# mentre ogni tiro finale è P(tiro) * P(tipo tiro) * P(esito).
 def compute_final_scores(p_l1: np.ndarray, p_l2: np.ndarray, p_l3: np.ndarray) -> dict[str, np.ndarray]:
     p_passaggio = p_l1[:, 0]
     p_tiro = p_l1[:, 1]
@@ -803,6 +879,8 @@ def compute_final_scores(p_l1: np.ndarray, p_l2: np.ndarray, p_l3: np.ndarray) -
     }
 
 
+# Seleziona per ogni finestra la label finale con score massimo e la relativa
+# confidence da salvare nel report raw.
 def argmax_final_labels(scores: dict[str, np.ndarray]) -> tuple[list[str], np.ndarray]:
     matrix = np.stack([scores[label] for label in FINAL_LABELS], axis=1)
     indices = matrix.argmax(axis=1)
@@ -811,6 +889,7 @@ def argmax_final_labels(scores: dict[str, np.ndarray]) -> tuple[list[str], np.nd
     return labels, confidences.astype(np.float32)
 
 
+# Definisce l'ordine stabile delle colonne del CSV window_predictions_raw.csv.
 def output_fieldnames() -> list[str]:
     return [
         "window_id",
@@ -834,6 +913,8 @@ def output_fieldnames() -> list[str]:
     ]
 
 
+# Scrive una riga per ogni finestra con tempi, label predetta, confidence e
+# score di tutte le classi finali.
 def write_prediction_rows(
     writer: csv.DictWriter,
     rows: list[WindowRow],
@@ -866,11 +947,15 @@ def write_prediction_rows(
         )
 
 
+# Ciclo di inferenza vero e proprio: costruzione batch, forward dei tre modelli,
+# fusione gerarchica degli score e scrittura progressiva del CSV.
 # =============================================================================
 # Inferenza
 # =============================================================================
 
 
+# Esegue il forward di un singolo modello su un batch già paddato e restituisce
+# probabilità softmax su CPU.
 def predict_batch(
     x_np: np.ndarray,
     lengths_np: np.ndarray,
@@ -892,6 +977,8 @@ def predict_batch(
     return probs.detach().cpu().numpy().astype(np.float32)
 
 
+# Processa tutte le finestre in batch, aggiorna statistiche riepilogative e
+# salva progressivamente le predizioni raw per evitare accumuli inutili in memoria.
 def infer_all_windows(
     feature_store: FeatureStore,
     windows: list[WindowRow],
@@ -944,6 +1031,8 @@ def infer_all_windows(
     }
 
 
+# Salva un JSON di tracciamento con input, checkpoint, policy temporali,
+# configurazione runtime e riepilogo delle predizioni.
 def write_inference_metadata(
     path: Path,
     feature_store: FeatureStore,
@@ -1014,6 +1103,8 @@ def write_inference_metadata(
 # =============================================================================
 
 
+# Definizione dell'interfaccia CLI: permette di indicare feature store,
+# windows_manifest, cartella di output, batch size, device e overwrite.
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1030,6 +1121,8 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Orchestrazione completa: valida argomenti/output, carica dati e checkpoint,
+# lancia l'inferenza e scrive predizioni più metadata.
 def main() -> None:
     args = make_parser().parse_args()
     started_at = time.time()
