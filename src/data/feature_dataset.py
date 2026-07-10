@@ -1,3 +1,14 @@
+# =============================================================================
+# Scopo del modulo
+# =============================================================================
+# Fornisce il Dataset PyTorch della pipeline clip-level a partire dalle feature
+# frame-level salvate in file .pt. I file sono prodotti da
+# features/extract_features.py e vengono consumati da training/train.py e da
+# evaluation/evaluate_hierarchical.py. La funzione collate_features applica il
+# padding temporale necessario per inserire nello stesso batch clip di durata
+# diversa, mantenendo anche lunghezze reali e maschera dei timestep validi.
+# =============================================================================
+
 from pathlib import Path
 
 import torch
@@ -40,6 +51,8 @@ class FeatureDataset(Dataset):
         - formato nuovo DINOv2: "label" = indice numerico e "label_name" = nome testuale
     """
 
+    # Indicizza i file senza caricarli in memoria: il tensore viene letto solo
+    # quando il DataLoader richiede il campione corrispondente.
     def __init__(self, features_root: str | Path, split: str):
         self.features_root = Path(features_root)
         self.split = split
@@ -57,6 +70,7 @@ class FeatureDataset(Dataset):
     def __len__(self):
         return len(self.items)
 
+    # Centralizza la compatibilità tra i diversi formati storici dei file .pt.
     def _parse_label(self, item):
         """
         Converte la label in indice numerico in modo robusto.
@@ -89,6 +103,8 @@ class FeatureDataset(Dataset):
 
         return label
 
+    # Carica una sequenza [T, D], verifica il formato e restituisce i metadati
+    # minimi richiesti dal collate e dai wrapper gerarchici del training.
     def __getitem__(self, idx: int):
         path = self.items[idx]
 
@@ -114,6 +130,8 @@ class FeatureDataset(Dataset):
         }
 
 
+# Costruisce il batch rettangolare [B, Tmax, D] senza perdere la lunghezza
+# originale di ciascuna clip, usata dal Transformer per ignorare il padding.
 def collate_features(batch):
     """
     Funzione di collate personalizzata per il DataLoader.
@@ -139,6 +157,7 @@ def collate_features(batch):
     padded = torch.zeros(batch_size, max_len, feature_dim)
     mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
 
+    # Copia ogni sequenza nella porzione valida del batch e marca i timestep reali.
     for i, features in enumerate(features_list):
         T = features.shape[0]
         padded[i, :T] = features

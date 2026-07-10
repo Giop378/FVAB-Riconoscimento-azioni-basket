@@ -9,6 +9,13 @@ DINOv3 nei modelli gerarchici L1/L2/L3.
 La versione è focalizzata solo sulle sequenze temporali: non produce più feature
 statiche per clip.
 """
+# Collegamenti con la pipeline:
+# - carica i pesi YOLO generati da training/train_ball_rim_yolo.py;
+# - delega geometria e dinamica a tracking_geometry.py e I/O a tracking_io.py;
+# - produce tracking_sequences.npz e tracking_sequence_index.json;
+# - tali file sono caricati da TrackingSequenceFeatureStore in train.py e
+#   evaluate_hierarchical.py per concatenare tracking e feature DINOv3.
+
 
 from pathlib import Path
 import argparse
@@ -35,6 +42,8 @@ from src.features.tracking_io import (
 )
 
 
+# Le clip possono essere filtrate per split e label; per default vengono incluse
+# tutte le nove classi del dataset clip-level.
 SHOT_LABELS = {
     "tiroDaDue0",
     "tiroDaDue1",
@@ -140,11 +149,14 @@ def resolve_class_id(model, class_name, explicit_id=None):
     return normalized[class_name_lower]
 
 
+# Pipeline per singola clip: campionamento frame, inferenza YOLO, selezione delle
+# migliori detection, feature geometriche e costruzione della sequenza temporale.
 def process_clip(row, model, ball_class_id, rim_class_id, args):
     """Estrae detection e sequenza temporale di tracking da una singola clip."""
     video_path = row["video_path"]
     frame_count, fps, width, height = get_video_metadata(video_path)
 
+    # Il campionamento può coprire uniformemente la clip o concentrarsi sulla coda.
     frame_indices = build_frame_indices(
         frame_count=frame_count,
         num_frames=args.num_frames,
@@ -158,6 +170,8 @@ def process_clip(row, model, ball_class_id, rim_class_id, args):
 
     frame_rows = []
 
+    # YOLO processa i frame a batch; frame_order conserva l’ordine della sequenza
+    # anche se gli indici originali sono campionati e non consecutivi.
     for start in range(0, len(frames), args.batch_size):
         batch_frames = frames[start:start + args.batch_size]
         batch_indices = valid_indices[start:start + args.batch_size]
@@ -231,6 +245,8 @@ def process_clip(row, model, ball_class_id, rim_class_id, args):
                 }
             )
 
+    # Le righe per-frame vengono trasformate nel vettore temp29 o temp43 mantenendo
+    # l’ordine fissato nei checkpoint compatibili.
     temporal_feature_names = TEMPORAL_TRACKING_FEATURE_SETS[args.temporal_feature_set]
     sequence = compute_temporal_sequence_features(
         frame_rows=frame_rows,
@@ -322,6 +338,8 @@ def parse_args():
     return parser.parse_args()
 
 
+# Gestisce controlli, logging, elaborazione robusta clip-per-clip e serializzazione
+# degli output, continuando sulle clip successive in caso di errore locale.
 def main():
     args = parse_args()
     temporal_feature_names = TEMPORAL_TRACKING_FEATURE_SETS[args.temporal_feature_set]
@@ -372,6 +390,7 @@ def main():
                 raise FileNotFoundError(f"Pesi YOLO non trovati: {yolo_weights}")
 
             print("\n# Caricamento YOLO")
+            # Il detector viene caricato una sola volta e riutilizzato per tutte le clip.
             model = YOLO(str(yolo_weights))
             model_names = get_model_names(model)
             print(f"Classi YOLO: {model_names}")
@@ -441,6 +460,7 @@ def main():
                 raise RuntimeError("Nessuna sequenza temporale estratta correttamente.")
 
             print("\n# Salvataggio output")
+            # La coppia NPZ+JSON separa i tensori compressi dall’indice path->sequenza.
             npz_path, index_path, sequence_feature_names_path = write_temporal_sequences(
                 output_dir=output_dir,
                 sequence_entries=sequence_entries,

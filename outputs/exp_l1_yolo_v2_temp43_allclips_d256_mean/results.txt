@@ -1,0 +1,276 @@
+File results.txt: outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/results.txt
+
+# Comando utilizzato
+/home/vrlab/miniconda3/envs/fvab-basket/bin/python /home/vrlab/Scrivania/BasketAR/Gruppo10/FVAB_Gruppo10/FVAB-Riconoscimento-azioni-basket/src/training/train.py --features-root data/features/dinov3_vitl16_336 --output-dir outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean --label-mode action_noaction --tracking-sequences-npz data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2_v4/tracking_sequences.npz --tracking-sequence-index data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2_v4/tracking_sequence_index.json --epochs 100 --batch-size 64 --lr 5e-5 --input-dim 1024 --d-model 256 --num-layers 2 --num-heads 4 --ff-dim 768 --dropout 0.45 --weight-decay 5e-3 --pooling mean --class-weight-power 0.5 --sampler-power 0.5 --tracking-missing-policy error --num-workers 0 --seed 42
+
+================================================================================
+
+# Configurazione esperimento
+features_root: data/features/dinov3_vitl16_336
+output_dir: outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean
+epochs: 100
+batch_size: 64
+lr: 5e-05
+weight_decay: 0.005
+input_dim: 1024
+d_model: 256
+num_layers: 2
+num_heads: 4
+ff_dim: 768
+dropout: 0.45
+pooling: mean
+last_mean_ratio: 0.3
+max_len: 1024
+label_mode: action_noaction
+tracking_features_csv: None
+tracking_sequences_npz: data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2_v4/tracking_sequences.npz
+tracking_sequence_index: data/features/ball_rim_tracking_temporal_clip_complete_yolo_v2_v4/tracking_sequence_index.json
+tracking_missing_policy: error
+no_normalize_tracking_features: False
+num_workers: 0
+grad_clip: 1.0
+seed: 42
+class_weight_power: 0.5
+no_class_weights: False
+sampler_power: 0.5
+no_weighted_sampler: False
+scheduler_factor: 0.5
+scheduler_patience: 5
+scheduler_min_lr: 1e-06
+
+================================================================================
+
+Device: cuda
+Seed: 42
+
+# Label mode
+Label mode: action_noaction
+Classi usate nel training:
+  0: passaggio
+  1: tiro
+  2: no-action
+
+Mapping label originali -> label usate nel training:
+  passaggio -> passaggio
+  tiroDaDue0 -> tiro
+  tiroDaDue1 -> tiro
+  tiroDaTre0 -> tiro
+  tiroDaTre1 -> tiro
+  tiroLibero0 -> tiro
+  tiroLibero1 -> tiro
+  idle -> no-action
+  non-gioco -> no-action
+
+# Dataset
+Train samples originali: 4236
+Train samples usati: 4236
+Val samples originali: 540
+Val samples usati: 540
+
+# Distribuzione classi
+Class counts:
+  passaggio: 1787
+  tiro: 633
+  no-action: 1816
+
+Class weights:
+  passaggio: 0.8170
+  tiro: 1.3726
+  no-action: 0.8104
+
+Weighted CrossEntropyLoss attiva.
+
+WeightedRandomSampler attivato.
+
+# Feature tracking palla/canestro temporali
+
+# Normalizzazione sequenze tracking
+Frame/sequenze usati per stimare mean/std: 113610
+Campioni train senza sequenze tracking: 0
+
+# TemporalTrackingAugmentedDataset
+Campioni: 4236
+Feature tracking temporali per frame: 43
+Campioni senza tracking sequences: 0
+Missing policy: error
+
+# TemporalTrackingAugmentedDataset
+Campioni: 540
+Feature tracking temporali per frame: 43
+Campioni senza tracking sequences: 0
+Missing policy: error
+Input dim feature video: 1024
+Input dim feature tracking temporali: 43
+Input dim totale modello: 1067
+/home/vrlab/Scrivania/BasketAR/Gruppo10/FVAB_Gruppo10/FVAB-Riconoscimento-azioni-basket/src/models/temporal_transformer_classifier.py:131: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.transformer_encoder = nn.TransformerEncoder(
+
+# Modello
+TemporalTransformerActionClassifier(
+  (input_projection): Linear(in_features=1067, out_features=256, bias=True)
+  (input_norm): LayerNorm((256,), eps=1e-05, elementwise_affine=True, bias=True)
+  (positional_encoding): SinusoidalPositionalEncoding()
+  (transformer_encoder): TransformerEncoder(
+    (layers): ModuleList(
+      (0-1): 2 x TransformerEncoderLayer(
+        (self_attn): MultiheadAttention(
+          (out_proj): NonDynamicallyQuantizableLinear(in_features=256, out_features=256, bias=True)
+        )
+        (linear1): Linear(in_features=256, out_features=768, bias=True)
+        (dropout): Dropout(p=0.45, inplace=False)
+        (linear2): Linear(in_features=768, out_features=256, bias=True)
+        (norm1): LayerNorm((256,), eps=1e-05, elementwise_affine=True, bias=True)
+        (norm2): LayerNorm((256,), eps=1e-05, elementwise_affine=True, bias=True)
+        (dropout1): Dropout(p=0.45, inplace=False)
+        (dropout2): Dropout(p=0.45, inplace=False)
+      )
+    )
+    (norm): LayerNorm((256,), eps=1e-05, elementwise_affine=True, bias=True)
+  )
+  (classifier): Sequential(
+    (0): LayerNorm((256,), eps=1e-05, elementwise_affine=True, bias=True)
+    (1): Dropout(p=0.45, inplace=False)
+    (2): Linear(in_features=256, out_features=3, bias=True)
+  )
+)
+
+# Training
+Scheduler: ReduceLROnPlateau(mode='max', factor=0.5, patience=5, min_lr=1e-06)
+Epoch 001 | lr 0.00005000 | train loss 0.6129 acc 0.7349 macroF1 0.7348 weightedF1 0.7346 | val loss 0.2884 acc 0.8815 macroF1 0.8952 weightedF1 0.8814
+Salvato nuovo best model: outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/best_model.pt
+Epoch 002 | lr 0.00005000 | train loss 0.2739 acc 0.8987 macroF1 0.9035 weightedF1 0.8985 | val loss 0.3210 acc 0.8926 macroF1 0.8995 weightedF1 0.8921
+Salvato nuovo best model: outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/best_model.pt
+Epoch 003 | lr 0.00005000 | train loss 0.2332 acc 0.9042 macroF1 0.9110 weightedF1 0.9039 | val loss 0.2463 acc 0.9037 macroF1 0.9124 weightedF1 0.9036
+Salvato nuovo best model: outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/best_model.pt
+Epoch 004 | lr 0.00005000 | train loss 0.2141 acc 0.9174 macroF1 0.9231 weightedF1 0.9173 | val loss 0.2241 acc 0.9056 macroF1 0.9173 weightedF1 0.9054
+Salvato nuovo best model: outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/best_model.pt
+Epoch 005 | lr 0.00005000 | train loss 0.1994 acc 0.9148 macroF1 0.9210 weightedF1 0.9147 | val loss 0.2566 acc 0.9074 macroF1 0.9188 weightedF1 0.9072
+Salvato nuovo best model: outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/best_model.pt
+Epoch 006 | lr 0.00005000 | train loss 0.2212 acc 0.9086 macroF1 0.9159 weightedF1 0.9086 | val loss 0.2423 acc 0.9167 macroF1 0.9259 weightedF1 0.9165
+Salvato nuovo best model: outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/best_model.pt
+Epoch 007 | lr 0.00005000 | train loss 0.1834 acc 0.9266 macroF1 0.9325 weightedF1 0.9265 | val loss 0.2449 acc 0.9148 macroF1 0.9245 weightedF1 0.9146
+Epoch 008 | lr 0.00005000 | train loss 0.1802 acc 0.9259 macroF1 0.9310 weightedF1 0.9258 | val loss 0.2749 acc 0.9111 macroF1 0.9217 weightedF1 0.9109
+Epoch 009 | lr 0.00005000 | train loss 0.1766 acc 0.9285 macroF1 0.9336 weightedF1 0.9283 | val loss 0.3169 acc 0.9056 macroF1 0.9174 weightedF1 0.9051
+Epoch 010 | lr 0.00005000 | train loss 0.1655 acc 0.9320 macroF1 0.9368 weightedF1 0.9320 | val loss 0.2450 acc 0.9111 macroF1 0.9213 weightedF1 0.9110
+Epoch 011 | lr 0.00005000 | train loss 0.1675 acc 0.9292 macroF1 0.9346 weightedF1 0.9291 | val loss 0.2583 acc 0.9074 macroF1 0.9152 weightedF1 0.9073
+Epoch 012 | lr 0.00005000 | train loss 0.1446 acc 0.9433 macroF1 0.9478 weightedF1 0.9433 | val loss 0.3019 acc 0.9037 macroF1 0.9142 weightedF1 0.9036
+Learning rate aggiornato: 0.00005000 -> 0.00002500
+Epoch 013 | lr 0.00002500 | train loss 0.1614 acc 0.9351 macroF1 0.9401 weightedF1 0.9351 | val loss 0.2569 acc 0.9111 macroF1 0.9198 weightedF1 0.9110
+Epoch 014 | lr 0.00002500 | train loss 0.1303 acc 0.9450 macroF1 0.9505 weightedF1 0.9450 | val loss 0.3129 acc 0.9093 macroF1 0.9149 weightedF1 0.9092
+Epoch 015 | lr 0.00002500 | train loss 0.1273 acc 0.9433 macroF1 0.9483 weightedF1 0.9433 | val loss 0.2718 acc 0.9185 macroF1 0.9236 weightedF1 0.9185
+Epoch 016 | lr 0.00002500 | train loss 0.1251 acc 0.9518 macroF1 0.9559 weightedF1 0.9518 | val loss 0.2793 acc 0.9148 macroF1 0.9190 weightedF1 0.9148
+Epoch 017 | lr 0.00002500 | train loss 0.1276 acc 0.9478 macroF1 0.9525 weightedF1 0.9478 | val loss 0.2966 acc 0.9074 macroF1 0.9170 weightedF1 0.9073
+Epoch 018 | lr 0.00002500 | train loss 0.1240 acc 0.9450 macroF1 0.9497 weightedF1 0.9450 | val loss 0.2940 acc 0.9111 macroF1 0.9198 weightedF1 0.9110
+Learning rate aggiornato: 0.00002500 -> 0.00001250
+Epoch 019 | lr 0.00001250 | train loss 0.1172 acc 0.9530 macroF1 0.9574 weightedF1 0.9530 | val loss 0.2890 acc 0.9111 macroF1 0.9179 weightedF1 0.9110
+Epoch 020 | lr 0.00001250 | train loss 0.1067 acc 0.9554 macroF1 0.9596 weightedF1 0.9554 | val loss 0.2781 acc 0.9204 macroF1 0.9249 weightedF1 0.9203
+Epoch 021 | lr 0.00001250 | train loss 0.1087 acc 0.9542 macroF1 0.9587 weightedF1 0.9542 | val loss 0.2830 acc 0.9167 macroF1 0.9221 weightedF1 0.9166
+Epoch 022 | lr 0.00001250 | train loss 0.1086 acc 0.9540 macroF1 0.9588 weightedF1 0.9539 | val loss 0.2853 acc 0.9185 macroF1 0.9235 weightedF1 0.9185
+Epoch 023 | lr 0.00001250 | train loss 0.1012 acc 0.9610 macroF1 0.9639 weightedF1 0.9610 | val loss 0.3220 acc 0.9148 macroF1 0.9208 weightedF1 0.9147
+Epoch 024 | lr 0.00001250 | train loss 0.0993 acc 0.9587 macroF1 0.9623 weightedF1 0.9587 | val loss 0.2927 acc 0.9111 macroF1 0.9159 weightedF1 0.9111
+Learning rate aggiornato: 0.00001250 -> 0.00000625
+Epoch 025 | lr 0.00000625 | train loss 0.1056 acc 0.9592 macroF1 0.9630 weightedF1 0.9591 | val loss 0.3007 acc 0.9148 macroF1 0.9189 weightedF1 0.9148
+Epoch 026 | lr 0.00000625 | train loss 0.1092 acc 0.9511 macroF1 0.9559 weightedF1 0.9511 | val loss 0.3162 acc 0.9130 macroF1 0.9176 weightedF1 0.9129
+Epoch 027 | lr 0.00000625 | train loss 0.0985 acc 0.9563 macroF1 0.9600 weightedF1 0.9563 | val loss 0.3144 acc 0.9148 macroF1 0.9207 weightedF1 0.9147
+Epoch 028 | lr 0.00000625 | train loss 0.0932 acc 0.9603 macroF1 0.9637 weightedF1 0.9603 | val loss 0.3074 acc 0.9130 macroF1 0.9193 weightedF1 0.9129
+Epoch 029 | lr 0.00000625 | train loss 0.0974 acc 0.9577 macroF1 0.9615 weightedF1 0.9577 | val loss 0.3055 acc 0.9167 macroF1 0.9221 weightedF1 0.9166
+Epoch 030 | lr 0.00000625 | train loss 0.0905 acc 0.9615 macroF1 0.9654 weightedF1 0.9615 | val loss 0.3228 acc 0.9148 macroF1 0.9190 weightedF1 0.9148
+Learning rate aggiornato: 0.00000625 -> 0.00000313
+Epoch 031 | lr 0.00000313 | train loss 0.0951 acc 0.9629 macroF1 0.9669 weightedF1 0.9629 | val loss 0.3262 acc 0.9148 macroF1 0.9208 weightedF1 0.9147
+Epoch 032 | lr 0.00000313 | train loss 0.0868 acc 0.9662 macroF1 0.9698 weightedF1 0.9662 | val loss 0.3295 acc 0.9130 macroF1 0.9194 weightedF1 0.9128
+Epoch 033 | lr 0.00000313 | train loss 0.0805 acc 0.9648 macroF1 0.9689 weightedF1 0.9648 | val loss 0.3048 acc 0.9167 macroF1 0.9221 weightedF1 0.9166
+Epoch 034 | lr 0.00000313 | train loss 0.0803 acc 0.9669 macroF1 0.9706 weightedF1 0.9669 | val loss 0.3160 acc 0.9130 macroF1 0.9176 weightedF1 0.9129
+Epoch 035 | lr 0.00000313 | train loss 0.0994 acc 0.9648 macroF1 0.9688 weightedF1 0.9648 | val loss 0.3017 acc 0.9185 macroF1 0.9235 weightedF1 0.9185
+Epoch 036 | lr 0.00000313 | train loss 0.0804 acc 0.9669 macroF1 0.9700 weightedF1 0.9669 | val loss 0.3174 acc 0.9185 macroF1 0.9236 weightedF1 0.9184
+Learning rate aggiornato: 0.00000313 -> 0.00000156
+Epoch 037 | lr 0.00000156 | train loss 0.0815 acc 0.9695 macroF1 0.9726 weightedF1 0.9695 | val loss 0.3179 acc 0.9148 macroF1 0.9190 weightedF1 0.9148
+Epoch 038 | lr 0.00000156 | train loss 0.0771 acc 0.9712 macroF1 0.9746 weightedF1 0.9712 | val loss 0.3171 acc 0.9167 macroF1 0.9204 weightedF1 0.9166
+Epoch 039 | lr 0.00000156 | train loss 0.0935 acc 0.9636 macroF1 0.9674 weightedF1 0.9636 | val loss 0.3226 acc 0.9148 macroF1 0.9207 weightedF1 0.9147
+Epoch 040 | lr 0.00000156 | train loss 0.0899 acc 0.9625 macroF1 0.9663 weightedF1 0.9624 | val loss 0.3139 acc 0.9167 macroF1 0.9204 weightedF1 0.9166
+Epoch 041 | lr 0.00000156 | train loss 0.0945 acc 0.9615 macroF1 0.9650 weightedF1 0.9615 | val loss 0.3220 acc 0.9148 macroF1 0.9207 weightedF1 0.9147
+Epoch 042 | lr 0.00000156 | train loss 0.0772 acc 0.9695 macroF1 0.9729 weightedF1 0.9695 | val loss 0.3190 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Learning rate aggiornato: 0.00000156 -> 0.00000100
+Epoch 043 | lr 0.00000100 | train loss 0.0955 acc 0.9655 macroF1 0.9689 weightedF1 0.9655 | val loss 0.3187 acc 0.9204 macroF1 0.9250 weightedF1 0.9203
+Epoch 044 | lr 0.00000100 | train loss 0.0865 acc 0.9662 macroF1 0.9700 weightedF1 0.9662 | val loss 0.3262 acc 0.9148 macroF1 0.9207 weightedF1 0.9147
+Epoch 045 | lr 0.00000100 | train loss 0.0845 acc 0.9632 macroF1 0.9677 weightedF1 0.9631 | val loss 0.3206 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 046 | lr 0.00000100 | train loss 0.0924 acc 0.9622 macroF1 0.9658 weightedF1 0.9622 | val loss 0.3243 acc 0.9148 macroF1 0.9207 weightedF1 0.9147
+Epoch 047 | lr 0.00000100 | train loss 0.0716 acc 0.9712 macroF1 0.9741 weightedF1 0.9712 | val loss 0.3311 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 048 | lr 0.00000100 | train loss 0.0896 acc 0.9641 macroF1 0.9676 weightedF1 0.9641 | val loss 0.3241 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 049 | lr 0.00000100 | train loss 0.0785 acc 0.9693 macroF1 0.9719 weightedF1 0.9693 | val loss 0.3197 acc 0.9222 macroF1 0.9264 weightedF1 0.9222
+Salvato nuovo best model: outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/best_model.pt
+Epoch 050 | lr 0.00000100 | train loss 0.0857 acc 0.9679 macroF1 0.9717 weightedF1 0.9679 | val loss 0.3258 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 051 | lr 0.00000100 | train loss 0.0795 acc 0.9677 macroF1 0.9709 weightedF1 0.9676 | val loss 0.3168 acc 0.9222 macroF1 0.9264 weightedF1 0.9222
+Epoch 052 | lr 0.00000100 | train loss 0.0798 acc 0.9677 macroF1 0.9709 weightedF1 0.9676 | val loss 0.3261 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 053 | lr 0.00000100 | train loss 0.0881 acc 0.9646 macroF1 0.9686 weightedF1 0.9646 | val loss 0.3230 acc 0.9185 macroF1 0.9236 weightedF1 0.9185
+Epoch 054 | lr 0.00000100 | train loss 0.0788 acc 0.9688 macroF1 0.9724 weightedF1 0.9688 | val loss 0.3233 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 055 | lr 0.00000100 | train loss 0.0789 acc 0.9677 macroF1 0.9707 weightedF1 0.9676 | val loss 0.3261 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 056 | lr 0.00000100 | train loss 0.0873 acc 0.9622 macroF1 0.9660 weightedF1 0.9622 | val loss 0.3232 acc 0.9148 macroF1 0.9190 weightedF1 0.9148
+Epoch 057 | lr 0.00000100 | train loss 0.0794 acc 0.9688 macroF1 0.9723 weightedF1 0.9688 | val loss 0.3234 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 058 | lr 0.00000100 | train loss 0.0815 acc 0.9700 macroF1 0.9729 weightedF1 0.9700 | val loss 0.3241 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 059 | lr 0.00000100 | train loss 0.0782 acc 0.9714 macroF1 0.9744 weightedF1 0.9714 | val loss 0.3261 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 060 | lr 0.00000100 | train loss 0.0904 acc 0.9634 macroF1 0.9672 weightedF1 0.9634 | val loss 0.3270 acc 0.9185 macroF1 0.9236 weightedF1 0.9185
+Epoch 061 | lr 0.00000100 | train loss 0.0818 acc 0.9662 macroF1 0.9699 weightedF1 0.9662 | val loss 0.3305 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 062 | lr 0.00000100 | train loss 0.0849 acc 0.9655 macroF1 0.9698 weightedF1 0.9655 | val loss 0.3296 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 063 | lr 0.00000100 | train loss 0.0843 acc 0.9653 macroF1 0.9689 weightedF1 0.9652 | val loss 0.3361 acc 0.9130 macroF1 0.9193 weightedF1 0.9129
+Epoch 064 | lr 0.00000100 | train loss 0.0787 acc 0.9658 macroF1 0.9688 weightedF1 0.9657 | val loss 0.3277 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 065 | lr 0.00000100 | train loss 0.0785 acc 0.9677 macroF1 0.9708 weightedF1 0.9676 | val loss 0.3266 acc 0.9185 macroF1 0.9236 weightedF1 0.9185
+Epoch 066 | lr 0.00000100 | train loss 0.0838 acc 0.9669 macroF1 0.9707 weightedF1 0.9669 | val loss 0.3361 acc 0.9148 macroF1 0.9207 weightedF1 0.9147
+Epoch 067 | lr 0.00000100 | train loss 0.0760 acc 0.9667 macroF1 0.9700 weightedF1 0.9667 | val loss 0.3313 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 068 | lr 0.00000100 | train loss 0.0787 acc 0.9648 macroF1 0.9689 weightedF1 0.9648 | val loss 0.3273 acc 0.9185 macroF1 0.9236 weightedF1 0.9185
+Epoch 069 | lr 0.00000100 | train loss 0.0786 acc 0.9688 macroF1 0.9721 weightedF1 0.9688 | val loss 0.3280 acc 0.9185 macroF1 0.9236 weightedF1 0.9185
+Epoch 070 | lr 0.00000100 | train loss 0.0818 acc 0.9672 macroF1 0.9702 weightedF1 0.9671 | val loss 0.3287 acc 0.9185 macroF1 0.9236 weightedF1 0.9185
+Epoch 071 | lr 0.00000100 | train loss 0.0807 acc 0.9703 macroF1 0.9734 weightedF1 0.9702 | val loss 0.3284 acc 0.9185 macroF1 0.9236 weightedF1 0.9185
+Epoch 072 | lr 0.00000100 | train loss 0.0685 acc 0.9707 macroF1 0.9742 weightedF1 0.9707 | val loss 0.3273 acc 0.9185 macroF1 0.9236 weightedF1 0.9185
+Epoch 073 | lr 0.00000100 | train loss 0.0891 acc 0.9686 macroF1 0.9710 weightedF1 0.9686 | val loss 0.3240 acc 0.9185 macroF1 0.9235 weightedF1 0.9185
+Epoch 074 | lr 0.00000100 | train loss 0.0773 acc 0.9691 macroF1 0.9726 weightedF1 0.9691 | val loss 0.3313 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 075 | lr 0.00000100 | train loss 0.0719 acc 0.9700 macroF1 0.9729 weightedF1 0.9700 | val loss 0.3298 acc 0.9167 macroF1 0.9204 weightedF1 0.9166
+Epoch 076 | lr 0.00000100 | train loss 0.0797 acc 0.9660 macroF1 0.9697 weightedF1 0.9660 | val loss 0.3334 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 077 | lr 0.00000100 | train loss 0.0824 acc 0.9698 macroF1 0.9730 weightedF1 0.9698 | val loss 0.3337 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 078 | lr 0.00000100 | train loss 0.0836 acc 0.9686 macroF1 0.9712 weightedF1 0.9686 | val loss 0.3255 acc 0.9185 macroF1 0.9236 weightedF1 0.9185
+Epoch 079 | lr 0.00000100 | train loss 0.0766 acc 0.9707 macroF1 0.9732 weightedF1 0.9707 | val loss 0.3245 acc 0.9185 macroF1 0.9235 weightedF1 0.9185
+Epoch 080 | lr 0.00000100 | train loss 0.0748 acc 0.9681 macroF1 0.9716 weightedF1 0.9681 | val loss 0.3318 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 081 | lr 0.00000100 | train loss 0.0807 acc 0.9686 macroF1 0.9717 weightedF1 0.9686 | val loss 0.3334 acc 0.9185 macroF1 0.9218 weightedF1 0.9185
+Epoch 082 | lr 0.00000100 | train loss 0.0676 acc 0.9743 macroF1 0.9768 weightedF1 0.9742 | val loss 0.3372 acc 0.9148 macroF1 0.9190 weightedF1 0.9148
+Epoch 083 | lr 0.00000100 | train loss 0.0737 acc 0.9707 macroF1 0.9740 weightedF1 0.9707 | val loss 0.3292 acc 0.9167 macroF1 0.9221 weightedF1 0.9166
+Epoch 084 | lr 0.00000100 | train loss 0.0776 acc 0.9677 macroF1 0.9707 weightedF1 0.9676 | val loss 0.3268 acc 0.9167 macroF1 0.9221 weightedF1 0.9166
+Epoch 085 | lr 0.00000100 | train loss 0.0711 acc 0.9736 macroF1 0.9763 weightedF1 0.9735 | val loss 0.3337 acc 0.9167 macroF1 0.9204 weightedF1 0.9166
+Epoch 086 | lr 0.00000100 | train loss 0.0712 acc 0.9714 macroF1 0.9750 weightedF1 0.9714 | val loss 0.3246 acc 0.9222 macroF1 0.9263 weightedF1 0.9222
+Epoch 087 | lr 0.00000100 | train loss 0.0755 acc 0.9740 macroF1 0.9766 weightedF1 0.9740 | val loss 0.3310 acc 0.9185 macroF1 0.9236 weightedF1 0.9185
+Epoch 088 | lr 0.00000100 | train loss 0.0787 acc 0.9700 macroF1 0.9733 weightedF1 0.9700 | val loss 0.3403 acc 0.9148 macroF1 0.9207 weightedF1 0.9147
+Epoch 089 | lr 0.00000100 | train loss 0.0742 acc 0.9698 macroF1 0.9726 weightedF1 0.9697 | val loss 0.3382 acc 0.9148 macroF1 0.9207 weightedF1 0.9147
+Epoch 090 | lr 0.00000100 | train loss 0.0764 acc 0.9681 macroF1 0.9719 weightedF1 0.9681 | val loss 0.3396 acc 0.9148 macroF1 0.9207 weightedF1 0.9147
+Epoch 091 | lr 0.00000100 | train loss 0.0698 acc 0.9724 macroF1 0.9757 weightedF1 0.9724 | val loss 0.3511 acc 0.9148 macroF1 0.9208 weightedF1 0.9147
+Epoch 092 | lr 0.00000100 | train loss 0.0829 acc 0.9669 macroF1 0.9708 weightedF1 0.9669 | val loss 0.3264 acc 0.9204 macroF1 0.9249 weightedF1 0.9203
+Epoch 093 | lr 0.00000100 | train loss 0.0767 acc 0.9681 macroF1 0.9716 weightedF1 0.9681 | val loss 0.3403 acc 0.9148 macroF1 0.9207 weightedF1 0.9147
+Epoch 094 | lr 0.00000100 | train loss 0.0710 acc 0.9724 macroF1 0.9753 weightedF1 0.9724 | val loss 0.3311 acc 0.9222 macroF1 0.9264 weightedF1 0.9222
+Epoch 095 | lr 0.00000100 | train loss 0.0839 acc 0.9693 macroF1 0.9726 weightedF1 0.9693 | val loss 0.3381 acc 0.9167 macroF1 0.9204 weightedF1 0.9166
+Epoch 096 | lr 0.00000100 | train loss 0.0814 acc 0.9693 macroF1 0.9731 weightedF1 0.9693 | val loss 0.3338 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 097 | lr 0.00000100 | train loss 0.0883 acc 0.9636 macroF1 0.9677 weightedF1 0.9636 | val loss 0.3380 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 098 | lr 0.00000100 | train loss 0.0743 acc 0.9698 macroF1 0.9732 weightedF1 0.9698 | val loss 0.3481 acc 0.9130 macroF1 0.9176 weightedF1 0.9129
+Epoch 099 | lr 0.00000100 | train loss 0.0645 acc 0.9714 macroF1 0.9745 weightedF1 0.9714 | val loss 0.3412 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+Epoch 100 | lr 0.00000100 | train loss 0.0669 acc 0.9731 macroF1 0.9758 weightedF1 0.9731 | val loss 0.3411 acc 0.9167 macroF1 0.9222 weightedF1 0.9166
+
+================================================================================
+
+Valutazione finale su validation usando il miglior modello salvato:
+Best epoch: 49
+Best val loss: 0.3197
+Best val accuracy: 0.9222
+Best val macro-F1: 0.9264
+Best val weighted-F1: 0.9222
+
+Classification report - 3 classi (action_noaction):
+              precision    recall  f1-score   support
+
+   passaggio       0.89      0.95      0.92       212
+        tiro       0.93      0.95      0.94        65
+   no-action       0.95      0.89      0.92       263
+
+    accuracy                           0.92       540
+   macro avg       0.92      0.93      0.93       540
+weighted avg       0.92      0.92      0.92       540
+
+Confusion matrix - 3 classi (action_noaction):
+[[202   1   9]
+ [  0  62   3]
+ [ 25   4 234]]

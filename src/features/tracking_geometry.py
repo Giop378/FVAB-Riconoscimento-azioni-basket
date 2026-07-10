@@ -5,12 +5,20 @@ Contiene la definizione dei set temporali temp29 e temp43, le utility per
 convertire le detection YOLO in feature normalizzate e il calcolo della sequenza
 per-frame usata dai modelli gerarchici.
 """
+# Collegamenti con la pipeline:
+# - extract_ball_rim_tracking_features.py passa qui gli output YOLO per ottenere
+#   detection normalizzate, relazioni palla-canestro e derivate temporali;
+# - tracking_io.py serializza le sequenze secondo l’ordine dei nomi definito qui;
+# - TrackingSequenceFeatureStore e i checkpoint assumono che tale ordine resti stabile.
+
 
 import math
 
 import numpy as np
 
 
+# L’ordine delle feature è parte del formato dati: modificarlo renderebbe le
+# sequenze incompatibili con normalizzazioni e checkpoint già salvati.
 TEMPORAL_TRACKING_FEATURE_NAMES = [
     # Detection quality / visibility.
     "t_rel",
@@ -118,6 +126,7 @@ def safe_float(value, default=0.0):
     return float(value)
 
 
+# Converte coordinate pixel YOLO in centro, dimensioni e area normalizzati in [0, 1].
 def detection_to_dict(box_xyxy, conf, frame_width, frame_height):
     x1, y1, x2, y2 = [float(v) for v in box_xyxy]
 
@@ -208,6 +217,8 @@ def detection_iou(det_a, det_b) -> float:
     return float(inter_area / union)
 
 
+# Per ogni frame conserva al massimo la detection più confidente di palla e rim;
+# in assenza di una classe restituisce un record esplicito di non rilevamento.
 def parse_yolo_result(result, ball_class_id, rim_class_id, frame_width, frame_height):
     best = {
         "ball": None,
@@ -240,6 +251,8 @@ def parse_yolo_result(result, ball_class_id, rim_class_id, frame_width, frame_he
     return ball, rim
 
 
+# Deriva feature geometriche soltanto quando entrambi gli oggetti sono visibili;
+# altrimenti usa valori neutri coerenti con il formato della sequenza.
 def compute_pair_features(ball, rim, near_threshold, rim_inside_margin=0.15):
     both_detected = int(ball["detected"] == 1 and rim["detected"] == 1)
 
@@ -290,6 +303,8 @@ def compute_pair_features(ball, rim, near_threshold, rim_inside_margin=0.15):
 
 
 
+# Calcola differenze finite rispetto al frame campionato precedente e combina
+# visibilità, geometria, moto assoluto e moto relativo nel vettore per-frame.
 def compute_temporal_sequence_features(frame_rows, fps, temporal_feature_names=None):
     """
     Converte le detection per-frame in una sequenza [S, K] di feature temporali.
@@ -336,6 +351,8 @@ def compute_temporal_sequence_features(frame_rows, fps, temporal_feature_names=N
         crosses_rim_y_upward_frame = 0.0
         current_velocity_valid = False
 
+        # Le derivate sono valide solo se il tempo trascorso è positivo e le
+        # detection necessarie sono presenti in entrambi i frame confrontati.
         if prev_row is not None:
             delta_frames = int(row["frame_idx"]) - int(prev_row["frame_idx"])
             dt = delta_frames / fps if fps > 0 and delta_frames > 0 else 0.0
@@ -420,6 +437,7 @@ def compute_temporal_sequence_features(frame_rows, fps, temporal_feature_names=N
             "ball_crosses_rim_y_upward_frame": crosses_rim_y_upward_frame,
         }
 
+        # La selezione per nome garantisce esattamente l’ordine del set temp29/temp43.
         sequence_rows.append([
             safe_float(feature_values[name], default=0.0)
             for name in temporal_feature_names

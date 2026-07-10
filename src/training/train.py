@@ -11,6 +11,13 @@ per le clip. Supporta solo i tre livelli usati nella configurazione finale:
 Per exp_46 usa feature tracking temporali palla/canestro salvate in formato
 NPZ + JSON e le concatena frame-per-frame alle feature DINOv3.
 """
+# Collegamenti con la pipeline:
+# - FeatureDataset legge i .pt generati da features/extract_features.py;
+# - TrackingSequenceFeatureStore legge le sequenze prodotte dal detector YOLO;
+# - LabelMappedDataset crea i tre task L1/L2/L3 senza duplicare le feature;
+# - TemporalTransformerActionClassifier viene addestrato e salvato con tutta la
+#   configurazione necessaria a evaluation/evaluate_hierarchical.py.
+
 
 from pathlib import Path
 import argparse
@@ -51,6 +58,8 @@ def get_reconstructed_command() -> str:
     return " ".join(shlex.quote(str(part)) for part in parts)
 
 
+# Fissa le sorgenti di casualità e disabilita le ottimizzazioni cuDNN non
+# deterministiche per rendere confrontabili gli esperimenti.
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -70,6 +79,8 @@ def get_original_idx_to_label() -> dict[int, str]:
     return {idx: IDX_TO_LABEL[idx] for idx in range(len(IDX_TO_LABEL))}
 
 
+# Definisce il vocabolario di ciascun livello e quali classi originali devono
+# essere fuse oppure escluse dal relativo dataset.
 def build_label_mapping(label_mode: str):
     """
     Costruisce il mapping tra label originali e label usate da uno specifico
@@ -162,6 +173,8 @@ def infer_original_label_from_item(item) -> str:
     return Path(item).parent.name
 
 
+# Vista logica sul dataset base: conserva gli stessi tensori e sostituisce soltanto
+# la label con quella del task gerarchico selezionato.
 class LabelMappedDataset(Dataset):
     """
     Wrapper di FeatureDataset che rimappa le label originali nel label space
@@ -244,6 +257,8 @@ def get_base_item_path_from_label_dataset(label_dataset, idx: int) -> str:
     return ""
 
 
+# Wrapper opzionale applicato dopo il remapping: allinea il tracking a T e lo
+# concatena lungo la dimensione delle feature, ottenendo [T, D_visuale + K].
 class TemporalTrackingAugmentedDataset(Dataset):
     """
     Concatena a ogni timestep DINOv3 la sequenza tracking palla/canestro
@@ -334,6 +349,8 @@ def get_dataset_labels_and_counts(dataset: Dataset, num_classes: int):
     return torch.tensor(labels, dtype=torch.long), counts
 
 
+# Pesi di loss e sampler usano potenze configurabili della frequenza inversa per
+# mitigare lo sbilanciamento senza imporre necessariamente una compensazione piena.
 def compute_class_weights_from_counts(counts: torch.Tensor, power: float = 0.5):
     weights = 1.0 / torch.pow(counts.clamp(min=1.0), power)
     return weights / weights.mean()
@@ -386,6 +403,7 @@ def get_current_lr(optimizer) -> float:
     return optimizer.param_groups[0]["lr"]
 
 
+# Passata di training con backpropagation, gradient clipping e metriche aggregate.
 def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip: float = 1.0):
     model.train()
     total_loss = 0.0
@@ -419,6 +437,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip: floa
     return avg_loss, acc, macro_f1, weighted_f1
 
 
+# Passata di validazione priva di gradienti; restituisce anche label e predizioni
+# per il report finale del miglior checkpoint.
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
     model.eval()
@@ -539,6 +559,8 @@ def parse_args():
     return parser.parse_args()
 
 
+# Calcola la dimensione effettiva dell’input e costruisce in parallelo il dizionario
+# model_config che verrà serializzato nel checkpoint.
 def build_model(args, device, num_classes: int, tracking_dim: int = 0, tracking_config=None):
     input_dim = int(args.input_dim)
     actual_input_dim = input_dim + int(tracking_dim)
@@ -576,6 +598,8 @@ def build_model(args, device, num_classes: int, tracking_dim: int = 0, tracking_
     return model, model_config
 
 
+# Orchestrazione completa dell’esperimento: dataset, bilanciamento, tracking,
+# DataLoader, modello, ottimizzatore, scheduler, selezione e salvataggio del best.
 def run_training(args) -> None:
     print("# Comando utilizzato")
     print(get_reconstructed_command())
@@ -598,6 +622,8 @@ def run_training(args) -> None:
 
     print_label_mode_info(args.label_mode, label_mapping, idx_to_label)
 
+    # Le feature originali vengono caricate una sola volta per split e poi viste
+    # attraverso il mapping specifico del livello gerarchico.
     base_train_dataset = FeatureDataset(args.features_root, split="train")
     base_val_dataset = FeatureDataset(args.features_root, split="val")
 
@@ -613,6 +639,8 @@ def run_training(args) -> None:
     train_labels, train_counts = get_dataset_labels_and_counts(train_dataset, num_classes=num_classes)
 
     print("\n# Distribuzione classi")
+    # Loss pesata e sampler sono indipendenti e possono essere attivati/disattivati
+    # separatamente per controllare l’intensità del bilanciamento.
     if args.no_class_weights:
         class_weights = None
         criterion = nn.CrossEntropyLoss()
@@ -647,6 +675,8 @@ def run_training(args) -> None:
     tracking_dim = 0
     tracking_config = None
 
+    # La normalizzazione viene stimata esclusivamente sui path del train set e la
+    # stessa mean/std viene riutilizzata per validation e salvata nel checkpoint.
     if args.tracking_sequences_npz is not None:
         print("\n# Feature tracking palla/canestro temporali")
         tracking_store = TrackingSequenceFeatureStore(
@@ -687,6 +717,7 @@ def run_training(args) -> None:
     data_loader_generator = torch.Generator()
     data_loader_generator.manual_seed(args.seed)
 
+    # Il collate condiviso esegue il padding temporale dopo gli eventuali wrapper.
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -718,6 +749,8 @@ def run_training(args) -> None:
         tracking_config=tracking_config,
     )
 
+    # AdamW ottimizza solo il classificatore temporale; le feature DINOv3 sono già
+    # estratte offline e quindi non partecipano alla retropropagazione.
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -753,6 +786,8 @@ def run_training(args) -> None:
 
     output_dir = Path(args.output_dir)
 
+    # Il criterio di selezione e dello scheduler è la Macro F1 di validation, più
+    # informativa dell’accuracy in presenza di classi sbilanciate.
     for epoch in range(1, args.epochs + 1):
         current_lr = get_current_lr(optimizer)
 
@@ -798,6 +833,8 @@ def run_training(args) -> None:
 
             checkpoint_path = output_dir / "best_model.pt"
 
+            # Il checkpoint include pesi, mapping delle label, configurazioni di
+            # modello/tracking/training e comando ricostruito per la riproducibilità.
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),

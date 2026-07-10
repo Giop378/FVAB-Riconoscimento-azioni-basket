@@ -8,6 +8,13 @@ una predizione di classe per l'intera clip.
 È usato sia durante il training dei singoli livelli gerarchici sia durante
 la valutazione end-to-end dell'esperimento finale.
 """
+# Collegamenti con la pipeline:
+# - riceve i batch [B, T, D] creati da data/feature_dataset.py;
+# - D può includere sia DINOv3 sia tracking concatenato da training/train.py o
+#   evaluation/evaluate_hierarchical.py;
+# - la configurazione del modello viene salvata nel checkpoint e usata dalla
+#   valutazione per ricostruire esattamente ciascun livello L1/L2/L3.
+
 
 import math
 
@@ -15,6 +22,8 @@ import torch
 import torch.nn as nn
 
 
+# Codifica deterministica della posizione, registrata come buffer e quindi spostata
+# automaticamente sul device senza essere ottimizzata.
 class SinusoidalPositionalEncoding(nn.Module):
     """
     Positional encoding sinusoidale.
@@ -62,6 +71,8 @@ class SinusoidalPositionalEncoding(nn.Module):
         return x + self.pe[:, :seq_len, :]
 
 
+# Il classificatore separa proiezione dell’input, modellazione temporale, pooling
+# della clip e testa lineare, consentendo tre strategie di aggregazione.
 class TemporalTransformerActionClassifier(nn.Module):
     """
     Classificatore temporale basato su Transformer Encoder.
@@ -129,6 +140,8 @@ class TemporalTransformerActionClassifier(nn.Module):
             max_len=max_len,
         )
 
+        # batch_first evita permutazioni [T, B, D]; norm_first usa la variante
+        # pre-norm, generalmente più stabile durante l’ottimizzazione.
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=num_heads,
@@ -157,6 +170,7 @@ class TemporalTransformerActionClassifier(nn.Module):
         if self.cls_token is not None:
             nn.init.normal_(self.cls_token, std=0.02)
 
+    # Traduce le lunghezze reali nella convenzione PyTorch True=padding ignorato.
     def _make_padding_mask(self, lengths, max_len, device):
         """
         Restituisce una maschera [B, Tmax].
@@ -213,6 +227,8 @@ class TemporalTransformerActionClassifier(nn.Module):
 
         return torch.stack(pooled_outputs, dim=0)
 
+    # Flusso completo: maschera, proiezione, eventuale CLS, positional encoding,
+    # Transformer Encoder, pooling selezionato e logits di classificazione.
     def forward(self, features, lengths):
         """
         features: [B, Tmax, input_dim]

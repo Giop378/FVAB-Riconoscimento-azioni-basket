@@ -10,6 +10,14 @@ Se un checkpoint richiede tracking, vengono usate solo sequenze temporali
 palla/canestro in formato NPZ + JSON. Il supporto alle vecchie feature
 aggregate CSV è stato rimosso perché non serve per exp_46.
 """
+# Collegamenti con la pipeline:
+# - FeatureDataset carica le feature .pt prodotte da extract_features.py;
+# - i tre checkpoint sono generati da training/train.py con label mode differenti;
+# - TrackingSequenceFeatureStore recupera le sequenze NPZ/JSON prodotte da
+#   extract_ball_rim_tracking_features.py e applica le statistiche del checkpoint;
+# - TemporalTransformerActionClassifier ricostruisce esattamente ciascun livello;
+# - predictions.csv conserva predizioni, confidenze e disponibilità del tracking.
+
 
 from pathlib import Path
 import argparse
@@ -28,6 +36,8 @@ from src.models.temporal_transformer_classifier import TemporalTransformerAction
 from src.features.tracking_sequence_store import TrackingSequenceFeatureStore
 
 
+# Spazi di label usati per la valutazione completa e per la variante collassata
+# che ignora l’esito del tiro.
 FINAL_LABELS = [
     "passaggio",
     "tiroDaDue0",
@@ -149,6 +159,8 @@ def get_sample_path(dataset, idx: int) -> str:
     return ""
 
 
+# Ricostruisce l’architettura dai metadati salvati da train.py, carica i pesi
+# e recupera il vocabolario delle classi dello specifico livello gerarchico.
 def load_checkpoint_model(checkpoint_path: str, device: torch.device, label_mode: str):
     checkpoint_path = Path(checkpoint_path)
 
@@ -222,6 +234,8 @@ def get_checkpoint_tracking_requirements(checkpoint, config):
     return tracking_config, tracking_type, tracking_input_dim
 
 
+# Ogni livello può avere una configurazione tracking indipendente: il relativo
+# store viene creato solo quando il checkpoint dichiara tracking_input_dim > 0.
 def load_tracking_store_for_level(
     level_name: str,
     checkpoint,
@@ -283,6 +297,8 @@ def load_tracking_store_for_level(
     return store
 
 
+# Allinea le sequenze di tracking alla lunghezza reale delle feature DINOv3 e
+# le porta al Tmax del batch con padding a zero.
 def build_tracking_sequence_batch(
     tracking_store: TrackingSequenceFeatureStore | None,
     dataset,
@@ -355,6 +371,8 @@ def append_tracking_sequence_to_features(
     return torch.cat([features, tracking_sequences.to(features.device, dtype=features.dtype)], dim=2)
 
 
+# Esegue il routing gerarchico: L1 decide se la clip è un tiro; soltanto le
+# clip instradate come tiro vengono sottoposte in parallelo a L2 e L3.
 @torch.no_grad()
 def predict_hierarchical_batch(
     features,
@@ -386,6 +404,8 @@ def predict_hierarchical_batch(
     p_l2 = [None] * batch_size
     p_l3 = [None] * batch_size
 
+    # Gli indici preservano la posizione nel batch originale per ricomporre poi
+    # la label finale tipo+esito nella stessa posizione del campione sorgente.
     shot_indices = [idx for idx, label in enumerate(pred_l1_labels) if label == "tiro"]
 
     for idx, label_l1 in enumerate(pred_l1_labels):
@@ -471,6 +491,8 @@ def print_report(title: str, y_true, y_pred, labels):
     print(confusion_matrix(y_true, y_pred, labels=labels))
 
 
+# Pipeline end-to-end: crea il DataLoader, carica i tre livelli e i relativi
+# store tracking, accumula le predizioni e calcola le metriche finali.
 def run_evaluation(args) -> None:
     print("# Comando utilizzato")
     print(get_reconstructed_command())
@@ -673,6 +695,8 @@ def run_evaluation(args) -> None:
         labels=FINAL_ACTION_LABELS,
     )
 
+    # Seconda lettura dei risultati: collassa 0/1 per misurare il riconoscimento
+    # del tipo di azione senza penalizzare gli errori sul solo esito del tiro.
     y_true_type = [final_to_type_label(label) for label in y_true_final]
     y_pred_type = [final_to_type_label(label) for label in y_pred_final]
 
@@ -696,6 +720,7 @@ def run_evaluation(args) -> None:
     output_dir = Path(args.output_dir)
     predictions_path = output_dir / "predictions.csv"
 
+    # Salva una riga per clip per rendere verificabili errori, routing e tracking.
     with open(predictions_path, "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=list(rows[0].keys()))
         writer.writeheader()

@@ -13,37 +13,26 @@ dependencies:
   - scipy
   - scikit-learn
 
-  # Visualization
+  # Visualization and notebook support
   - matplotlib
   - seaborn
+  - ipykernel
 
-  # Computer vision and media
-  - opencv
+  # Image/video utilities
+  # OpenCV is installed from pip as opencv-python to avoid mixing the
+  # conda package "opencv" with the package required by Ultralytics.
   - pillow
   - ffmpeg
 
-  # CLI and configuration
+  # Configuration and progress reporting
   - pyyaml
   - tqdm
-
-  # Notebook / VS Code support
-  - ipykernel
 
   - pip:
       # Deep learning
       - torch
       - torchvision
-      - torchmetrics
-      - timm
 
-      # DINOv3 / model utilities
-      - huggingface-hub
-      - safetensors
-      - termcolor
-
-      # YOLO ball/rim detector
+      # Computer vision
+      - opencv-python
       - ultralytics
-
-      # CLI utilities
-      - rich
-      - typer

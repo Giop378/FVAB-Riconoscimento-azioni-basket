@@ -21,7 +21,7 @@ ENV/
 conda-meta/
 
 # =============================================================================
-# IDE / OS
+# IDE / sistema operativo
 # =============================================================================
 
 .vscode/
@@ -33,7 +33,7 @@ Thumbs.db
 desktop.ini
 
 # =============================================================================
-# Logs / temporary files
+# Log e file temporanei
 # =============================================================================
 
 *.log
@@ -43,45 +43,56 @@ temp/
 *.tmp
 
 # =============================================================================
-# Dataset pesante
+# Dataset e annotazioni pesanti
 # =============================================================================
 
-# Non versionare clip/video pesanti e annotazioni relative a palla e canestro
+# Clip e video del dataset principale
 data/datasets/dataset_basket_v1/train/
 data/datasets/dataset_basket_v1/val/
 data/datasets/dataset_basket_v1/test/
 data/datasets/dataset_basket_v1/videos/
-data/datasets/ball_rim_yolo_all_v2
-data/datasets/ball_rim_yolo_shot_only_v3
-data/annotations/ball_rim_cvat_exports
-data/annotations/ball_rim_frames_sample
 
-# Versionare solo manifest e README del dataset
+# Dataset e annotazioni del detector palla/canestro
+data/datasets/ball_rim_yolo_all_v2/
+data/datasets/ball_rim_yolo_shot_only_v3/
+data/annotations/ball_rim_cvat_exports/
+data/annotations/ball_rim_frames_sample/
+
+# Mantieni versionabili manifest e README del dataset principale
 !data/datasets/
 !data/datasets/dataset_basket_v1/
 !data/datasets/dataset_basket_v1/manifest.csv
+!data/datasets/dataset_basket_v1/readme.md
 !data/datasets/dataset_basket_v1/README.md
 
 # =============================================================================
 # Feature estratte
 # =============================================================================
 
+# Tutte le feature clip-level restano escluse
 data/features/
+
+# Tutte le feature store long-video sono escluse di default.
+# Le due cartelle necessarie vengono riabilitate in fondo al file.
 data/features_long/
 
-# Feature DINO / tracking / long-video
+# Formati binari di feature, esclusi globalmente salvo eccezioni finali
 *.npy
 *.npz
 
 # =============================================================================
-# Output esperimenti
+# Output degli esperimenti
 # =============================================================================
 
+# Tutti gli output sono esclusi di default.
+# Le tre cartelle contenenti i checkpoint finali vengono riabilitate in fondo.
 outputs/
+
+# Output Ultralytics / YOLO
 runs/
 
 # =============================================================================
-# Modelli / checkpoint
+# Modelli e checkpoint
 # =============================================================================
 
 *.pt
@@ -92,7 +103,7 @@ runs/
 *.safetensors
 
 # =============================================================================
-# Video / immagini generate
+# Video e immagini generate
 # =============================================================================
 
 *.mp4
@@ -101,26 +112,68 @@ runs/
 *.mkv
 *.webm
 
-# Preview e render generati
 preview_annotated.mp4
 *.metadata.json
 
 # =============================================================================
-# Third party
+# Codice e risorse third-party
 # =============================================================================
 
 third_party/dinov3/
 
-# Se usate submodule, non ignorare la cartella third_party intera.
-# Ignora solo contenuti scaricati/pesi/cache se presenti.
+# Cache o pesi eventualmente presenti sotto third_party
 third_party/**/__pycache__/
 third_party/**/*.pt
 third_party/**/*.pth
 
 # =============================================================================
-# Cache modelli
+# Cache dei modelli
 # =============================================================================
 
 .cache/
 torch_cache/
 hub/
+
+# =============================================================================
+# ECCEZIONI FINALI
+# Queste regole devono rimanere in fondo al file.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Feature store minime necessarie per riprodurre exp_long_13
+# a partire dalla fase successiva alla feature extraction.
+# Tutto il contenuto delle due cartelle viene versionato.
+# -----------------------------------------------------------------------------
+
+!data/features_long/
+data/features_long/*
+
+!data/features_long/primaparte_0215_1215_exp46/
+!data/features_long/primaparte_0215_1215_exp46/**
+
+!data/features_long/psa_converted_0010_1010_exp46/
+!data/features_long/psa_converted_0010_1010_exp46/**
+
+# -----------------------------------------------------------------------------
+# Checkpoint finali exp_46.
+# Tutto il contenuto delle tre cartelle viene versionato.
+# Qualsiasi altro contenuto di outputs/ resta ignorato, inclusi:
+# - outputs/long_video/
+# - outputs/exp_46_test/
+# - outputs/exp_46_hier_best_per_level_l1temp43_l2temp29_l3temp43/
+# -----------------------------------------------------------------------------
+
+!outputs/
+outputs/*
+
+!outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/
+!outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/**
+
+!outputs/exp_l2_yolo_v2_temp29_allclips_d256_mean/
+!outputs/exp_l2_yolo_v2_temp29_allclips_d256_mean/**
+
+!outputs/exp_l3_yolo_v1_temp43_shots_d256_mean/
+!outputs/exp_l3_yolo_v1_temp43_shots_d256_mean/**
+
+# Mantieni il placeholder della cartella, se presente
+!outputs/.gitkeep

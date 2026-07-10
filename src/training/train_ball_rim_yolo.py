@@ -1,3 +1,14 @@
+# =============================================================================
+# Scopo del modulo
+# =============================================================================
+# Addestra e valida un detector Ultralytics YOLO a due classi, ball e rim, sul
+# dataset ottenuto dalle annotazioni preparate a partire dai frame esportati da
+# annotations/extract_ball_rim_frames.py. Prima del training controlla struttura,
+# ordine delle classi e corrispondenza immagine-label. Il best.pt prodotto viene
+# successivamente usato da features/extract_ball_rim_tracking_features.py per
+# generare le sequenze geometriche/temporali associate alle clip.
+# =============================================================================
+
 from pathlib import Path
 import argparse
 import random
@@ -33,6 +44,7 @@ EXPECTED_CLASS_NAMES = ["ball", "rim"]
 # Utilities
 # ============================================================
 
+# Allinea le principali sorgenti di casualità prima di delegare il training a YOLO.
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -63,6 +75,8 @@ def normalize_names(names_field: Any) -> list[str]:
     )
 
 
+# Validazione preventiva del contratto del dataset YOLO: cartelle, names/nc e
+# presenza di un file .txt per ciascuna immagine di train e validation.
 def check_dataset(data_yaml: Path) -> None:
     if not data_yaml.exists():
         raise FileNotFoundError(f"File data.yaml non trovato: {data_yaml}")
@@ -139,6 +153,8 @@ def check_dataset(data_yaml: Path) -> None:
     print(f"[INFO] Val images:   {len(val_images)}")
 
 
+# Espone i parametri operativi principali mantenendo nel codice la configurazione
+# di ottimizzazione e augmentation usata per l’esperimento del detector.
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Training YOLO per rilevamento palla e canestro."
@@ -239,6 +255,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Esegue controlli, stampa la configurazione, avvia il fine-tuning e valida infine
+# il checkpoint migliore nella cartella dell’esperimento.
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -261,8 +279,11 @@ def main() -> None:
     print(f"       project:  {args.project}")
     print(f"       name:     {args.name}")
 
+    # Il modello pretrained indicato funge da inizializzazione del detector custom.
     model = YOLO(args.model)
 
+    # Tutti i parametri passati qui vengono gestiti dal trainer Ultralytics;
+    # il codice mantiene esplicite le scelte di hardware, output e augmentation.
     model.train(
         data=str(data_yaml),
         task="detect",
@@ -323,6 +344,7 @@ def main() -> None:
     if best_weights.exists():
         print("[INFO] Eseguo validazione finale sul best.pt...")
 
+        # La validazione separata usa esattamente il best.pt selezionato durante il training.
         best_model = YOLO(str(best_weights))
         best_model.val(
             data=str(data_yaml),

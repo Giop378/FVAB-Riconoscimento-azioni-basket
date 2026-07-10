@@ -10,6 +10,12 @@ Le sequenze [S, K] vengono recuperate tramite la chiave normalizzata della clip,
 interpolate alla lunghezza richiesta [T, K] e, se necessario, normalizzate con
 mean/std salvate nel checkpoint del modello.
 """
+# Collegamenti con la pipeline:
+# - legge gli output prodotti da extract_ball_rim_tracking_features.py/tracking_io.py;
+# - training/train.py stima mean/std sul solo train set e salva la configurazione;
+# - evaluation/evaluate_hierarchical.py ricrea lo store con le statistiche del
+#   checkpoint, evitando leakage e mismatch tra addestramento e inferenza.
+
 
 from pathlib import Path
 import json
@@ -40,6 +46,8 @@ def normalize_clip_key(path_value) -> str:
     return Path(*parts).with_suffix("").as_posix()
 
 
+# L’interpolazione rende compatibile il numero di frame campionati dal tracker
+# con la lunghezza T delle feature DINOv3 della stessa clip.
 def interpolate_sequence_array(sequence: np.ndarray, target_len: int) -> np.ndarray:
     """Interpola una sequenza tracking [S, K] alla lunghezza target [T, K]."""
     target_len = int(target_len)
@@ -72,6 +80,8 @@ def interpolate_sequence_array(sequence: np.ndarray, target_len: int) -> np.ndar
     return resized.astype(np.float32)
 
 
+# Astrazione di accesso path->sequenza che nasconde indice JSON, archivio NPZ,
+# gestione dei dati mancanti, interpolazione e normalizzazione.
 class TrackingSequenceFeatureStore:
     """
     Store delle feature tracking temporali palla/canestro.
@@ -104,6 +114,7 @@ class TrackingSequenceFeatureStore:
                 "Passa --tracking-sequence-index oppure genera l'indice con lo script di estrazione."
             )
 
+        # L’indice contiene nomi feature e associazione tra chiave clip e array NPZ.
         with open(self.index_path, "r", encoding="utf-8") as f:
             index_data = json.load(f)
 
@@ -122,6 +133,8 @@ class TrackingSequenceFeatureStore:
         if not self.rows_by_key:
             raise ValueError(f"Nessuna sequenza tracking indicizzata in {self.index_path}.")
 
+        # np.load mantiene l’archivio accessibile per chiave senza concatenare tutte
+        # le sequenze in memoria in un unico tensore.
         self.data = np.load(self.npz_path)
         self.normalized = bool(normalized)
         self.mean = None if mean is None else np.array(mean, dtype=np.float32)
@@ -141,6 +154,8 @@ class TrackingSequenceFeatureStore:
     def has(self, path_value) -> bool:
         return normalize_clip_key(path_value) in self.rows_by_key
 
+    # Recupera la sequenza non normalizzata; la policy zeros consente di mantenere
+    # il campione anche quando il tracker non dispone della clip corrispondente.
     def get_raw(self, path_value, target_len=None, missing_policy: str = "zeros") -> np.ndarray:
         key = normalize_clip_key(path_value)
 
@@ -166,12 +181,15 @@ class TrackingSequenceFeatureStore:
 
         return sequence.astype(np.float32)
 
+    # Applica opzionalmente lo z-score usando esclusivamente mean/std già fissate.
     def get(self, path_value, target_len=None, missing_policy: str = "zeros") -> np.ndarray:
         sequence = self.get_raw(path_value, target_len=target_len, missing_policy=missing_policy)
         if self.normalized:
             sequence = (sequence - self.mean.reshape(1, -1)) / self.std.reshape(1, -1)
         return sequence.astype(np.float32)
 
+    # Stima le statistiche aggregando tutti i timestep disponibili del training set;
+    # le clip mancanti non contribuiscono alla stima.
     def fit_normalizer_from_paths(self, paths) -> None:
         sequences = []
         missing = 0
@@ -198,6 +216,7 @@ class TrackingSequenceFeatureStore:
         print(f"Frame usati per stimare mean/std: {matrix.shape[0]}")
         print(f"Campioni train senza sequenze tracking: {missing}")
 
+    # Restituisce una configurazione serializzabile da incorporare nel checkpoint.
     def get_config(self) -> dict:
         return {
             "enabled": True,

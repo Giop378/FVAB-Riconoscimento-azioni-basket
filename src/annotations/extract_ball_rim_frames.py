@@ -1,3 +1,20 @@
+# =============================================================================
+# Scopo del modulo
+# =============================================================================
+# Seleziona dal manifest un sottoinsieme bilanciato di clip e ne estrae frame
+# rappresentativi da annotare per il rilevamento di palla e canestro. Le immagini
+# vengono organizzate in archivi ZIP compatibili con CVAT e accompagnate da CSV
+# che mantengono il collegamento con split, classe, clip e timestamp originali.
+#
+# Collegamenti con la pipeline:
+# - legge il dataset indicizzato dal manifest clip-level;
+# - prepara il materiale da cui vengono ricavate le label YOLO ball/rim;
+# - il dataset YOLO risultante viene poi validato e addestrato da
+#   training/train_ball_rim_yolo.py;
+# - i pesi del detector così ottenuti sono usati da
+#   features/extract_ball_rim_tracking_features.py.
+# =============================================================================
+
 import csv
 import random
 import re
@@ -84,6 +101,7 @@ FIELDNAMES = [
 # =============================================================================
 
 
+# Rende sicuri i metadati usati nei nomi file, evitando caratteri non portabili.
 def safe_name(value: str) -> str:
     value = str(value)
     value = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value)
@@ -122,6 +140,7 @@ def validate_percents(percents: Iterable[float]):
             raise ValueError(f"Percentuale non valida: {p}. Deve stare tra 0 e 1.")
 
 
+# Carica e normalizza il manifest, aggiungendo identificativi compatibili se assenti.
 def prepare_manifest(manifest_path: Path) -> pd.DataFrame:
     manifest = pd.read_csv(manifest_path)
 
@@ -139,6 +158,7 @@ def prepare_manifest(manifest_path: Path) -> pd.DataFrame:
     return manifest
 
 
+# Ripartisce le clip, non i singoli frame, per mantenere coerenti i pacchetti CVAT.
 def assign_parts_balanced(df: pd.DataFrame, num_parts: int, seed: int) -> pd.DataFrame:
     """
     Assegna le clip alle parti in modo bilanciato per classe.
@@ -242,6 +262,8 @@ def part_token(part) -> str:
     return safe_name(str(part))
 
 
+# Cuore dello script: apre ogni clip, campiona le percentuali previste e registra
+# sia l’immagine JPEG sia la riga di mapping necessaria a risalire alla sorgente.
 def extract_frames(
     rows: pd.DataFrame,
     images_dir: Path,
@@ -271,6 +293,8 @@ def extract_frames(
             print(f"[WARN] Clip non trovata: {video_path}")
             continue
 
+        # Ogni clip viene aperta una sola volta; gli accessi successivi avvengono
+        # per indice di frame mediante read_frame_at.
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             print(f"[WARN] Impossibile aprire: {video_path}")
@@ -367,6 +391,8 @@ def print_distribution(title: str, df: pd.DataFrame):
         print(df.groupby(["split", "part", "label"]).size())
 
 
+# Orchestra separatamente tiri train, contesti train e validation, quindi crea
+# i relativi ZIP/mapping e un indice globale di tutte le immagini estratte.
 def main():
     validate_percents(SHOT_PERCENTS)
     validate_percents(CONTEXT_PERCENTS)

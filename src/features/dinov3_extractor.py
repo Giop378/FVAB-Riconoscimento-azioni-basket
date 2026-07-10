@@ -1,3 +1,14 @@
+# =============================================================================
+# Scopo del modulo
+# =============================================================================
+# Incapsula il backbone DINOv3 congelato e tutte le trasformazioni necessarie
+# per ottenere feature frame-level coerenti tra pipeline clip-level e video
+# lunghi. features/extract_features.py usa extract_clip_features sui frame RGB;
+# gli script long-video possono usare extract_dino_features_for_frames sui frame
+# BGR di OpenCV. I tensori [T, D] prodotti vengono poi caricati da FeatureDataset
+# e classificati dal Temporal Transformer.
+# =============================================================================
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -22,6 +33,8 @@ DINO_FEATURE_DIMS = {
 DEFAULT_DINO_OUTPUT_TOKEN = "x_norm_clstoken"
 
 
+# Wrapper che rende uniforme il caricamento da repository locale/GitHub e la
+# selezione del token globale indipendentemente dal formato restituito dal backbone.
 class DINOv3FeatureExtractor(nn.Module):
     """
     Wrapper unico per DINOv3 usato sia sulle clip sia sui video lunghi.
@@ -67,6 +80,8 @@ class DINOv3FeatureExtractor(nn.Module):
             "weights": self.weights,
         }
 
+        # torch.hub riceve sempre pesi espliciti: non è previsto alcun backbone
+        # casuale, così le feature restano riproducibili tra estrazione e inferenza.
         if self.source == "local":
             self.backbone = torch.hub.load(
                 self.repo_or_dir,
@@ -83,10 +98,13 @@ class DINOv3FeatureExtractor(nn.Module):
                 **load_kwargs,
             )
 
+        # DINOv3 opera esclusivamente come feature extractor congelato.
         self.backbone.eval()
         for param in self.backbone.parameters():
             param.requires_grad = False
 
+    # Il forward restituisce una feature globale per immagine e verifica che la
+    # dimensione coincida con quella prevista dal modello ViT selezionato.
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out: Any
@@ -107,6 +125,8 @@ class DINOv3FeatureExtractor(nn.Module):
             )
         return features
 
+    # Gestisce in ordine di preferenza CLS normalizzato, token pre-normalizzati,
+    # media dei patch token e formati tensor/tuple usati da versioni differenti.
     def _features_from_output(self, out: Any) -> torch.Tensor:
         if isinstance(out, dict):
             # Caso previsto per i ViT DINOv3 usati nelle clip.
@@ -161,6 +181,8 @@ class DINOv3FeatureExtractor(nn.Module):
         raise RuntimeError(f"Output DINOv3 non gestito. Tipo: {type(out)}")
 
 
+# Un’unica trasformazione condivisa impedisce mismatch di preprocessing tra
+# feature estratte offline e successive pipeline di inferenza.
 def build_dino_transform(image_size: int = 336) -> transforms.Compose:
     """
     Preprocessing DINOv3 identico a quello usato sulle clip:
@@ -275,6 +297,8 @@ def extract_clip_features(
     device = torch.device(device)
     all_features: list[torch.Tensor] = []
 
+    # Elabora la clip a blocchi per limitare l’occupazione della memoria GPU senza
+    # modificare l’ordine temporale dei frame nel tensore finale.
     for start_idx in range(0, len(frames), chunk_size):
         chunk = frames[start_idx : start_idx + chunk_size]
         batch = torch.stack(
@@ -323,6 +347,8 @@ def extract_dino_features_for_frames(
     amp_enabled = bool(use_amp and device.type == "cuda")
     all_features: list[np.ndarray] = []
 
+    # Variante BGR per video lunghi: converte e processa batch contigui, con AMP
+    # opzionale ma disattivato di default per coerenza numerica con le clip.
     for start_idx in range(0, len(frames_bgr), batch_size):
         chunk = frames_bgr[start_idx : start_idx + batch_size]
         batch = torch.stack([transform(bgr_to_pil(frame)) for frame in chunk], dim=0)
@@ -350,6 +376,7 @@ def extract_dino_features_for_frames(
     return np.concatenate(all_features, axis=0).astype(np.float32)
 
 
+# Esporta i metadati necessari a documentare e ricostruire l’estrazione.
 def get_dino_config(
     model_name: str,
     weights: str | Path,

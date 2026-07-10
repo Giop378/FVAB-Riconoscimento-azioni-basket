@@ -1,0 +1,81 @@
+{
+  "created_at": "2026-06-27T13:08:43",
+  "elapsed_sec": 2417.97,
+  "experiment": "exp_long_13_feature_store",
+  "video": {
+    "input_path": "data\\datasets\\dataset_basket_v1\\videos\\PrimaParte.mp4",
+    "fps": 29.97002997002997,
+    "num_frames": 75952,
+    "width": 1920,
+    "height": 1080,
+    "duration_sec": 2534.265066666667,
+    "start_sec": 135.0,
+    "end_sec": 735.0,
+    "segment_duration_sec": 600.0
+  },
+  "sampling": {
+    "mode": "source_frames",
+    "policy": "all real source frames in [start_sec, end_sec)",
+    "source_fps": 29.97002997002997,
+    "feature_fps": 29.97002997002997,
+    "num_samples": 17982,
+    "first_timestamp": 135.00153333333333,
+    "last_timestamp": 734.9675666666667,
+    "first_frame_index": 4046,
+    "last_frame_index": 22027
+  },
+  "dinov3": {
+    "enabled": true,
+    "repo": "third_party\\dinov3",
+    "source": "local",
+    "weights": "checkpoints\\dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+    "model_name": "dinov3_vitl16",
+    "input_size": 336,
+    "feature_dim": 1024,
+    "amp": false,
+    "output_file": "dinov3_features.npy"
+  },
+  "yolo": {
+    "enabled_v1": true,
+    "enabled_v2": true,
+    "v1_weights": "runs\\detect\\outputs\\ball_rim_detector\\yolo11m_1280_v1\\weights\\best.pt",
+    "v2_weights": "runs\\detect\\outputs\\ball_rim_detector\\yolo11m_1280_v2\\weights\\best.pt",
+    "imgsz": 1280,
+    "conf": 0.1,
+    "iou": 0.5,
+    "classes_filter": [
+      0,
+      1
+    ],
+    "ball_class_id": 0,
+    "rim_class_id": 1,
+    "primitive_fields": [
+      "ball_detected",
+      "rim_detected",
+      "ball_conf",
+      "rim_conf",
+      "ball_xc",
+      "ball_yc",
+      "ball_w",
+      "ball_h",
+      "rim_xc",
+      "rim_yc",
+      "rim_w",
+      "rim_h"
+    ]
+  },
+  "runtime": {
+    "device": "0",
+    "batch_size_decode": 128,
+    "batch_size_dino": 32,
+    "batch_size_yolo": 16
+  },
+  "files": {
+    "metadata": "metadata.json",
+    "timestamps": "timestamps.npy",
+    "frame_indices": "frame_indices.npy",
+    "dinov3_features": "dinov3_features.npy",
+    "yolo_v1_primitives": "yolo_v1_primitives.npz",
+    "yolo_v2_primitives": "yolo_v2_primitives.npz"
+  }
+}

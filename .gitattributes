@@ -1,0 +1,11 @@
+# Feature store long-video necessarie per la riproduzione
+data/features_long/primaparte_0215_1215_exp46/*.npy filter=lfs diff=lfs merge=lfs -text
+data/features_long/primaparte_0215_1215_exp46/*.npz filter=lfs diff=lfs merge=lfs -text
+
+data/features_long/psa_converted_0010_1010_exp46/*.npy filter=lfs diff=lfs merge=lfs -text
+data/features_long/psa_converted_0010_1010_exp46/*.npz filter=lfs diff=lfs merge=lfs -text
+
+# Checkpoint finali exp_46
+outputs/exp_l1_yolo_v2_temp43_allclips_d256_mean/best_model.pt filter=lfs diff=lfs merge=lfs -text
+outputs/exp_l2_yolo_v2_temp29_allclips_d256_mean/best_model.pt filter=lfs diff=lfs merge=lfs -text
+outputs/exp_l3_yolo_v1_temp43_shots_d256_mean/best_model.pt filter=lfs diff=lfs merge=lfs -text

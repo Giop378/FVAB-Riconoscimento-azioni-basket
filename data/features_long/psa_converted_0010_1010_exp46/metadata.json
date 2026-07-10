@@ -1,0 +1,76 @@
+{
+  "created_at": "2026-06-22T16:34:17",
+  "elapsed_sec": 3238.696,
+  "video": {
+    "input_path": "data\\datasets\\dataset_basket_v1\\videos\\PSA_converted.mp4",
+    "sha256": "8c8b3c1aa138d46d7ed8a11dc221fa150ef3a46f8ede5887c16216fdd938f954",
+    "fps": 29.97002997002997,
+    "num_frames": 110061,
+    "width": 1920,
+    "height": 1080,
+    "duration_sec": 3672.3687,
+    "start_sec": 10.0,
+    "end_sec": 610.0,
+    "segment_duration_sec": 600.0
+  },
+  "sampling": {
+    "mode": "source_frames",
+    "policy": "all real source frames in [start_sec, end_sec)",
+    "source_fps": 29.97002997002997,
+    "feature_fps": 29.97002997002997,
+    "num_samples": 17982,
+    "first_timestamp": 10.01,
+    "last_timestamp": 609.9760333333334,
+    "first_frame_index": 300,
+    "last_frame_index": 18281
+  },
+  "dinov3": {
+    "model_name": "dinov3_vitl16",
+    "weights": "checkpoints\\dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+    "repo_or_dir": "third_party\\dinov3",
+    "source": "local",
+    "input_size": 336,
+    "resize_mode": "stretch",
+    "center_crop": false,
+    "normalization": "imagenet",
+    "output_token": "x_norm_clstoken",
+    "feature_dim": 1024,
+    "enabled": true,
+    "weights_sha256": "8aa4cbddda325040fc78db2c272754af6ebe8ff2c55f6ec4f1964d8890f66035",
+    "output_file": "dinov3_features.npy"
+  },
+  "yolo": {
+    "enabled_v1": true,
+    "enabled_v2": true,
+    "v1_weights": "runs\\detect\\outputs\\ball_rim_detector\\yolo11m_1280_v1\\weights\\best.pt",
+    "v2_weights": "runs\\detect\\outputs\\ball_rim_detector\\yolo11m_1280_v2\\weights\\best.pt",
+    "v1_sha256": "13c64ee3300e22f1a8b40d1a7ab5d9269127a77d15288bc21270838323f1424a",
+    "v2_sha256": "832c85667bbcd266e2eb76438448712465fe8454a89d0b8e7527adbef619ce8c",
+    "imgsz": 1280,
+    "conf": 0.1,
+    "iou": 0.5,
+    "classes_filter": [
+      0,
+      1
+    ],
+    "ball_class_id": 0,
+    "rim_class_id": 1
+  },
+  "runtime": {
+    "device": "0",
+    "batch_size_decode": 64,
+    "batch_size_dino": 16,
+    "batch_size_yolo": 8,
+    "amp": false
+  },
+  "files": {
+    "metadata": "metadata.json",
+    "timestamps": "timestamps.npy",
+    "frame_indices": "frame_indices.npy",
+    "dinov3_features": "dinov3_features.npy",
+    "yolo_v1_primitives": "yolo_v1_primitives.npz",
+    "yolo_v2_primitives": "yolo_v2_primitives.npz",
+    "yolo_v1_detections": "yolo_v1_detections.csv",
+    "yolo_v2_detections": "yolo_v2_detections.csv"
+  }
+}

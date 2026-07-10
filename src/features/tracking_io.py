@@ -5,6 +5,12 @@ Raccoglie le funzioni per leggere il manifest, campionare i frame delle clip,
 scrivere file CSV di debug e salvare le sequenze temporali in formato NPZ con
 indice JSON.
 """
+# Collegamenti con la pipeline:
+# - è usato da extract_ball_rim_tracking_features.py per leggere clip e manifest;
+# - importa l’ordine temp43 da tracking_geometry.py;
+# - produce i file NPZ/JSON che tracking_sequence_store.py carica durante training
+#   e valutazione dei classificatori gerarchici.
+
 
 from pathlib import Path
 import csv
@@ -53,6 +59,7 @@ def normalize_clip_key(path_value) -> str:
     return Path(*parts).with_suffix("").as_posix()
 
 
+# Filtra il manifest prima dell’inferenza YOLO e risolve il path assoluto di ogni clip.
 def read_manifest(manifest_path: Path, dataset_root: Path, splits, labels, max_clips=None):
     rows = []
 
@@ -100,6 +107,7 @@ def read_manifest(manifest_path: Path, dataset_root: Path, splits, labels, max_c
 
 
 
+# Legge i metadati necessari per campionamento e conversione frame->tempo.
 def get_video_metadata(video_path: Path):
     cap = cv2.VideoCapture(str(video_path))
 
@@ -119,6 +127,7 @@ def get_video_metadata(video_path: Path):
     return frame_count, fps, width, height
 
 
+# Genera indici unici e ordinati, sull’intera clip oppure nella sola porzione finale.
 def build_frame_indices(frame_count: int, num_frames: int, sample_mode: str, last_ratio: float):
     if frame_count <= 0:
         return []
@@ -148,6 +157,8 @@ def build_frame_indices(frame_count: int, num_frames: int, sample_mode: str, las
     return indices
 
 
+# Effettua accessi casuali ai frame richiesti e tenta il precedente in caso di
+# decodifica fallita vicino alla fine della clip.
 def read_frames(video_path: Path, frame_indices):
     cap = cv2.VideoCapture(str(video_path))
 
@@ -177,6 +188,7 @@ def read_frames(video_path: Path, frame_indices):
 
 
 
+# Serializza output di debug/metadata con formato numerico uniforme.
 def write_csv(path: Path, rows, fieldnames):
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -197,6 +209,8 @@ def write_csv(path: Path, rows, fieldnames):
             writer.writerow(cleaned)
 
 
+# Salva gli array compressi separatamente dall’indice, così il caricamento può
+# recuperare una clip tramite chiave normalizzata senza scandire tutto il dataset.
 def write_temporal_sequences(output_dir: Path, sequence_entries, temporal_feature_names=None):
     """
     Salva le sequenze tracking in formato NPZ più un indice JSON path -> array.
@@ -219,6 +233,7 @@ def write_temporal_sequences(output_dir: Path, sequence_entries, temporal_featur
         "sequences": {},
     }
 
+    # Ogni path normalizzato punta alla chiave interna dell’array nel contenitore NPZ.
     for array_idx, entry in enumerate(sequence_entries):
         array_key = f"seq_{array_idx:06d}"
         arrays[array_key] = entry["sequence"].astype(np.float32)
